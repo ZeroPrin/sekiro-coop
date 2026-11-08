@@ -2,7 +2,7 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.1`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.2`. Everybody in a session needs the same build.
 
 ## What it adds: shared map pickups (`[GAMEPLAY] share_pickups`, default 1)
 
@@ -29,12 +29,30 @@ that lot's flag is set on their side, so they cannot pick it up again.
   and a pickup in the first ~10 s after a load / warp / death reload (the map flags are
   read when the world has settled; a pickup before that counts as an old one).
 
-## Open question (needs a live test)
+## Taking the item off the map (1.0.9-pickups.2)
 
-Whether the glowing item on the ground disappears for the receiver at once or only after
-the next load, and whether picking it up there gives the item a second time. The game's
-own grants outside AwardItemLot are logged as `pickup: game grant [...] (caller RVA ...)`;
-one that matches a friend's pickup given here is logged as `pickup: POSSIBLE DOUBLE`.
+Live test of pickups.1 (2026-11-09): setting the lot flag does not remove an item that is
+already lying on the loaded map; the friend picked the host's Pellet up a second time.
+From a memory dump of the running 1.06 exe (layout checked live on 133 loaded treasures):
+
+- MapItemMan (`*(base+0x3D6CDC0)`) keeps map items in linked lists per kind
+  (`handle & 0xF`): 1 `+0x20`, 2 `+0x40`, 3 `+0x30` (map treasure), 4 `+0x50`, 5 `+0x68`
+  (enemy drops, no flag). Node: `+0x20` handle, `+0x28` lot flag, `+0x30` position,
+  `+0x54` item count, `+0x58` items.
+- `0x91FCF0 PickUpMapItem(mim, handle, bool)` = the player's pickup: `0x91D450(handle, 1)`
+  then GrantItems with the node's items. `0x91D450 MapItemPicked(mim, handle, picked)` sets
+  the node's flag (`0x921E40`) and takes the node off the map (`0x91FAD0`): glow and prompt go.
+
+So the receiver now, after giving the friend's pickup, finds the loaded nodes with that
+lot flag (the sure slot's flag or the row's) and calls `0x91D450(handle, 1)`: the item
+disappears as if picked up, nothing is given twice. And `0x91FCF0` is detoured: a pickup of
+a node whose flag the friend's pickup set here (and is on) is refused the same way (node
+off the map, no GrantItems). Log lines: `pickup: lot L taken off the map here (handle ...)`,
+`pickup: a second pickup refused ...`.
+
+Still open: chests. If a chest is an ObjAct whose item node only spawns when it is opened,
+the chest itself stays closed for the receiver (opening it gives nothing). Enemy drops
+(kind 5, no lot flag) are not shared.
 
 ## Working on this fork
 

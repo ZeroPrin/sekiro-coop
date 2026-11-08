@@ -1,4 +1,4 @@
-SEKIRO TOGETHER 1.0.9-pickups.1 - quick guide
+SEKIRO TOGETHER 1.0.9-pickups.2 - quick guide
 =============================================
 
 Unofficial build: Sekiro Together 1.0.9 beta plus shared map pickups
@@ -77,7 +77,8 @@ An item one of you picks up from the map while connected (treasure, chests,
 items on corpses) is given to the other too, with the small pickup log, and
 the other can no longer pick it up there. Both players need share_pickups = 1.
 Pickups made alone or before the session stay your own; shops stay your own.
-The item on the ground may stay visible for the other until the next load.
+The item disappears from the other's map at once (no glow, no prompt), and a
+second pickup of it is refused.
 Log lines start with "pickup:".
 
 SAVES

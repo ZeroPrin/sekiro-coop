@@ -118,6 +118,30 @@ const MAX_PICKUP_ROWS: usize = 256;
 /// Game pickups (GrantItems outside AwardItemLot) logged per run at most (diagnostics).
 const MAX_WORLD_GRANT_LOGS: u32 = 60;
 
+// Map items (memory dump of the running 1.06 exe, 2026-11-09; layout checked live on 133
+// loaded treasures). MapItemMan (`*(base+0x3D6CDC0)`) keeps its map items in singly linked
+// lists (`next` at +0), one per kind (`handle & 0xF`): 1 +0x20, 2 +0x40, 3 +0x30 (map
+// treasure: lot flag 5xxxxxxx, goods), 4 +0x50 (placed emblems), 5 +0x68 (enemy drops, no
+// flag). Node: +0x20 u32 handle, +0x24 entity (-1), +0x28 i32 lot flag (what the pickup
+// sets), +0x30 position, +0x54 item count, +0x58 items (16 bytes each).
+/// `0x91FCF0 PickUpMapItem(MapItemMan*, u32 handle, bool)`: the player's pickup (callers
+/// `0x668CC0` action button, `0x923190`): finds the node, `0x91D450(handle, 1)`, then
+/// GrantItems with the node's items and the pickup effect.
+const PICKUP_RVA: usize = 0x91FCF0;
+// mov rax, rsp; mov [rax+10h], edx; push rsi; push rdi; push r14 (no RIP-relative code)
+const PICKUP_PROLOGUE: [u8; 10] = [0x48, 0x8B, 0xC4, 0x89, 0x50, 0x10, 0x56, 0x57, 0x41, 0x56];
+/// `0x91D450 MapItemPicked(MapItemMan*, u32 handle, bool picked)`: picked = the node's lot
+/// flag set (`0x921E40`), then the node is taken off the map (`0x91FAD0`): its glow and its
+/// pickup prompt go. Gives nothing (the pickup's GrantItems is the caller's).
+const ITEM_PICKED_RVA: usize = 0x91D450;
+/// `0x920330 FindMapItem(MapItemMan*, u32 handle) -> node*` (0 = none).
+const FIND_MAP_ITEM_RVA: usize = 0x920330;
+const MAP_ITEM_LISTS: [usize; 5] = [0x20, 0x30, 0x40, 0x50, 0x68];
+const NODE_HANDLE: usize = 0x20;
+const NODE_FLAG: usize = 0x28;
+/// Nodes walked per list at most (a list is a few hundred at most).
+const MAX_LIST_WALK: usize = 4096;
+
 /// Bulk kind: one script grant of the sender (`encode_grant`). (30 is doctor.rs, 0x4E
 /// nsession.rs; an older build leaves these unread.)
 pub const BULK_ITEM_GRANT: u8 = 41;
@@ -209,6 +233,13 @@ static GRANT_TRAMP: AtomicUsize = AtomicUsize::new(0);
 /// shops...): (caller RVA, entries), for the share_pickups double-pickup diagnostics.
 static WORLD_GRANTS: Mutex<Vec<(usize, Vec<[u32; 4]>)>> = Mutex::new(Vec::new());
 static WORLD_GRANT_LOGS: AtomicU32 = AtomicU32::new(0);
+static PICKUP_TRAMP: AtomicUsize = AtomicUsize::new(0);
+/// Lot flags the friend's pickups set here (share_pickups). A map item that still lies here
+/// with one of these flags (its flag on) is taken off the map instead of being given again
+/// (`pickup_detour`).
+static SHARED_FLAGS: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+/// Pickups `pickup_detour` refused: (lot flag, handle), logged by the frame task.
+static BLOCKED_PICKUPS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
 /// AwardItemLot calls seen (the boss window's included), for the stats line.
 static AWARDS_SEEN: AtomicU32 = AtomicU32::new(0);
 /// `game::now_ms` when a table boss's defeat flag (bosses.rs) last turned on here (0 = never).
@@ -914,8 +945,90 @@ extern "C" fn grant_detour(a: usize, buf: usize, c: usize, d: usize, e: usize, f
     original(a, buf, c, d, e, f)
 }
 
+/// The lot flag of map item `handle` (None = no such node).
+fn map_item_flag(mim: usize, handle: u32) -> Option<i32> {
+    let find: extern "C" fn(usize, u32) -> usize = unsafe { std::mem::transmute(module_base() + FIND_MAP_ITEM_RVA) };
+    let node = find(mim, handle);
+    if node < 0x10000 {
+        return None;
+    }
+    read::<i32>(node + NODE_FLAG)
+}
+
+/// Map items lying here (loaded) whose lot flag is one of `flags`: (handle, flag).
+fn map_items_with_flags(flags: &[u32]) -> Vec<(u32, u32)> {
+    let Some(mim) = read_ptr(module_base() + MAP_ITEM_MAN) else { return Vec::new() };
+    let mut hits = Vec::new();
+    for off in MAP_ITEM_LISTS {
+        let mut node = read_ptr(mim + off);
+        let mut n = 0;
+        while let Some(p) = node
+            && n < MAX_LIST_WALK
+        {
+            if let (Some(handle), Some(flag)) = (read::<u32>(p + NODE_HANDLE), read::<i32>(p + NODE_FLAG))
+                && flag > 0
+                && flags.contains(&(flag as u32))
+            {
+                hits.push((handle, flag as u32));
+            }
+            node = read_ptr(p);
+            n += 1;
+        }
+    }
+    hits
+}
+
+/// The map items of `flags` that lie here are picked up the way the game does it, without
+/// giving anything: the lot flag is set and the node goes, with its glow and its pickup
+/// prompt (`0x91D450(handle, picked = 1)`). Game thread. Returns the (handle, flag) taken.
+fn take_off_map(flags: &[u32]) -> Vec<(u32, u32)> {
+    let Some(mim) = read_ptr(module_base() + MAP_ITEM_MAN) else { return Vec::new() };
+    // Collected first: the removal unlinks nodes.
+    let hits = map_items_with_flags(flags);
+    let picked: extern "C" fn(usize, u32, u8) = unsafe { std::mem::transmute(module_base() + ITEM_PICKED_RVA) };
+    for &(handle, _) in &hits {
+        picked(mim, handle, 1);
+    }
+    hits
+}
+
+/// `0x91FCF0`: the player picks up a map item. One whose lot flag the friend's pickup set
+/// here (it was still lying here) is taken off the map and NOT given again.
+extern "C" fn pickup_detour(mim: usize, handle: u32, force: u8) -> usize {
+    let t = loop {
+        match PICKUP_TRAMP.load(Ordering::Acquire) {
+            0 => std::hint::spin_loop(),
+            t => break t,
+        }
+    };
+    if SHARE_PICKUPS.load(Ordering::Relaxed)
+        && let Some(flag) = map_item_flag(mim, handle).filter(|&f| f > 0).map(|f| f as u32)
+        && SHARED_FLAGS.try_lock().is_ok_and(|s| s.contains(&flag))
+        && game::event_flag(flag) == Some(true)
+    {
+        let picked: extern "C" fn(usize, u32, u8) = unsafe { std::mem::transmute(module_base() + ITEM_PICKED_RVA) };
+        picked(mim, handle, 1);
+        if let Ok(mut q) = BLOCKED_PICKUPS.try_lock()
+            && q.len() < MAX_CAPTURED
+        {
+            q.push((flag, handle));
+        }
+        return 0;
+    }
+    let original: extern "C" fn(usize, u32, u8) -> usize = unsafe { std::mem::transmute(t) };
+    original(mim, handle, force)
+}
+
 /// From bossrules.rs `install`.
 pub fn install() {
+    let pickup: extern "C" fn(usize, u32, u8) -> usize = pickup_detour;
+    match hook::install_detour(PICKUP_RVA, &PICKUP_PROLOGUE, pickup as usize, "map item pickup (0x91FCF0)") {
+        Some(t) => {
+            PICKUP_TRAMP.store(t, Ordering::Release);
+            log::line("pickup: map item pickup hook installed: an item the friend's pickup already gave here is not given twice");
+        }
+        None => log::line("pickup: map item pickup hook missing: an item still lying here after the friend's pickup can be picked up again"),
+    }
     let detour: Fn6 = grant_detour;
     match hook::install_detour(GRANT_RVA, &GRANT_PROLOGUE, detour as usize, "GrantItems (0x91C970)") {
         Some(t) => {
@@ -1206,8 +1319,10 @@ struct LotIndex {
     rows: HashMap<i32, (u32, [u32; 4])>,
     /// share_pickups: map treasure rows with one sure goods slot, row -> (lot flag, entry).
     map: HashMap<i32, (u32, [u32; 4])>,
-    /// Their lot flags -> the first row with that flag.
+    /// Their lot flags (the sure slot's and the row's) -> the first row with that flag.
     map_by_flag: HashMap<u32, i32>,
+    /// Map rows -> every lot flag the pickup may set (the sure slot's flag, the row's flag).
+    map_flags: HashMap<i32, Vec<u32>>,
 }
 
 fn build_lot_index() -> Option<LotIndex> {
@@ -1241,6 +1356,7 @@ fn build_lot_index() -> Option<LotIndex> {
     let mut rows = HashMap::new();
     let mut map = HashMap::new();
     let mut map_by_flag = HashMap::new();
+    let mut map_flags = HashMap::new();
     let (mut script, mut drops, mut treasure, mut shop, mut repeat, mut not_sure, mut coop) = (0, 0, 0, 0, 0, 0, 0);
     for (id, r) in unsafe { lots.rows::<ITEMLOT_PARAM_ST>() } {
         let id = id as i32;
@@ -1263,7 +1379,15 @@ fn build_lot_index() -> Option<LotIndex> {
                 && !items::is_coop_goods(*item)
             {
                 map.insert(id, (flag, [GOODS | *item, *num, u32::MAX, 0]));
-                map_by_flag.entry(flag).or_insert(id);
+                let mut flags = vec![flag];
+                let row_flag = r.get_item_flag_id();
+                if row_flag > 0 && row_flag as u32 != flag {
+                    flags.push(row_flag as u32);
+                }
+                for &f in &flags {
+                    map_by_flag.entry(f).or_insert(id);
+                }
+                map_flags.insert(id, flags);
             }
             continue;
         }
@@ -1288,7 +1412,7 @@ fn build_lot_index() -> Option<LotIndex> {
         map_by_flag.len(),
         u8::from(SHARE_PICKUPS.load(Ordering::Relaxed))
     ));
-    Some(LotIndex { rows, map, map_by_flag })
+    Some(LotIndex { rows, map, map_by_flag, map_flags })
 }
 
 /// Before a queued grant goes out: still ours in this save? (Its lot flags on here, every
@@ -1750,6 +1874,12 @@ impl KeyItems {
             }
         }
         let world_grants: Vec<(usize, Vec<[u32; 4]>)> = WORLD_GRANTS.try_lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+        let blocked: Vec<(u32, u32)> = BLOCKED_PICKUPS.try_lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+        for (flag, handle) in &blocked {
+            log::line(&format!(
+                "pickup: a second pickup refused: map item {handle:#x} (lot flag {flag}) was already given here by the friend's pickup; taken off the map, nothing given"
+            ));
+        }
         self.pickup_echo.retain(|_, t| now.duration_since(*t) < PICKUP_ECHO_KEEP);
         self.pickups_given.retain(|(t, _)| now.duration_since(*t) < PICKUP_RECENT_KEEP);
         if !on {
@@ -1766,13 +1896,23 @@ impl KeyItems {
             self.pickup_ring = None;
         }
         self.last_in_world = in_world_for;
-        if in_world_for < DOCTOR_IN_WORLD {
+        let index = if in_world_for < DOCTOR_IN_WORLD {
+            None
+        } else {
+            if self.lots.is_none() {
+                self.lots = Some(build_lot_index().map(std::sync::Arc::new));
+            }
+            self.lots.clone().flatten()
+        };
+        let Some(index) = index else {
+            // Diagnostics still go to the log (first seconds after a load, no index).
+            for (rva, entries) in &world_grants {
+                if WORLD_GRANT_LOGS.fetch_add(1, Ordering::Relaxed) < MAX_WORLD_GRANT_LOGS {
+                    log::line(&format!("pickup: game grant [{}] (caller RVA {rva:#x}, early after a load)", describe_all(entries).join(", ")));
+                }
+            }
             return;
-        }
-        if self.lots.is_none() {
-            self.lots = Some(build_lot_index().map(std::sync::Arc::new));
-        }
-        let Some(Some(index)) = self.lots.clone() else { return };
+        };
         self.log_world_grants(&index, &world_grants);
         if connected && self.map_on.is_none() {
             // The ring position first: this runs on the game thread, no flag write comes in between.
@@ -1869,6 +2009,8 @@ impl KeyItems {
         let mut wait = Vec::new();
         let mut give: Vec<([u32; 4], i32, u32)> = Vec::new();
         let mut flags_done: HashSet<u32> = HashSet::new();
+        // Rows whose map item must not stay on the map here (given, owned, or already ours).
+        let mut off_map: Vec<i32> = Vec::new();
         for &row in rows {
             let Some(&(flag, entry)) = index.map.get(&row) else {
                 log::line(&format!("pickup: friend's lot {row} is no map pickup with one sure item here, not given"));
@@ -1884,6 +2026,7 @@ impl KeyItems {
                 }
                 Some(true) => {
                     log::line(&format!("pickup: friend's lot {row} [{}]: already picked up here (lot flag {flag} on)", describe(&entry)));
+                    off_map.push(row);
                     continue;
                 }
                 Some(false) => {}
@@ -1899,6 +2042,8 @@ impl KeyItems {
                     "pickup: friend's lot {row} [{}]: already owned here, lot flag {flag} set ({set})",
                     describe(&entry)
                 ));
+                self.mark_shared(index, row);
+                off_map.push(row);
                 continue;
             }
             give.push((entry, row, flag));
@@ -1917,9 +2062,33 @@ impl KeyItems {
                 self.pickups_got += 1;
                 self.pickups_given.push((now, row));
                 log::line(&format!("pickup: got lot {row} [{}] that the friend picked up, lot flag {flag} set ({set})", describe(&entry)));
+                self.mark_shared(index, row);
+                off_map.push(row);
+            }
+        }
+        // The item still lying here (glowing, with its prompt) goes, as if picked up.
+        for row in off_map {
+            let flags = index.map_flags.get(&row).cloned().unwrap_or_default();
+            let taken = take_off_map(&flags);
+            if taken.is_empty() {
+                log::line(&format!("pickup: lot {row} is not on the loaded map here (its lot flag keeps it away)"));
+            } else {
+                for (handle, flag) in taken {
+                    log::line(&format!("pickup: lot {row} taken off the map here (handle {handle:#x}, lot flag {flag}): no glow, no prompt"));
+                }
             }
         }
         (!wait.is_empty()).then_some(wait)
+    }
+
+    /// The lot flags of map row `row` count as "given by the friend's pickup" here: a later
+    /// pickup of an item still lying here with one of them is refused (`pickup_detour`).
+    fn mark_shared(&mut self, index: &LotIndex, row: i32) {
+        if let Some(flags) = index.map_flags.get(&row)
+            && let Ok(mut s) = SHARED_FLAGS.lock()
+        {
+            s.extend(flags.iter().copied());
+        }
     }
 
     /// share_pickups diagnostics: the game's own grants outside AwardItemLot. One that gives
