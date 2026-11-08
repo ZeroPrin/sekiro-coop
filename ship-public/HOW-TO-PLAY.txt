@@ -1,5 +1,9 @@
-SEKIRO TOGETHER 1.0.9 beta - quick guide
+SEKIRO TOGETHER 1.0.9-pickups.1 - quick guide
 =============================================
+
+Unofficial build: Sekiro Together 1.0.9 beta plus shared map pickups
+(share_pickups, see SHARED PICKUPS below). Everybody in the session needs
+this same build. Not made or supported by Tihvert.
 
 Beta, still buggy. Back up your saves before playing.
 Full readme, known bugs and source: https://github.com/Tihvert/sekiro-coop
@@ -67,6 +71,14 @@ Only the host needs an open port. All joiners use the same address.
 Can't open ports? A virtual LAN (Radmin VPN, ZeroTier, Tailscale) works:
 everyone joins the same network and joiners use the host's VPN IP as
 udp_host_address. No port forwarding needed then.
+
+SHARED PICKUPS (share_pickups = 1 in sekiro_coop_settings.ini, default on)
+An item one of you picks up from the map while connected (treasure, chests,
+items on corpses) is given to the other too, with the small pickup log, and
+the other can no longer pick it up there. Both players need share_pickups = 1.
+Pickups made alone or before the session stay your own; shops stay your own.
+The item on the ground may stay visible for the other until the next load.
+Log lines start with "pickup:".
 
 SAVES
 Co-op uses its own save S0000.coop.sl2, your normal save isn't touched.
