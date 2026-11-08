@@ -36,6 +36,16 @@ the next load, and whether picking it up there gives the item a second time. The
 own grants outside AwardItemLot are logged as `pickup: game grant [...] (caller RVA ...)`;
 one that matches a friend's pickup given here is logged as `pickup: POSSIBLE DOUBLE`.
 
+## Working on this fork
+
+- Repository: https://github.com/ZeroPrin/sekiro-coop, branch `share-pickups` (the fork's
+  default branch). `main` stays a copy of the original author's `main`.
+- New work: a branch from `share-pickups`, then a pull request into `share-pickups`.
+- Bump `MOD_VERSION` in `crates/coop-dll/src/ui.rs` (`1.0.9-pickups.2`, ...) with every build
+  you give to other players: everybody in a session needs the same build.
+- When the original author publishes newer source (1.0.10 / 1.0.11), the pickup commits can be
+  rebased onto it (`git remote add upstream https://github.com/Tihvert/sekiro-coop`).
+
 ## Build
 
 `build-public.cmd` (VS 2022 Build Tools with MSVC x64 and Windows SDK 10.0.26100, Rust
