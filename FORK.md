@@ -2,7 +2,7 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.2`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3`. Everybody in a session needs the same build.
 
 ## What it adds: shared map pickups (`[GAMEPLAY] share_pickups`, default 1)
 
@@ -54,12 +54,24 @@ Still open: chests. If a chest is an ObjAct whose item node only spawns when it 
 the chest itself stays closed for the receiver (opening it gives nothing). Enemy drops
 (kind 5, no lot flag) are not shared.
 
+## Fixes to the 1.0.9 base
+
+- **False wipe** (1.0.9-pickups.3, `persist.rs`). A wipe was "every player's committed death
+  within 90 s", even when the first player had already reloaded and was alive again. Live
+  2026-11-09: the host died, reloaded and played on for 79 s, the friend then died, and both
+  sides cleared the dead set, the paid kills and the boss records (killed enemies and damaged
+  minibosses would come back on the next load). Now a death stops counting once that player
+  loaded after it and is alive (`death_over`: ours after our death reload, a peer's after its
+  last hidden snapshot); checked after the wipe test, so a death that comes in during the other
+  player's death reload is still a wipe. Log line: `persist: ... is back after ... death: it no
+  longer counts for a wipe`.
+
 ## Working on this fork
 
 - Repository: https://github.com/ZeroPrin/sekiro-coop, branch `share-pickups` (the fork's
   default branch). `main` stays a copy of the original author's `main`.
 - New work: a branch from `share-pickups`, then a pull request into `share-pickups`.
-- Bump `MOD_VERSION` in `crates/coop-dll/src/ui.rs` (`1.0.9-pickups.2`, ...) with every build
+- Bump `MOD_VERSION` in `crates/coop-dll/src/ui.rs` (`1.0.9-pickups.4`, ...) with every build
   you give to other players: everybody in a session needs the same build.
 - When the original author publishes newer source (1.0.10 / 1.0.11), the pickup commits can be
   rebased onto it (`git remote add upstream https://github.com/Tihvert/sekiro-coop`).
