@@ -120,6 +120,11 @@ const PTYPE_SPEFFECT_LIST: u32 = 61;
 /// NetworkManipulator see a ~17 ms interval and snap instead of blend.
 /// More queued frames of one type than this: drop the oldest (latency).
 const MAX_QUEUED_PER_TYPE: usize = 10;
+/// A measured type-1 interval below this: the peer sends faster than the game's own 12/s
+/// (`player_packet_hz`, packetrate.rs). At or above it every rule stays as tuned for 12/s.
+const RAISED_RATE_BELOW_MS: f32 = 60.0;
+/// At a raised rate, at most this much type-1 backlog (ms of the peer's frames) is kept.
+const RAISED_RATE_BACKLOG_MS: f32 = 200.0;
 const MAX_INBOX: usize = 64;
 const MAX_OUTBOX: usize = 64;
 const STATS_EVERY: Duration = Duration::from_secs(10);
@@ -186,7 +191,8 @@ static SOLID_VT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 struct Inbox {
-    packets: VecDeque<(u32, Vec<u8>)>,
+    /// `(type, bytes, arrival)`.
+    packets: VecDeque<(u32, Vec<u8>, Instant)>,
     served_frame: HashMap<u32, u64>,
     frame_released_at: Option<Instant>,
     served: u64,
@@ -196,6 +202,8 @@ struct Inbox {
     /// Type-1 arrivals: last time and the smoothed interval (ms, 0 = unknown).
     last_frame_at: Option<Instant>,
     frame_interval_ms: f32,
+    /// Smoothed time a served type-1 frame waited in this inbox (ms, 0 = none served yet).
+    playout_ms: f32,
 }
 
 #[derive(Default)]
@@ -219,6 +227,7 @@ static TEE_STATS: Mutex<Option<TeeStats>> = Mutex::new(None);
 /// Once per FrameBegin, before anything else.
 pub fn begin_frame() {
     FRAME.fetch_add(1, Ordering::Relaxed);
+    crate::packetrate::on_frame(Instant::now());
 }
 
 /// net.rs: the slots (bit = slot) that want our player's packets; 0 = tee forwards nothing.
@@ -264,16 +273,17 @@ pub fn push_inbound(from: PeerId, ptype: u32, data: Vec<u8>) {
     let Ok(mut g) = INBOXES[i].lock() else { return };
     let ib = g.get_or_insert_with(Inbox::default);
     ib.received += 1;
+    let now = Instant::now();
     if ptype == PTYPE_FRAME {
-        let now = Instant::now();
         if let Some(t) = ib.last_frame_at {
             let ms = (now.duration_since(t).as_secs_f32() * 1000.0).clamp(5.0, 300.0);
             ib.frame_interval_ms = if ib.frame_interval_ms <= 0.0 { ms } else { ib.frame_interval_ms * 0.95 + ms * 0.05 };
         }
         ib.last_frame_at = Some(now);
     }
-    if ib.packets.iter().filter(|(t, _)| *t == ptype).count() >= MAX_QUEUED_PER_TYPE
-        && let Some(i) = ib.packets.iter().position(|(t, _)| *t == ptype)
+    let max_queued = if ptype == PTYPE_FRAME { max_queued_frames(ib.frame_interval_ms) } else { MAX_QUEUED_PER_TYPE };
+    if ib.packets.iter().filter(|(t, ..)| *t == ptype).count() >= max_queued
+        && let Some(i) = ib.packets.iter().position(|(t, ..)| *t == ptype)
     {
         ib.packets.remove(i);
         ib.dropped_old += 1;
@@ -282,7 +292,53 @@ pub fn push_inbound(from: PeerId, ptype: u32, data: Vec<u8>) {
         ib.packets.pop_front();
         ib.dropped_old += 1;
     }
-    ib.packets.push_back((ptype, data));
+    ib.packets.push_back((ptype, data, now));
+}
+
+/// Type-1 frames kept queued at the measured interval: 10 at the game's own rate, at a raised
+/// rate about `RAISED_RATE_BACKLOG_MS` of them (6 at 30/s, 10 at 60/s), never fewer than 4.
+fn max_queued_frames(interval_ms: f32) -> usize {
+    if interval_ms <= 0.0 || interval_ms >= RAISED_RATE_BELOW_MS {
+        return MAX_QUEUED_PER_TYPE;
+    }
+    ((RAISED_RATE_BACKLOG_MS / interval_ms).round() as usize).clamp(4, MAX_QUEUED_PER_TYPE)
+}
+
+/// How long before the nominal spacing a type-1 frame may already be released. At the
+/// game's own rate none (as tuned live). At a raised rate half a frame: the sender's cadence
+/// is a whole number of its frames (33.3 ms at 30/s), and a frame that comes a little early
+/// would otherwise hold the packet one more frame (50 ms), so the queue and the lag grew.
+fn release_early_ms(nominal_ms: f32, frame_ms: f32) -> f32 {
+    if nominal_ms >= RAISED_RATE_BELOW_MS { 0.0 } else { (frame_ms * 0.5).clamp(2.0, 8.0) }
+}
+
+/// How far in the past the position pin reads the peer's snapshots (`follow_peers`).
+/// `fixed` = `native_pin_delay_ms` (0 = auto). Auto: `NATIVE_POS_DELAY_MS` (130, tuned live)
+/// while the peer sends at the game's own rate or nothing is measured yet. At a raised rate the
+/// pin has to trail the packet position by about what `0x7EC9E0` expects, 1.2 packet intervals
+/// (it sets the remote's velocity to distance / (1.2 x interval), and the locomotion level comes
+/// from that): play-out wait + 1.2 x interval - one frame (the pin is a frame older when the
+/// packet is processed). A fixed 130 ms at 30/s would read walking as running or dashing
+/// (IMPLEMENTATION-NOTES section 7). [ARV: the game's own 1.2 factor, not tuned live.]
+pub fn pin_delay_ms(fixed: u32, interval_ms: f32, playout_ms: f32, frame_ms: f32) -> u32 {
+    if fixed > 0 {
+        return fixed;
+    }
+    if interval_ms <= 0.0 || interval_ms >= RAISED_RATE_BELOW_MS || playout_ms <= 0.0 {
+        return NATIVE_POS_DELAY_MS;
+    }
+    let ms = playout_ms + 1.2 * interval_ms - frame_ms;
+    (ms.round().max(0.0) as u32).clamp(PIN_DELAY_MIN_MS, NATIVE_POS_DELAY_MS)
+}
+
+/// `pin_delay_ms` for peer index `i`, from its inbox.
+fn pin_delay_for(i: usize) -> u32 {
+    let (interval, playout) = INBOXES
+        .get(i)
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| g.as_ref().map(|ib| (ib.frame_interval_ms, ib.playout_ms)))
+        .unwrap_or((0.0, 0.0));
+    pin_delay_ms(crate::tuning::native_pin_delay_ms(), interval, playout, crate::packetrate::frame_ms())
 }
 
 fn clear_inbox(i: usize) {
@@ -326,7 +382,7 @@ fn next_packet(i: usize, ptype: u32, cap: usize) -> Option<Vec<u8>> {
     if ib.served_frame.get(&ptype) == Some(&frame) {
         return None;
     }
-    let queued = ib.packets.iter().filter(|(t, _)| *t == ptype).count();
+    let queued = ib.packets.iter().filter(|(t, ..)| *t == ptype).count();
     if queued == 0 {
         return None;
     }
@@ -346,12 +402,13 @@ fn next_packet(i: usize, ptype: u32, cap: usize) -> Option<Vec<u8>> {
         3..=4 => 0.85,
         _ => 0.55,
     };
-    let spacing = Duration::from_secs_f32(nominal * factor / 1000.0);
+    let early = release_early_ms(nominal, crate::packetrate::frame_ms());
+    let spacing = Duration::from_secs_f32((nominal * factor - early).max(1.0) / 1000.0);
     if ptype == PTYPE_FRAME && ib.frame_released_at.is_some_and(|t| now.duration_since(t) < spacing) {
         return None;
     }
-    let i = ib.packets.iter().position(|(t, _)| *t == ptype)?;
-    let (_, data) = ib.packets.remove(i)?;
+    let i = ib.packets.iter().position(|(t, ..)| *t == ptype)?;
+    let (_, data, arrived) = ib.packets.remove(i)?;
     if data.len() > cap {
         ib.dropped_big += 1;
         return None;
@@ -359,6 +416,8 @@ fn next_packet(i: usize, ptype: u32, cap: usize) -> Option<Vec<u8>> {
     ib.served_frame.insert(ptype, frame);
     if ptype == PTYPE_FRAME {
         ib.frame_released_at = Some(now);
+        let waited = (now.duration_since(arrived).as_secs_f32() * 1000.0).min(1000.0);
+        ib.playout_ms = if ib.playout_ms <= 0.0 { waited } else { ib.playout_ms * 0.9 + waited * 0.1 };
     }
     ib.served += 1;
     Some(data)
@@ -1464,13 +1523,20 @@ impl Native {
                 let g = INBOXES[i].lock().ok()?;
                 let ib = g.as_ref()?;
                 Some(format!(
-                    "slot {i}: received {} served {} dropped old {} too big {} queued {}, frame interval {:.0} ms",
+                    "slot {i}: received {} served {} dropped old {} too big {} queued {}, frame interval {:.0} ms, play-out {:.0} ms, pin delay {} ms",
                     ib.received,
                     ib.served,
                     ib.dropped_old,
                     ib.dropped_big,
                     ib.packets.len(),
-                    ib.frame_interval_ms
+                    ib.frame_interval_ms,
+                    ib.playout_ms,
+                    pin_delay_ms(
+                        crate::tuning::native_pin_delay_ms(),
+                        ib.frame_interval_ms,
+                        ib.playout_ms,
+                        crate::packetrate::frame_ms()
+                    )
                 ))
             })
             .collect();
@@ -1508,9 +1574,10 @@ impl Native {
             format!("; N0 clones {} [{}], player chr set {used} of {cap}", self.tests.len(), list.join(", "))
         };
         log::line(&format!(
-            "native stats ({secs:.0} s): tee {} [{}], forward {:#08b}, outbox dropped {out_dropped} too big {out_big}; inbox {inbox}{unmapped}; {remote}; {}{clones}",
+            "native stats ({secs:.0} s): tee {} [{}] ({}), forward {:#08b}, outbox dropped {out_dropped} too big {out_big}; inbox {inbox}{unmapped}; {remote}; {}{clones}",
             self.tee_on.is_some(),
             tee.join(", "),
+            crate::packetrate::describe(),
             FORWARD.load(Ordering::Relaxed),
             log_queue()
         ));
@@ -1539,7 +1606,7 @@ impl Native {
             let Some(peer) = r.peer else { continue };
             let target = net
                 .and_then(|n| n.peer(peer))
-                .and_then(|p| p.remote_smoothed(NATIVE_POS_DELAY_MS))
+                .and_then(|p| p.remote_smoothed(pin_delay_for(peer.index())))
                 .filter(|(p, _)| crate::game::sane_pos(*p));
             let pin = self.pins.entry(peer).or_default();
             // 2026-10-24 (v7.11, video, Lady Butterfly): a deathblow / grab with this peer's
@@ -1603,8 +1670,11 @@ impl Native {
 
 /// The peer's interpolated snapshot position this far in the past: about as late as the
 /// animation, which comes through the game's own packet queue (latency + ~1.5 packets of
-/// play-out at 12/s).
+/// play-out at 12/s). The value while the peer sends at the game's own rate (`pin_delay_ms`).
 const NATIVE_POS_DELAY_MS: u32 = 130;
+/// The auto pin delay never goes below this: the snapshots it interpolates come 60/s (30/s
+/// relayed by a host with 3+ players), so less would mostly extrapolate.
+const PIN_DELAY_MIN_MS: u32 = 60;
 /// UpdateCoords hook slots of the pins: one per peer index, the top `MAX_PLAYERS` slots of
 /// the table (enemies.rs allocates below `PIN_SLOT_BASE`; puppet's ghost uses slot 0).
 pub const PIN_SLOT_BASE: usize = hook::TARGETS - MAX_PLAYERS;
@@ -1766,23 +1836,44 @@ impl PinStats {
     }
 }
 
-/// The sender side (PadManipulator slot 11, `0x7EEB50`) re-arms its send
-/// countdown with `ChrSync.FrameSkipCount` = 5 frames (`mov ecx, 5` before
-/// `0x96F8A0` at `0x7EEF47`): 12 frames/s, which the remote shows as small
-/// jumps on fast moves. NOT INSTALLED: the remote's locomotion level is distance /
-/// (1.2 x time between packets), so faster sending made it read walking as dashing;
-/// the position now comes from our 60/s snapshots instead (puppet.rs follow_native).
-/// 1 = every frame (60/s at 60 fps, ≤ 60 KB/s; 2 still
-/// showed small jumps, live 2026-10-23). Both sides patch
-/// their own sender; the receiver measures the cadence (`frame_interval_ms`).
-#[allow(dead_code)]
-pub fn install_send_rate() -> bool {
-    crate::hook::patch_code(0x7EEF47, &[0xB9, 0x05, 0x00, 0x00, 0x00], &[0xB9, 0x01, 0x00, 0x00, 0x00], "player send rate (every frame)")
-}
+// The player send rate (`0x7EEF47` / `0x96F8A0`, ChrSync.FrameSkipCount) is packetrate.rs.
+// On 2026-10-23 a fixed patch to every frame was dropped because the remote read walking as
+// dashing with the fixed 130 ms pin; the pin delay now follows the measured rate (`pin_delay_ms`).
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_delay_follows_the_peer_rate() {
+        let f = 1000.0 / 60.0;
+        // The game's own rate, or nothing measured yet: the live-tuned 130 ms.
+        assert_eq!(pin_delay_ms(0, 83.0, 100.0, f), 130);
+        assert_eq!(pin_delay_ms(0, 0.0, 0.0, f), 130);
+        assert_eq!(pin_delay_ms(0, 33.0, 0.0, f), 130);
+        // 30/s: play-out 47 ms + 1.2 x 33 - one frame = 70 ms.
+        assert_eq!(pin_delay_ms(0, 33.3, 47.0, f), 70);
+        // 60/s: would be 33 ms, floored at the snapshot limit.
+        assert_eq!(pin_delay_ms(0, 16.7, 30.0, f), PIN_DELAY_MIN_MS);
+        // A long play-out never goes above the 12/s value.
+        assert_eq!(pin_delay_ms(0, 33.3, 400.0, f), 130);
+        // The setting wins.
+        assert_eq!(pin_delay_ms(95, 33.3, 47.0, f), 95);
+        assert_eq!(pin_delay_ms(95, 83.0, 100.0, f), 95);
+    }
+
+    #[test]
+    fn play_out_rules_stay_as_tuned_at_the_games_rate() {
+        assert_eq!(max_queued_frames(83.0), MAX_QUEUED_PER_TYPE);
+        assert_eq!(max_queued_frames(0.0), MAX_QUEUED_PER_TYPE);
+        assert_eq!(max_queued_frames(33.3), 6);
+        assert_eq!(max_queued_frames(16.7), MAX_QUEUED_PER_TYPE);
+        assert_eq!(max_queued_frames(55.0), 4);
+        assert_eq!(release_early_ms(83.0, 16.7), 0.0);
+        assert_eq!(release_early_ms(33.3, 1000.0 / 60.0), 8.0);
+        assert!((release_early_ms(33.3, 1000.0 / 120.0) - 1000.0 / 240.0).abs() < 1e-3);
+        assert_eq!(release_early_ms(16.7, 50.0), 8.0);
+    }
 
     #[test]
     fn pin_release_rules() {

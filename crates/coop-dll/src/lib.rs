@@ -61,6 +61,7 @@ mod puppet;
 mod puppetguard;
 mod ngblock;
 mod optprobe;
+mod packetrate;
 mod quitblock;
 mod restsync;
 mod resurrect;
@@ -213,6 +214,8 @@ fn init(hmodule: usize) {
     // v8.60: the owner's type-5 HP does not kill a Puppeteer puppet here (puppetguard.rs).
     puppetguard::install();
     fps::install();
+    // [ADVANCED] player_packet_hz: our type-1 send rate (nothing patched at 12).
+    packetrate::install();
     // The material constant-buffer over-read behind the nvwgf2umx.dll crash (gpuguard.rs).
     gpuguard::install(settings::gpu_guard_at_start());
     #[cfg(feature = "testsync")]

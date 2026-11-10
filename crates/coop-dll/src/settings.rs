@@ -393,6 +393,8 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::MAX_PLAYERS.store(ini.num("max_players", 6, 2, max_players, warn) as u8, Relaxed);
     let native_max = ini.num("native_session_max_players", max_players, 2, max_players, warn);
     crate::nsession::MAX_NATIVE_PLAYERS.store(native_max as u8, Relaxed);
+    // Experimental: our player frame (type 1) rate, packetrate.rs. 12 = the game's own.
+    tuning::PLAYER_PACKET_HZ.store(player_packet_hz_setting(ini, warn), Relaxed);
 
     // [DEBUG]
     tuning::NATIVE_REMOTE.store(ini.flag("native_remote", true, warn), Relaxed);
@@ -419,6 +421,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::NATIVE_SPAWN_DELAY_S.store(ini.num("native_spawn_delay_s", 10, 2, 120, warn), Relaxed);
     tuning::NATIVE_DRESS_DELAY_MS.store(ini.num("native_dress_delay_ms", 3000, 0, 60_000, warn), Relaxed);
     tuning::N0_CLONES.store(ini.num("n0_clones", 0, 0, 5, warn), Relaxed);
+    tuning::NATIVE_PIN_DELAY_MS.store(pin_delay_setting(ini, warn), Relaxed);
     tuning::RELAY_SNAPSHOT_HZ.store(ini.num("relay_snapshot_hz", 30, 10, 120, warn), Relaxed);
     tuning::SNAPSHOT_HZ_MULTI.store(ini.num("snapshot_hz_multi", 60, 20, 120, warn), Relaxed);
     tuning::DEATH_RESTORE_DELAY_S.store(ini.num("death_restore_delay_s", 8, 2, 60, warn), Relaxed);
@@ -445,6 +448,20 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
         GPU_GUARD_AT_START.store(ini.flag("gpu_guard", true, warn), Relaxed);
         OVERLAY_HOOK_AT_START.store(ini.flag("overlay_hook", true, warn), Relaxed);
         STALL_WATCHDOG_AT_START.store(ini.flag("stall_watchdog", true, warn), Relaxed);
+    }
+}
+
+/// `player_packet_hz`: 12..=60, 12 = the game's own rate.
+fn player_packet_hz_setting(ini: &Ini, warn: &mut Vec<String>) -> u32 {
+    use crate::packetrate::{DEFAULT_HZ, MAX_HZ, VANILLA_HZ};
+    ini.num("player_packet_hz", DEFAULT_HZ, VANILLA_HZ, MAX_HZ, warn)
+}
+
+/// `native_pin_delay_ms`: 0 = auto, else 40..=250 ms.
+fn pin_delay_setting(ini: &Ini, warn: &mut Vec<String>) -> u32 {
+    match ini.num("native_pin_delay_ms", 0, 0, 250, warn) {
+        0 => 0,
+        ms => ms.max(40),
     }
 }
 
@@ -697,6 +714,12 @@ max_players = 6
 ;     this many players (2..6); with more, this mod's own enemy sync for everyone.
 ;     2 = the native session only in 2-player co-op.
 native_session_max_players = 6
+; Experimental: how many times a second your own character's movement packet goes out to
+;     the others (12..60). 12 = the game's own rate; 30 = the friend sees you with less delay
+;     and smoother (about 4 KB/s per player instead of 1.5). Each player sets it for their own
+;     sending; use the same value on all machines, at most your friends' frame rate.
+;     Read when the game starts.
+player_packet_hz = 30
 
 [DEBUG]
 ; Leave these alone unless you are testing. The defaults are the tested setup.
@@ -726,6 +749,9 @@ observe = 1
 log_off = observe, hkb, native: remote moved
 ; Host and an echo peer inside this game: the friend is you, 1 second late. Test alone.
 loopback = 0
+; The friend's position on your screen is read this many ms in the past (40..250).
+; 0 = auto: 130 while the friend sends at the game's own rate, less when they send faster.
+native_pin_delay_ms = 0
 ; Test of 3-6 players on one PC: while you host (or with loopback = 1), this many extra
 ; players (0..5) join from inside your game, each replaying you a bit later (1 s, 1.25 s, ...).
 ; They need room: max_players at least 1 + friends + loopback_peers.
@@ -1139,6 +1165,31 @@ mod tests {
 
     /// A settings file from before the items ([NETWORK] section, `role`): every key it
     /// shares with the new layout is read, `role` is ignored without a warning.
+    #[test]
+    fn player_packet_rate_parses_and_clamps() {
+        // The pure readers, not `apply`: other tests apply the default file in parallel.
+        let hz = |text: &str| {
+            let mut warn = Vec::new();
+            let ini = Ini::parse(text);
+            (player_packet_hz_setting(&ini, &mut warn), pin_delay_setting(&ini, &mut warn), warn.len())
+        };
+        assert_eq!(hz("player_packet_hz = 45
+native_pin_delay_ms = 70
+"), (45, 70, 0));
+        assert_eq!(hz("player_packet_hz = 5
+native_pin_delay_ms = 10
+"), (12, 40, 0));
+        assert_eq!(hz("player_packet_hz = 1000
+native_pin_delay_ms = 900
+"), (60, 250, 0));
+        assert_eq!(hz("player_packet_hz = fast
+native_pin_delay_ms = 0
+"), (30, 0, 1));
+        // A file from before the setting: the default, no warning.
+        assert_eq!(hz("password = x
+"), (30, 0, 0));
+    }
+
     #[test]
     fn party_bar_settings_parse_and_fall_back() {
         let mut warn = Vec::new();
