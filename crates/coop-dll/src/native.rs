@@ -153,7 +153,7 @@ pub struct Remote {
     peer: Option<PeerId>,
     /// The first dress ran (`dress_now`): from then on a new loadout of the peer re-dresses.
     dressed: bool,
-    /// The peer's equip ids last put on it (loadout.rs), None while it wears ours (fallback).
+    /// The peer's item ids last put on its PGD (loadout.rs), None while it wears ours (fallback).
     applied: Option<[i32; crate::ghost::EQUIP_SLOTS]>,
     /// Last seen look (v8.53): model ins (ChrIns+0x48) and its draw group (model+0x23). A change
     /// is logged at once ("my model is not visible" left no trace in the log, 2026-10-27).
@@ -1220,26 +1220,41 @@ impl Native {
         }
     }
 
-    /// `l`'s equip ids onto `peer`'s remote, then the part reload (RE-FINDINGS-2 § Solid
-    /// ghost (c): the id writes alone do not reload the parts).
+    /// `l`'s item ids onto `peer`'s remote (loadout.rs): equipped into the replica's own
+    /// PlayerGameData (`r.pgd`) as the game fills / equips a PGD, then its ChrAsm copied into
+    /// the PlayerIns holders (as the PlayerIns ctor does) and the parts reloaded through the
+    /// guarded vtable slot 21 (RE-FINDINGS-2 § Solid ghost (c)). The holders are synced even
+    /// when no slot changed the first time: the fallback dress put OUR handles there.
     fn dress_from_peer(r: &mut Remote, peer: PeerId, l: &coop_net::Loadout) {
+        let first = r.applied.is_none();
         r.applied = Some(l.slots);
-        match crate::ghost::dress_with(r.chr, &l.slots, &format!("peer slot {}", peer.slot())) {
-            Ok(0) => {}
-            // `native_dress_delay_ms = 0` dresses right after the factory: no model to reload yet.
-            Ok(_) if !r.seen_in_set => log::line(&format!("native: part reload of {:#x} skipped (not in the player chr set yet)", r.chr.0)),
-            Ok(n) => match crate::ghost::reload_parts(r.chr) {
-                Ok(()) => log::line(&format!("native: parts of {:#x} reloaded after {n} slot(s) changed", r.chr.0)),
-                Err(e) => log::line(&format!("native: part reload of {:#x} skipped: {e}", r.chr.0)),
-            },
-            Err(e) => log::line(&format!("native: dress from peer slot {} failed: {e}", peer.slot())),
+        let who = format!("peer slot {}", peer.slot());
+        let n = match crate::loadout::apply(r.pgd, &l.slots, &who) {
+            Ok(n) => n,
+            Err(e) => {
+                log::line(&format!("loadout: {who} not applied to {:#x}: {e}", r.chr.0));
+                return;
+            }
+        };
+        if n == 0 && !first {
+            return;
         }
-        // TODO(IDA): combat art. `l.art` (-1 for now, loadout.rs) belongs in this remote's
-        // PlayerGameData (`r.pgd`), which `create` filled from a CharaInitParam row: its
-        // `cult_sword_id` (row +0x110) is the template's art, the one every art of the friend
-        // plays as (Whirlwind Slash). Hypothesis: PGD_FILL_A/B (`0x7B7470` / `0x7B7120`) copy
-        // it into a PGD / EquipGameData field; find that write target in IDA, then write
-        // `l.art` there (when >= 0). Do not guess an offset.
+        match crate::loadout::sync_chr(r.chr, r.pgd) {
+            Ok(h) => log::line(&format!("loadout: {who} {n} slot(s) applied, {h} ChrAsm holder(s) of {:#x} synced from its PGD", r.chr.0)),
+            Err(e) => {
+                log::line(&format!("loadout: {who} ChrAsm sync of {:#x} skipped: {e}", r.chr.0));
+                return;
+            }
+        }
+        // `native_dress_delay_ms = 0` dresses right after the factory: no model to reload yet.
+        if !r.seen_in_set {
+            log::line(&format!("loadout: refresh of {:#x} skipped (not in the player chr set yet)", r.chr.0));
+            return;
+        }
+        match crate::ghost::reload_parts(r.chr) {
+            Ok(()) => log::line(&format!("loadout: refresh of {:#x}: parts reloaded (vtable slot 21)", r.chr.0)),
+            Err(e) => log::line(&format!("loadout: refresh of {:#x} skipped: {e}", r.chr.0)),
+        }
     }
 
     /// A peer's remote dressed earlier: wear the peer's newest loadout when it differs from

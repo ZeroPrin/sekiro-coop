@@ -65,37 +65,74 @@ Nothing about equipment went over the network (the snapshot has pose, animation 
 only). Seen live: the replica wore the observer's prosthetics, and every combat art of the
 friend played as Whirlwind Slash (the template's default art).
 
-- **Message**: bulk kind 0xA8 (`loadout::BULK_LOADOUT`; far from upstream's 41-50 run, reliable, to every peer; the host
-  relays). Body (`coop_net::encode_loadout`): magic `LD`, layout version 1, the sender's 25
-  ChrAsm ids, `art` and `extra[3]` (i32 each, reserved for the combat art / skills, -1 for
-  now). Sent when our ids change and every 3 s as a refresh (late join, lost packets; only
-  while no bulk chunk is unacked). An older build leaves it unread.
-- **Receiver**: the last loadout per peer slot (`loadout::of`). The deferred dress
-  (`native_dress_delay_ms`) now puts the PEER's ids on its replica (`ghost::dress_with`,
-  same `0x9CCBA0` loop) and then reloads the parts through PlayerIns vtable slot 21
-  (`0xA30A50` -> `0xA361C0`, RE-FINDINGS-2 § Solid ghost (c)), only when the slot holds
-  exactly that function and the replica is in the player chr set. A newer loadout that
-  differs from the one applied re-dresses it (not only once). No loadout yet when the dress
-  is due: it wears ours as before, and the first loadout that arrives re-dresses it.
-  `loadout_sync = 0`: nothing is sent and the replica wears ours (the old behaviour).
-- **Log lines**: `loadout: sent [...]` (ours, on change only), `loadout: peer N wears
-  [...]` (theirs, on change), `ghost: dressed like peer slot N, K slots changed, ...`,
-  `native: parts of 0x... reloaded after K slot(s) changed` or `native: part reload of 0x...
-  skipped: ...`, `native: new loadout from peer slot N, re-dressing ...`, and the fallback
-  `native: no loadout from peer slot N yet, ... wears ours for now`.
-- **Live test**: both on this build. The observer equips something the friend does not
-  have (Ichimonji as the art, a different prosthetic) before the session and again during
-  it. Before the fix the replica showed the observer's prosthetics and `ghost: dressed like
-  player`; now the observer's log has `ghost: dressed like peer slot N` with the friend's
-  ids (they match the friend's `loadout: sent` line), the friend's prosthetics are visible
-  on the replica, and a change of the friend's prosthetic shows within ~1 s with a
-  `re-dressing` line. Watch for a crash right after `parts of ... reloaded` (the reload
-  call on a live remote is new); `loadout_sync = 0` turns it off.
-- **Open: the combat art.** Equip ids do not carry it; the replica's PGD keeps the
-  template's `cult_sword_id` (CharaInitParam row `+0x110`), so the friend's arts still play
-  as Whirlwind Slash. `0x7B7470` / `0x7B7120` (PGD_FILL_A/B) read that row into some PGD /
-  EquipGameData field: find the write target in IDA, then send `art` and write it there
-  (`TODO(IDA)` in `native.rs` `dress_from_peer` and in `loadout.rs`).
+- **Ids, not handles** (RE of a live dump, 2026-11-11, `E:/RE/notes-2026-11-11.md`). Layout 1
+  sent the ChrAsm slots (`ChrIns+0x2140`, `+0x24 + 4*slot`): those are gaitem HANDLES
+  (`0x8080xxxx`, `0x907Fxxxx`, identical to `PGD+0x310` ChrAsm), and the getter `0x9CBE40`
+  resolves them through the LOCAL player's inventory, so on another machine they mean nothing.
+  The real ids are in EquipGameData (`PGD+0x278`): `+0x374` i32[25] by ChrAsm slot
+  (`PGD+0x5EC`), category bits included. Dump values: slot 0 = 70100 (Shuriken), **slot 1 =
+  5200 (Nightjar Slash): the right "weapon" is the equipped combat art** (5100 = Whirlwind
+  Slash, the template's), 2 = 73000 (Axe), 4 = 72000 (Flame Vent), 3/5 = 110000 (bare hands),
+  12..15 = protectors (`0x1000_0000 | id`), the rest -1. That is why the friend's arts played
+  as Whirlwind Slash: the replica's PGD kept the template's slot 1.
+- **Message**: bulk kind 0xA8 (`loadout::BULK_LOADOUT`; reliable, to every peer; the host
+  relays). Body (`coop_net::encode_loadout`): magic `LD`, **layout version 2**, the sender's
+  25 EquipGameData ids (GameDataMan+8 -> PGD -> `+0x5EC`), `art` and `extra[3]` (reserved,
+  -1; the art is slot 1). Sent when our ids change and every 3 s as a refresh (late join, lost
+  packets; only while no bulk chunk is unacked). A layout-1 body (the previous build) is
+  ignored and logged once per peer.
+- **Receiver**: the last loadout per peer slot (`loadout::of`). When the deferred dress is due
+  (`native_dress_delay_ms`), and again whenever a newer loadout differs, `loadout::apply`
+  replays on the replica's OWN PlayerGameData (`Remote.pgd`) what the game does when it fills
+  a PGD from a CharaInitParam row (`0x7B7470`, the same call `create` uses on that PGD) and
+  the equip menu (`0xD592F0`), for each slot whose id differs from the PGD's `+0x5EC`:
+  - item already in that PGD's inventory (`0x79D7E0(egd, &id)` >= 0): its entry's handle
+    (`0xC3C9B0` / `0xC3CB00`, the menu's way), then equip;
+  - else a new gaitem handle `0xC37740(GaitemMan 0x143D888A8, &h, &id)`, added to the PGD's
+    inventory `0x79A710(egd, id & 0xF0000000, &h, 1, 1, 0, 1)` (count 1, no "new" mark, no
+    auto-equip; fill_a passes 0 for the last one and lets `0x7A12F0` auto-equip), then equip,
+    then `0xC396C0(&h)` drops our reference as fill_a does;
+  - equip = `0x79F8A0(egd, slot, &h, inv_idx, 0, 1, 0)` (fill_a's arguments): it builds the
+    functor `0x7A46B0` -> `0x9CCBA0` on the PGD's ChrAsm (`egd+0x98`) and `0x7A52B0` writes
+    `egd+0x24[slot]` = inventory index and `egd+0x374[slot]` = id.
+  Then `loadout::sync_chr` copies the PGD's ChrAsm into the PlayerIns holders `+0x2140` and
+  `+0x2198` with `0x9CCEE0(holder, pgd)` (what the PlayerIns ctor `0xA217A0` does, and the
+  equip menu for a weapon swap), and the parts reload through PlayerIns vtable slot 21
+  (`0xA30A50`, only when the slot holds exactly that function and the replica is in the player
+  chr set). The menu's own follow-up `0xA2E1B0(chr)` is NOT called: it sends OUR equipment
+  over the game's session (`PlayerIns+0x2038`), not a refresh.
+- **Validation**: network ids reach a game call only through `loadout::plan`: slots 0..11 take
+  a weapon id (category 0) that is a row of EquipParamWeapon, 12..16 a protector id (category
+  1) that is a row of EquipParamProtector (`SoloParamRepository`, `find_index`). Anything else
+  is skipped with a log line: -1 (unequip is not replayed), accessories / slots 17..24 (fill_a
+  adds them through `0x79BF90`, not replayed), a wrong category, a missing row. Unit tests:
+  `loadout::tests`, `protocol::tests::loadout_round_trip_and_rejects`.
+- **Fallback**: no loadout yet (the friend on an older build, or `loadout_sync = 0`), and N0
+  clones: `ghost::dress_like` as before, OUR handles into the replica's holder. Kept on
+  purpose: without it the template replica has no visible body (ghost.rs). The first loadout
+  then re-syncs the holders from the PGD (even when no slot differed), replacing our handles.
+- **Log lines**: `loadout: sent ids [...]` (ours, on change), `loadout: peer N ids [...]`
+  (theirs, on change), `loadout: peer slot N slot S a -> b applied (ret inventory I, added /
+  in inventory; slot now Some(b))`, `loadout: peer slot N slot S id X skipped (NoRow /
+  Empty / ...)`, `loadout: peer slot N K slot(s) applied, H ChrAsm holder(s) of 0x... synced
+  from its PGD`, `loadout: refresh of 0x...: parts reloaded (vtable slot 21)` or `... skipped:
+  ...`, `native: new loadout from peer slot N, re-dressing ...`, and the fallback `native: no
+  loadout from peer slot N yet, ... wears ours for now`.
+- **Verified vs not.** From the dump (static, Ghidra): the id array and its values, the
+  handle nature of the ChrAsm slots, fill_a's call sequence and arguments, the menu path, the
+  PlayerIns ctor's holder copy, that `0x79A710` / `0x79F8A0` work on the EGD they are given
+  (inventory `egd+0x168`, ChrAsm `egd+0x98`) and that their side effects on the LOCAL player
+  (`0xA2AA00` item-count bookkeeping, `0x7A1B60`) only fire for goods ids
+  (`0x400001F4`, `0x4000044C/D`, `0x40000456`), never for weapons / protectors. NOT tested
+  live: that the replica's model and moveset follow (the combat art in particular may also
+  need the hand/style refresh `0xA26150` the menu calls for weapon swaps, not done), that the
+  gaitem manager's new handles behave on a remote PGD over a long session, and the crash risk
+  of the vtable-21 reload on a live remote (`loadout_sync = 0` turns all of it off).
+- **Live test**: both on this build. The friend equips a combat art and prosthetics the
+  observer does not have before the session and changes the art during it. The observer's log
+  must show `loadout: peer N ids` matching the friend's `loadout: sent ids`, `slot 1 ... ->
+  <art> applied`, the holder sync and the reload; the friend's art must play as itself on the
+  replica, the friend's prosthetics must be visible.
 
 ## Fixes to the 1.0.9 base
 

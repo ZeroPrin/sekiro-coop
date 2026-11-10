@@ -91,8 +91,10 @@ const EQUIP_IDS: usize = 0x24;
 pub const EQUIP_SLOTS: usize = 25;
 const SET_EQUIP_RVA: usize = 0x9CCBA0;
 
-/// The 25 equip ids of `chr`'s ChrAsm (`EQUIP_HOLDER`), None while any is unreadable.
-pub fn equip_ids(chr: Chr) -> Option<[i32; EQUIP_SLOTS]> {
+/// The 25 ChrAsm slots of `chr` (`EQUIP_HOLDER`), None while any is unreadable. They are
+/// gaitem HANDLES of this machine (dump 2026-11-11), not item ids: meaningless to a peer
+/// (loadout.rs sends the EquipGameData ids instead).
+fn equip_ids(chr: Chr) -> Option<[i32; EQUIP_SLOTS]> {
     let h = read_ptr(chr.0 + EQUIP_HOLDER)?;
     let mut ids = [0i32; EQUIP_SLOTS];
     for (slot, id) in ids.iter_mut().enumerate() {
@@ -109,7 +111,7 @@ pub fn dress_like(ghost: Chr, player: Chr) -> Result<usize, String> {
 
 /// Puts `ids` into `ghost`'s ChrAsm through `0x9CCBA0`, only the slots that differ.
 /// `who` names the source in the log line. Returns the number of slots changed.
-pub fn dress_with(ghost: Chr, ids: &[i32; EQUIP_SLOTS], who: &str) -> Result<usize, String> {
+fn dress_with(ghost: Chr, ids: &[i32; EQUIP_SLOTS], who: &str) -> Result<usize, String> {
     let gh = read_ptr(ghost.0 + EQUIP_HOLDER).ok_or("ghost equip holder null")?;
     let set: extern "C" fn(usize, i32, *const i32) -> usize =
         unsafe { std::mem::transmute(module_base() + SET_EQUIP_RVA) };

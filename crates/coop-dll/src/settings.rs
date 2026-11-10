@@ -757,7 +757,7 @@ native_spawn_delay_s = 10
 ; Milliseconds after its creation before it gets your equipment (0 = at once).
 native_dress_delay_ms = 3000
 ; 1 = your equipment is sent to the others and their characters wear their own (log lines
-; loadout: and ghost: dressed like peer). 0 = their characters wear your equipment.
+; starting with loadout:). 0 = their characters wear your equipment.
 loadout_sync = 1
 ; One-machine test of a 6-player world: this many local copies of you (0..5) appear,
 ; one every 3 s, after every load (native_spawn_delay_s). 0 = off. The friend stays a ghost meanwhile.
