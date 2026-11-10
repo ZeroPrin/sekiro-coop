@@ -49,6 +49,7 @@ mod netai;
 mod nopause;
 mod npcintro;
 mod nsession;
+mod objact;
 mod ownworld;
 mod peers;
 mod persist;

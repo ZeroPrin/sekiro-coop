@@ -62,24 +62,24 @@ use std::time::{Duration, Instant};
 use crate::game::{self, read, read_ptr};
 use crate::log;
 
-const WORLD_OBJACT_MAN: usize = 0x3D55EC8;
-const OBJ_MAN: usize = 0x3D5D600;
-const MAN_BLOCK_COUNT: usize = 0x28;
-const MAN_BLOCKS: usize = 0x30;
-const BLOCK_STRIDE: usize = 224;
-const BLOCK_LOADED: usize = 0x10;
-const BLOCK_INFOS: usize = 0x78;
-const BLOCK_INFO_COUNT: usize = 0x80;
-const BLOCK_DESC_SLOT: usize = 0x20;
-const INFO_STRIDE: usize = 304;
-const INFO_INDEX: usize = 0x08;
-const INFO_HANDLE: usize = 0x50;
-const INFO_RUN_STATE: usize = 0x54;
-const INFO_STATE: usize = 0x88;
-const INFO_SUB: usize = 0xAC;
-const STATE_FLAG: usize = 0x10;
+pub(crate) const WORLD_OBJACT_MAN: usize = 0x3D55EC8;
+pub(crate) const OBJ_MAN: usize = 0x3D5D600;
+pub(crate) const MAN_BLOCK_COUNT: usize = 0x28;
+pub(crate) const MAN_BLOCKS: usize = 0x30;
+pub(crate) const BLOCK_STRIDE: usize = 224;
+pub(crate) const BLOCK_LOADED: usize = 0x10;
+pub(crate) const BLOCK_INFOS: usize = 0x78;
+pub(crate) const BLOCK_INFO_COUNT: usize = 0x80;
+pub(crate) const BLOCK_DESC_SLOT: usize = 0x20;
+pub(crate) const INFO_STRIDE: usize = 304;
+pub(crate) const INFO_INDEX: usize = 0x08;
+pub(crate) const INFO_HANDLE: usize = 0x50;
+pub(crate) const INFO_RUN_STATE: usize = 0x54;
+pub(crate) const INFO_STATE: usize = 0x88;
+pub(crate) const INFO_SUB: usize = 0xAC;
+pub(crate) const STATE_FLAG: usize = 0x10;
 /// State vtables (RVA) and their class.
-const STATE_VTS: [(usize, Class); 4] = [
+pub(crate) const STATE_VTS: [(usize, Class); 4] = [
     (0x298B570, Class::One),
     (0x298B628, Class::Door),
     (0x298B6E0, Class::OneLoop),
@@ -88,13 +88,13 @@ const STATE_VTS: [(usize, Class); 4] = [
 const OBJ_ANIM: usize = 0x138;
 const OBJ_ANIM_FLAGS: usize = 0x128;
 /// `0x6BA910(block, index, actor handle, state)`: the game's replay of a friend's ObjAct.
-const REPLAY_RVA: usize = 0x6BA910;
+pub(crate) const REPLAY_RVA: usize = 0x6BA910;
 /// `0x6BCBC0(block, req, -1, slot, index, actor, state, 0)`: request builder (pure).
-const REQUEST_RVA: usize = 0x6BCBC0;
+pub(crate) const REQUEST_RVA: usize = 0x6BCBC0;
 /// `0x899310(ObjMan, handle) -> object`.
-const OBJ_BY_HANDLE_RVA: usize = 0x899310;
+pub(crate) const OBJ_BY_HANDLE_RVA: usize = 0x899310;
 /// Run state "executing" (`0x6B31E0` sets 3).
-const RUN_EXECUTING: u32 = 3;
+pub(crate) const RUN_EXECUTING: u32 = 3;
 /// A friend door flag is replayed this long after it was applied.
 const REPLAY_DELAY: Duration = Duration::from_millis(300);
 /// Doors are checked this long after a rest (twice, see restsync.rs).
@@ -116,11 +116,11 @@ const REST_QUIET: Duration = Duration::from_secs(15);
 /// logs and hid every door event of the last 4 h.
 const MAX_LOG: u32 = 20;
 /// Sanity caps for the walk (garbage pointers must not make it loop forever).
-const MAX_BLOCKS: u32 = 64;
-const MAX_INFOS: i32 = 4096;
+pub(crate) const MAX_BLOCKS: u32 = 64;
+pub(crate) const MAX_INFOS: i32 = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Class {
+pub(crate) enum Class {
     One,
     Door,
     OneLoop,
@@ -128,7 +128,7 @@ enum Class {
 }
 
 impl Class {
-    fn has_flag(self) -> bool {
+    pub(crate) fn has_flag(self) -> bool {
         self != Class::One
     }
 }
@@ -167,7 +167,7 @@ struct Report {
 }
 
 /// Fault-safe memory reads (the game, or a byte snapshot in the tests).
-trait Mem {
+pub(crate) trait Mem {
     fn bytes(&self, addr: usize, out: &mut [u8]) -> bool;
     fn u8(&self, a: usize) -> Option<u8> {
         let mut b = [0u8; 1];
@@ -186,7 +186,7 @@ trait Mem {
     }
 }
 
-struct GameMem;
+pub(crate) struct GameMem;
 
 impl Mem for GameMem {
     fn bytes(&self, addr: usize, out: &mut [u8]) -> bool {
@@ -194,11 +194,11 @@ impl Mem for GameMem {
     }
 }
 
-fn le_u32(b: &[u8], off: usize) -> u32 {
+pub(crate) fn le_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
 }
 
-fn le_ptr(b: &[u8], off: usize) -> usize {
+pub(crate) fn le_ptr(b: &[u8], off: usize) -> usize {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap()) as usize
 }
 
@@ -310,13 +310,13 @@ fn ignore_off_decision(on: bool, here_on: Option<bool>, known_door: bool, rest_q
 }
 
 /// Door flags are map flags (group 1 / 2) [ARV from the live ids].
-fn map_flag(id: u32) -> bool {
+pub(crate) fn map_flag(id: u32) -> bool {
     matches!(id / 10_000_000 % 10, 1 | 2)
 }
 
 /// An animation is an ObjAct player animation (full id or id within its category, as
 /// ownworld.rs `objact_anim`).
-fn is_objact_anim(anim: i32, set: &HashSet<u32>) -> bool {
+pub(crate) fn is_objact_anim(anim: i32, set: &HashSet<u32>) -> bool {
     anim > 0 && (set.contains(&(anim as u32)) || set.contains(&(anim as u32 % 1_000_000)))
 }
 
@@ -376,7 +376,7 @@ fn known_door(s: &State, id: u32) -> bool {
 }
 
 /// `ObjActParam.playerAnimId` of every row (once the params are loaded).
-fn objact_anims() -> Option<&'static HashSet<u32>> {
+pub(crate) fn objact_anims() -> Option<&'static HashSet<u32>> {
     use fromsoftware_shared::FromStatic;
     use sekiro::param::{OBJ_ACT_PARAM_ST, ParamDef};
     use sekiro::sprj::SoloParamRepository;
@@ -435,23 +435,48 @@ fn doors() -> Vec<Door> {
     all
 }
 
-/// The object of `d` already shows the animation the "opened" execution would play.
-fn looks_open(d: &Door) -> Option<bool> {
+/// What the map object of an ObjAct info shows now, against what an execution with `state`
+/// would play (objact.rs logs it and dedups with it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ObjView {
+    /// The map object (`0x899310(ObjMan, info+0x50)`).
+    pub obj: usize,
+    /// Its animation now (`obj+0x138`) and the "playing" bit (`obj+0x128 & 4`).
+    pub anim: u32,
+    pub playing: bool,
+    /// The animation the execution would play (request builder `0x6BCBC0`, `req[6]`).
+    pub want: u32,
+}
+
+impl ObjView {
+    /// The object already shows the execution's animation (the game's own check `0x8777F0`).
+    pub(crate) fn done(&self) -> bool {
+        self.anim == self.want && self.playing
+    }
+}
+
+/// The game thread only (calls the request builder and `0x899310`).
+pub(crate) fn object_view(block: usize, slot: i32, index: i32, handle: u32, state: u32) -> Option<ObjView> {
     let base = game::module_base();
     let mut req = [0u32; 16];
     let build: extern "C" fn(usize, *mut u32, i32, i32, i32, i32, u32, u8) -> u8 = unsafe { std::mem::transmute(base + REQUEST_RVA) };
-    if build(d.block, req.as_mut_ptr(), -1, d.slot, d.index, -1, 1, 0) == 0 {
+    if build(block, req.as_mut_ptr(), -1, slot, index, -1, state, 0) == 0 {
         return None;
     }
     let objs = read_ptr(base + OBJ_MAN)?;
     let get: extern "C" fn(usize, u32) -> usize = unsafe { std::mem::transmute(base + OBJ_BY_HANDLE_RVA) };
-    let obj = get(objs, d.handle);
+    let obj = get(objs, handle);
     if obj < 0x10000 {
         return None;
     }
     let anim = read::<u32>(obj + OBJ_ANIM)?;
     let flags = read::<u8>(obj + OBJ_ANIM_FLAGS)?;
-    Some(anim == req[6] && flags & 4 != 0)
+    Some(ObjView { obj, anim, playing: flags & 4 != 0, want: req[6] })
+}
+
+/// The object of `d` already shows the animation the "opened" execution would play.
+fn looks_open(d: &Door) -> Option<bool> {
+    object_view(d.block, d.slot, d.index, d.handle, 1).map(|v| v.done())
 }
 
 /// Opens `d` like the game replays a friend's ObjAct, unless it is open or running.
@@ -467,6 +492,8 @@ fn open_if_closed(s: &mut State, d: &Door, why: &str) -> bool {
             return false;
         }
     }
+    // objact.rs must not send this execution to the friend as one of ours.
+    crate::objact::note_replay(d.block, d.index);
     let replay: extern "C" fn(usize, i32, i32, u32) -> u8 = unsafe { std::mem::transmute(game::module_base() + REPLAY_RVA) };
     let ok = replay(d.block, d.index, -1, 1) != 0;
     s.replays += 1;

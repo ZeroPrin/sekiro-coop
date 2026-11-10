@@ -54,6 +54,72 @@ Still open: chests. If a chest is an ObjAct whose item node only spawns when it 
 the chest itself stays closed for the receiver (opening it gives nothing). Enemy drops
 (kind 5, no lot flag) are not shared.
 
+## ObjAct sync (experimental, `[GAMEPLAY] sync_objact`, default 1; NOT verified live)
+
+Problem: in 1.0.9 only event flags travel. doors.rs replays a friend's door only for ObjAct
+states that keep a flag (door / one-dir door / one-loop); most doors seen live are
+`SprjObjActOneState` (no flag, EMEVD sets one), so the object the friend opened stays closed
+here until a reload (IMPLEMENTATION-NOTES §37 "Risks"). The game's own type 45 replay only
+runs with the native session engaged at stage 4.
+
+Design (`objact.rs`):
+
+- **Sender: a poll, not a detour.** Every 50 ms the WorldObjActMan walk (doors.rs layout)
+  reads each loaded block's infos in one read. An info whose run state (`+0x54`) turns 3 is a
+  new execution; 150 ms later it counts as ours when `info+114 = 1` (the player's own path
+  `0x6BA7B0` -> `0x6BC1B0`; the replay `0x6BA910` sets `+113 = 1, +114 = 0`) or our player
+  started an `ObjActParam.playerAnimId` animation within 2 s, and it is not one of our own
+  `0x6BA910` replays (doors.rs and objact.rs mark them: no echo). A door's sub infos count
+  once. A detour on `0x6BC1B0` was not done: its signature and prologue are in no note here.
+- **Message:** bulk kind `0xA7` (`BULK_OBJACT`), 25 bytes: magic `0x4F`, version 1, reason 1,
+  state class, target state, then the block's **map id** (the block descriptor is a
+  `WorldBlockInfo`: `+0x08` block id, checked against its area's number; not the
+  WorldObjActMan slot, which depends on the load order), info index, sub index, ObjActParam id
+  (-1: not located yet), sequence number. Host <-> each client; the host passes a client's on
+  to the other clients. An older build leaves it unread.
+- **Receiver** (game thread, 300 ms after arrival, retried for 5 s): the loaded block with
+  that map id, the info by index / sub, then `0x6BA910(block, index, -1, state)` unless the
+  info is executing (type 45 is replaying it), the object already shows that execution's
+  animation (doors.rs `looks_open` check, generalized: `doors::object_view`), it is a door's
+  toggle back to closed (doors.rs keeps door flags on), or a one-loop state (could be a lift:
+  only with `sync_objact = 2`).
+- **Settings:** `sync_objact` 0 off, 1 on (default), 2 also one-loop states.
+  `[DEBUG] objact_debug` (default 0): every execution, every map flag write, the raw info
+  bytes (first 8 per load) and the first bytes of `0x6BC1B0` / `0x6BA7B0` / `0x6BA910`.
+
+Log lines (prefix `objact:`):
+- `loaded ObjAct blocks: slot S mAA_BB_CC_DD (0x...) (N infos), ...` once per load; a `?` map
+  means the WorldBlockInfo reading is wrong.
+- `ObjAct ran here: map ..., block slot, info index, sub, <class> state, flag F before B after
+  A, info+113/+114, object handle, anim at start ..., our ObjAct animation ...; <why ours>:
+  sending as #N | not sent: <why>`, then `sent our ObjAct #N ... ok = true`.
+- `map flags written from 5 s before it until now: [...]` and `flag F = V (within 5 s after
+  our ObjAct)`; with `objact_debug = 1` every `flag F = V` (8-digit ids: all map groups, the
+  doors.rs groups 1/2 and the 611xxxxx door flags seen live included).
+- `1 s after our ObjAct ...: run state, info+113/+114, flag, object anim (looks done)`.
+- Receiver: `peer P ran ObjAct #N: map ..., info index, sub, class, target state`, then
+  `peer P's ObjAct #N here: ...; replayed with 0x6BA910(...) ok = ...` or `not replayed: <why>`
+  or `no such loaded info here within 5 s`, then the same info `1 s after` / `3 s after`.
+
+Open questions:
+- Actor -1 vs the friend's native replica handle: if the object animates but still blocks the
+  way, try the replica (`REPLAY_ACTOR` in objact.rs, marked TODO).
+- Keyed doors (a key item check runs before the execution on the opener's side only: the
+  receiver opens it without the key; probably fine for co-op, not checked).
+- Lifts: no object position offset is known, so a player standing on a lift is not checked;
+  one-loop states are only logged by default. Whether lifts are ObjActs at all is unknown.
+- Chests: whether a chest is an ObjAct whose item node spawns on opening (see the pickups
+  section) is unknown; the log will show their class.
+- Whether `info+114` really marks the local player (vs NPC / script executions) and where the
+  ObjActParam id and the actor sit in the info: read the `objact_debug` info dumps in IDA.
+
+Recommended first live test: both players set `native_session_stage = 4` and
+`objact_debug = 1` (both need this build), stand at a known one-state door (for example a
+door doors.rs never logs) in the same area, one opens it; the other watches whether it swings
+open and walks through. Exchange both `log.txt` files and compare the `objact:` lines (with
+stage 4 the receiver should mostly log `not replayed: ... executing` or `already shows`, i.e.
+type 45 was first; then repeat with `native_session_stage = 3` to see our replay alone).
+
 ## Fixes to the 1.0.9 base
 
 - **False wipe** (1.0.9-pickups.3, `persist.rs`). A wipe was "every player's committed death

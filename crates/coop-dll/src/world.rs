@@ -585,6 +585,8 @@ impl World {
                 FlagEntry::Pending => break,
                 FlagEntry::Lost => self.lost += 1,
                 FlagEntry::Ready(id, on, bank) => {
+                    // ObjAct sync (objact.rs): the map flags around an ObjAct go to the log.
+                    crate::objact::flag_write(id, on, bank);
                     if bank == 0 && should_sync(id) {
                         *self.writes_per_id.entry(id).or_insert(0) += 1;
                         if !settled {
@@ -916,6 +918,9 @@ impl World {
             let anims: Vec<(u8, i32)> = peers.iter().filter_map(|p| Some((p.id.slot(), p.snapshot?.anim))).collect();
             crate::doors::tick(&anims, in_world_for);
         }
+        // ObjAct sync (objact.rs): our door / lever executions to the peers, theirs replayed
+        // here (the inbox is drained even before the world settled).
+        crate::objact::tick(net, in_world_for, settled && flag_man().is_some());
 
         // Resync (both players rest) and the session-start doctor / flag cross-check.
         let session = self.epoch;

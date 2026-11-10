@@ -358,6 +358,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::SYNC_POSTURE.store(ini.flag("sync_posture", true, warn), Relaxed);
     crate::keyitems::ENABLED.store(ini.flag("share_key_items", true, warn), Relaxed);
     crate::keyitems::SHARE_PICKUPS.store(ini.flag("share_pickups", true, warn), Relaxed);
+    crate::objact::MODE.store(ini.num("sync_objact", 1, 0, 2, warn) as u8, Relaxed);
     crate::bossgate::ENABLED.store(ini.flag("boss_start_gate", true, warn), Relaxed);
     crate::dialog::CONFIRM_ITEMS.store(ini.flag("confirm_items", true, warn), Relaxed);
     tuning::DIALOG_DEFAULT_YES.store(ini.flag("dialog_default_yes", true, warn), Relaxed);
@@ -436,6 +437,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::posture::REST_GUARD.store(ini.flag("posture_rest_guard", true, warn), Relaxed);
     crate::keyitems::RECONCILE.store(ini.flag("reward_reconcile", true, warn), Relaxed);
     crate::statelog::ENABLED.store(ini.flag("state_log", true, warn), Relaxed);
+    crate::objact::DEBUG.store(ini.flag("objact_debug", false, warn), Relaxed);
     crate::hook::freeze::SKIP_DRIVER_THREADS.store(ini.flag("freeze_skip_driver_threads", true, warn), Relaxed);
     // Log categories switched off (log.rs). Missing key = the default list; an empty value = none.
     log::set_muted(log::parse_categories(ini.get("log_off").map_or(DEFAULT_LOG_OFF, String::as_str)));
@@ -590,6 +592,11 @@ share_key_items = 1
 ;     Both players need 1. Pickups made alone or before the session are not shared.
 ;     Shops stay your own. 0 = each player picks up their own copy.
 share_pickups = 1
+; 1 = a door, gate or lever one of you opens is opened in the other's game too (the object
+;     itself, not only its event flag), when that part of the map is loaded there. Both
+;     players need 1. Experimental. 2 = also one-loop objects (possibly lifts: a lift may
+;     move under a player standing on it). 0 = off (objects follow the flags after a reload).
+sync_objact = 1
 ; 1 = a boss fight the friend starts far from you (other area or over 60 m) does not
 ;     start in your world until you come near it; the kill still counts for you. 0 = off.
 boss_start_gate = 1
@@ -772,6 +779,10 @@ audit_every_s = 180
 ; Test build: every 0.5 s the player's input state (SpEffects, action-ban bits, menu
 ; states) goes to the log when it changes; F11 writes the full state once. 0 = off.
 state_log = 1
+; 1 = log every door / lever / lift (ObjAct) execution in detail, every map event flag
+;     write and the raw ObjAct data (objact: lines; long logs). 0 = only our own ObjActs,
+;     the friend's, and the map flags written around ours.
+objact_debug = 0
 ; 1 = code patches leave GPU driver threads running (they never run game code; waiting
 ;     for one froze the game for up to 5 s). 0 = every thread is paused, as before v8.61.
 freeze_skip_driver_threads = 1
