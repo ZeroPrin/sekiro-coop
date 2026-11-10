@@ -424,6 +424,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::DEATH_RESTORE_DELAY_S.store(ini.num("death_restore_delay_s", 8, 2, 60, warn), Relaxed);
     tuning::RESTORE_LOST_ITEMS.store(ini.flag("restore_lost_items", true, warn), Relaxed);
     items::ENABLED.store(ini.flag("connection_items", true, warn), Relaxed);
+    items::FIX_UNLOCKS.store(ini.flag("fix_debug_item_unlocks", true, warn), Relaxed);
     crate::audit::ENABLED.store(ini.flag("audit", true, warn), Relaxed);
     crate::audit::EVERY_S.store(ini.num("audit_every_s", 180, 30, 3600, warn), Relaxed);
     // v7.8 bisect switches for the v7.7 behaviours (live 2026-10-24: input lock at join,
@@ -702,6 +703,10 @@ native_session_max_players = 6
 ; Leave these alone unless you are testing. The defaults are the tested setup.
 ; 0 = no co-op items (then use auto_connect = 1).
 connection_items = 1
+; 1 = the co-op items do not unlock actions: their goods rows (999996-999999) are
+;     FromSoftware debug items that unlock diving, Mortal Blade, ninjutsu and skills.
+;     Zeroed before the save loads; the unlocks are rebuilt after each load. 0 = old behaviour.
+fix_debug_item_unlocks = 1
 ; 1 = F8 wakes you at the idol while waiting on the boss death screen, F9 goes to the friend,
 ; F11 writes a MARK line to the log, F3 resyncs the world (both players rest).
 debug_hotkeys = 0
