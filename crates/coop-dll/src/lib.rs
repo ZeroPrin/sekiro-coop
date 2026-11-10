@@ -36,6 +36,7 @@ mod join;
 mod keyitems;
 mod leave;
 mod livesync;
+mod loadout;
 mod log;
 mod mode4;
 mod motion;

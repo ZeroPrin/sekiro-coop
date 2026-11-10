@@ -88,28 +88,60 @@ pub fn spawn_plain() -> Result<Chr, String> {
 /// equipment had no visible body.
 const EQUIP_HOLDER: usize = 0x2140;
 const EQUIP_IDS: usize = 0x24;
-const EQUIP_SLOTS: usize = 25;
+pub const EQUIP_SLOTS: usize = 25;
 const SET_EQUIP_RVA: usize = 0x9CCBA0;
+
+/// The 25 equip ids of `chr`'s ChrAsm (`EQUIP_HOLDER`), None while any is unreadable.
+pub fn equip_ids(chr: Chr) -> Option<[i32; EQUIP_SLOTS]> {
+    let h = read_ptr(chr.0 + EQUIP_HOLDER)?;
+    let mut ids = [0i32; EQUIP_SLOTS];
+    for (slot, id) in ids.iter_mut().enumerate() {
+        *id = crate::game::read::<i32>(h + EQUIP_IDS + 4 * slot)?;
+    }
+    Some(ids)
+}
 
 /// Copies the local player's equipment onto `ghost` so it looks like the player.
 pub fn dress_like(ghost: Chr, player: Chr) -> Result<usize, String> {
+    let ids = equip_ids(player).ok_or("player equip holder null or unreadable")?;
+    dress_with(ghost, &ids, "player")
+}
+
+/// Puts `ids` into `ghost`'s ChrAsm through `0x9CCBA0`, only the slots that differ.
+/// `who` names the source in the log line. Returns the number of slots changed.
+pub fn dress_with(ghost: Chr, ids: &[i32; EQUIP_SLOTS], who: &str) -> Result<usize, String> {
     let gh = read_ptr(ghost.0 + EQUIP_HOLDER).ok_or("ghost equip holder null")?;
-    let ph = read_ptr(player.0 + EQUIP_HOLDER).ok_or("player equip holder null")?;
     let set: extern "C" fn(usize, i32, *const i32) -> usize =
         unsafe { std::mem::transmute(module_base() + SET_EQUIP_RVA) };
     let mut changed = 0;
-    let mut ids = Vec::new();
-    for slot in 0..EQUIP_SLOTS {
-        let Some(id) = crate::game::read::<i32>(ph + EQUIP_IDS + 4 * slot) else { continue };
+    for (slot, id) in ids.iter().enumerate() {
         let cur = crate::game::read::<i32>(gh + EQUIP_IDS + 4 * slot);
-        ids.push(id);
-        if cur != Some(id) {
-            set(gh, slot as i32, &id);
+        if cur != Some(*id) {
+            set(gh, slot as i32, id);
             changed += 1;
         }
     }
-    log::line(&format!("ghost: dressed like player, {changed} slots changed, player ids {ids:?}"));
+    log::line(&format!("ghost: dressed like {who}, {changed} slots changed, {who} ids {ids:?}"));
     Ok(changed)
+}
+
+/// PlayerIns vtable slot 21 (`0xA30A50`): reaches the part loader `0xA361C0(chr)`.
+/// RE-FINDINGS-2 § Solid ghost (c) [V IDA]: equip-id writes (`0x9CCBA0`) only store the id
+/// and refcount the part; this reloads the parts. Game thread only. Called only when the
+/// slot holds exactly that function (a vtable copy keeps it, ghost.rs / native.rs), else
+/// nothing is called.
+const SLOT_PART_RELOAD: usize = 21;
+const PART_RELOAD_RVA: usize = 0xA30A50;
+
+pub fn reload_parts(chr: Chr) -> Result<(), String> {
+    let base = module_base();
+    let f = read_ptr(chr.0).and_then(|vt| read_ptr(vt + 8 * SLOT_PART_RELOAD)).ok_or("vtable unreadable")?;
+    if f != base + PART_RELOAD_RVA {
+        return Err(format!("vtable slot 21 is rva {:#x}, not {PART_RELOAD_RVA:#x}: not called", f.wrapping_sub(base)));
+    }
+    let f: extern "C" fn(usize) = unsafe { std::mem::transmute(f) };
+    f(chr.0);
+    Ok(())
 }
 
 /// ReplayGhostIns `+0x22A1`: set by the ctor for ghost types 3 and 11

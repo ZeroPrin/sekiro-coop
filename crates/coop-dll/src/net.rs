@@ -1371,8 +1371,9 @@ impl Net {
             }
             Event::Bulk { from, kind, data } => {
                 let Some(id) = peer(from) else { return };
-                // The auditor's boss HP samples come at 2 Hz: audit.rs logs what matters.
-                if kind != crate::audit::BULK_AUDIT {
+                // The auditor's boss HP samples come at 2 Hz, loadouts every 3 s: audit.rs and
+                // loadout.rs log what matters.
+                if kind != crate::audit::BULK_AUDIT && kind != crate::loadout::BULK_LOADOUT {
                     log::line(&format!("net: bulk transfer kind {kind} received, {} bytes", data.len()));
                 }
                 if self.bulk_inbox.len() >= 24 {

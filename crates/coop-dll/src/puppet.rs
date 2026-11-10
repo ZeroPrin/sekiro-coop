@@ -735,6 +735,9 @@ impl Puppet {
             #[cfg(feature = "testsync")]
             self.testsync.on_frame(n);
             if !hands_off {
+                // Our equipment to the peers, theirs for their native remotes (loadout.rs).
+                crash::breadcrumb("loadout");
+                crate::loadout::tick(n, &self.peers, player);
                 crash::breadcrumb("hkb sync");
                 let ghost = self.spawned.filter(|&c| is_ghost_ins(c));
                 self.hkb.on_frame(n, &self.peers, player, ghost, &self.enemies);

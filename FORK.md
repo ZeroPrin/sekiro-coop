@@ -54,6 +54,49 @@ Still open: chests. If a chest is an ObjAct whose item node only spawns when it 
 the chest itself stays closed for the receiver (opening it gives nothing). Enemy drops
 (kind 5, no lot flag) are not shared.
 
+## Loadout sync (experimental, `[DEBUG] loadout_sync`, default 1; not tested live yet)
+
+**Bug.** The friend's native replica (`native.rs`, a PlayerIns with its own PlayerGameData)
+never got the friend's equipment. `create` fills the replica's PGD from the first existing
+CharaInitParam row (the dev test's row 1080100 does not exist in retail), and the deferred
+dress called `ghost::dress_like(remote, player)` with the LOCAL player: the observer's 25
+ChrAsm slots (`ChrIns+0x2140`, ids at `+0x24 + 4*slot`, set through `0x9CCBA0`), once.
+Nothing about equipment went over the network (the snapshot has pose, animation and HP
+only). Seen live: the replica wore the observer's prosthetics, and every combat art of the
+friend played as Whirlwind Slash (the template's default art).
+
+- **Message**: bulk kind 0xA8 (`loadout::BULK_LOADOUT`; far from upstream's 41-50 run, reliable, to every peer; the host
+  relays). Body (`coop_net::encode_loadout`): magic `LD`, layout version 1, the sender's 25
+  ChrAsm ids, `art` and `extra[3]` (i32 each, reserved for the combat art / skills, -1 for
+  now). Sent when our ids change and every 3 s as a refresh (late join, lost packets; only
+  while no bulk chunk is unacked). An older build leaves it unread.
+- **Receiver**: the last loadout per peer slot (`loadout::of`). The deferred dress
+  (`native_dress_delay_ms`) now puts the PEER's ids on its replica (`ghost::dress_with`,
+  same `0x9CCBA0` loop) and then reloads the parts through PlayerIns vtable slot 21
+  (`0xA30A50` -> `0xA361C0`, RE-FINDINGS-2 § Solid ghost (c)), only when the slot holds
+  exactly that function and the replica is in the player chr set. A newer loadout that
+  differs from the one applied re-dresses it (not only once). No loadout yet when the dress
+  is due: it wears ours as before, and the first loadout that arrives re-dresses it.
+  `loadout_sync = 0`: nothing is sent and the replica wears ours (the old behaviour).
+- **Log lines**: `loadout: sent [...]` (ours, on change only), `loadout: peer N wears
+  [...]` (theirs, on change), `ghost: dressed like peer slot N, K slots changed, ...`,
+  `native: parts of 0x... reloaded after K slot(s) changed` or `native: part reload of 0x...
+  skipped: ...`, `native: new loadout from peer slot N, re-dressing ...`, and the fallback
+  `native: no loadout from peer slot N yet, ... wears ours for now`.
+- **Live test**: both on this build. The observer equips something the friend does not
+  have (Ichimonji as the art, a different prosthetic) before the session and again during
+  it. Before the fix the replica showed the observer's prosthetics and `ghost: dressed like
+  player`; now the observer's log has `ghost: dressed like peer slot N` with the friend's
+  ids (they match the friend's `loadout: sent` line), the friend's prosthetics are visible
+  on the replica, and a change of the friend's prosthetic shows within ~1 s with a
+  `re-dressing` line. Watch for a crash right after `parts of ... reloaded` (the reload
+  call on a live remote is new); `loadout_sync = 0` turns it off.
+- **Open: the combat art.** Equip ids do not carry it; the replica's PGD keeps the
+  template's `cult_sword_id` (CharaInitParam row `+0x110`), so the friend's arts still play
+  as Whirlwind Slash. `0x7B7470` / `0x7B7120` (PGD_FILL_A/B) read that row into some PGD /
+  EquipGameData field: find the write target in IDA, then send `art` and write it there
+  (`TODO(IDA)` in `native.rs` `dress_from_peer` and in `loadout.rs`).
+
 ## Fixes to the 1.0.9 base
 
 - **False wipe** (1.0.9-pickups.3, `persist.rs`). A wipe was "every player's committed death
