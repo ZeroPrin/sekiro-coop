@@ -453,6 +453,12 @@ impl ObjView {
     pub(crate) fn done(&self) -> bool {
         self.anim == self.want && self.playing
     }
+
+    /// The object is at that animation, playing or finished (objact.rs: a door that already
+    /// opened here keeps its last animation, `playing` goes false when it ends) [ARV].
+    pub(crate) fn reached(&self) -> bool {
+        self.anim == self.want
+    }
 }
 
 /// The game thread only (calls the request builder and `0x899310`).
@@ -491,6 +497,10 @@ fn open_if_closed(s: &mut State, d: &Door, why: &str) -> bool {
             note_log(s, || format!("doors: door flag {} (block slot {}, index {}): object not found here, not replayed", d.flag, d.slot, d.index));
             return false;
         }
+    }
+    // objact.rs replayed this ObjAct a moment ago (the friend's 0xA7): no second 0x6BA910.
+    if crate::objact::replayed_recently(d.block, d.index) {
+        return false;
     }
     // objact.rs must not send this execution to the friend as one of ours.
     crate::objact::note_replay(d.block, d.index);
