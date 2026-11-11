@@ -1197,7 +1197,9 @@ fn wait_overlay(phase_a: bool, name: &str, f8: bool) -> String {
     let mut s = if phase_a {
         format!("Waiting for {name} to end the boss fight\nThe screen stays dark until then; you wake at your idol")
     } else {
-        format!("Spectating {name}")
+        // Phase B: dead in the world with no death screen; without the reason it looked
+        // like a hang (live 2026-11-12, "I died and do not respawn").
+        format!("Spectating {name}\nWaiting for {name} to finish the fight; you wake at your idol when it ends")
     };
     if f8 {
         s.push_str(" - [F8] wake at idol");
@@ -2049,6 +2051,10 @@ impl BossRules {
                 if started_a { "A" } else { "B, no death screen" },
                 hps.join(", "),
                 revive_fields_now()
+            ));
+            log::line(&format!(
+                "spectate: overlay hint on: {}",
+                if started_a { "waiting on the death screen (dark)" } else { "waiting for the friend to finish the fight (phase B)" }
             ));
             send(net, world::EV_DOWN, 1, 0);
         }
@@ -3024,7 +3030,7 @@ mod tests {
 
     #[test]
     fn phase_a_says_the_screen_is_dark() {
-        assert_eq!(wait_overlay(false, "Kuro", false), "Spectating Kuro");
+        assert!(wait_overlay(false, "Kuro", false).starts_with("Spectating Kuro\nWaiting for Kuro to finish the fight"));
         assert!(wait_overlay(true, "Kuro", false).contains("stays dark"));
         assert!(wait_overlay(true, "Kuro", true).ends_with("[F8] wake at idol"));
     }

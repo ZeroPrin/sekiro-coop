@@ -27,6 +27,9 @@ pub struct Status {
     pub friend_tags: Vec<FriendTag>,
     /// Extra status lines (limbo, rest, boss), shown under the status line.
     pub notice: Option<String>,
+    /// A boss-fight wait (bossrules.rs `wait_overlay`): also drawn as a large banner in the
+    /// middle of the screen, so a dead player does not take the wait for a hang.
+    pub wait: Option<String>,
     /// Party HP bars (companion), drawn on the left of the screen. Empty = none.
     pub party: Vec<PartyMember>,
 }
@@ -401,6 +404,32 @@ fn read_camera() -> Option<([[f32; 4]; 4], f32)> {
 }
 
 
+/// The boss-fight wait in the lower middle of the screen, one centred line per text line on a
+/// dark plate (the top-left status line alone was missed: live 2026-11-12, "I died and do not
+/// respawn"). Drawn even with `show_status_overlay = 0`.
+fn draw_wait_banner(ui: &Ui, status: &Status) {
+    let Some(text) = status.wait.as_deref() else { return };
+    let [w, h] = ui.io().display_size;
+    if w < 1.0 || h < 1.0 {
+        return;
+    }
+    let k = h / 1080.0;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    let sizes: Vec<[f32; 2]> = lines.iter().map(|l| ui.calc_text_size(l)).collect();
+    let tw = sizes.iter().map(|s| s[0]).fold(0.0, f32::max);
+    let th: f32 = sizes.iter().map(|s| s[1] + 4.0 * k).sum();
+    let pad = 12.0 * k;
+    let (x0, y0) = ((w - tw) * 0.5 - pad, h * 0.70 - pad);
+    let dl = ui.get_foreground_draw_list();
+    dl.add_rect([x0, y0], [x0 + tw + 2.0 * pad, y0 + th + 2.0 * pad], [0.0, 0.0, 0.0, 0.6]).filled(true).rounding(6.0 * k).build();
+    let mut y = y0 + pad;
+    for (i, (line, size)) in lines.iter().zip(&sizes).enumerate() {
+        let colour = if i == 0 { YELLOW } else { [1.0, 1.0, 1.0, 0.95] };
+        dl.add_text([(w - size[0]) * 0.5, y], colour, line);
+        y += size[1] + 4.0 * k;
+    }
+}
+
 impl Overlay {
     /// Party HP list for `party_hp_position` left / top (head mode is drawn by `draw_tag`).
     /// "L2 R2 Page n/m" under the Co-op Settings page: two drawn trigger icons and the page number (the game has
@@ -664,6 +693,7 @@ impl ImguiRenderLoop for Overlay {
         draw_lock_mark(ui);
         self.draw_party(ui, &status);
         self.draw_page_hint(ui);
+        draw_wait_banner(ui, &status);
         self.panel.draw(ui);
 
         if !settings::show_status_overlay() {
