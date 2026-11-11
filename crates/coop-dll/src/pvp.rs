@@ -1131,7 +1131,7 @@ impl Pvp {
         self.stats(active);
     }
 
-    /// Team 29 + "cannot die while the owner lives" on the native remote of every peer with
+    /// Team 28 + "cannot die while the owner lives" on the native remote of every peer with
     /// a fresh Hello while `on`; the originals back for every other remote.
     fn teams(&mut self, peers: &PeerSet, on: bool) {
         let remotes: Vec<(PeerId, usize, Option<i32>)> =

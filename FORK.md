@@ -2,13 +2,15 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test2`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test3`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test2`: nothing in the sections below marked experimental or
-> "not verified live" has been verified in a live game.** This build merges the branches
+> **Test build `1.0.9-pickups.3-test3`: nothing in the sections below marked experimental or
+> "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
-> onto `share-pickups` (branch `test2`). Each feature was written and unit-tested on its own;
-> they have never run together in the game. The oracle is a playtest with both logs.
+> onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
+> `prosthetic-active` (active prosthetic slot), `zone-flicker` (block-border grace for the
+> native remote, `docs/IMPLEMENTATION-NOTES.md`), `objact-doors2` (one-loop doors at mode 1)
+> and `pvp-ff` (friendly fire, team 28). The oracle is a playtest with both logs.
 
 ## New settings in this build
 
@@ -35,6 +37,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `friendly_fire_in_boss_fights` | GAMEPLAY | 0 | Friendly fire |
 | `pvp_dry_run` | DEBUG | 0 | Friendly fire |
 | `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | Friendly fire |
+| `block_change_grace_ms` | DEBUG | 2500 (0..3000; 0 = the old immediate rule) | Block-border grace (IMPLEMENTATION-NOTES) |
 
 Reliable bulk kinds added by the fork: 46 (pickups), 0xA7 (ObjAct), 0xA8 (loadout), 0xA9
 (PvP); `net::tests::bulk_kinds_are_unique` checks them against the upstream kinds. The doctor
