@@ -187,7 +187,7 @@ pub fn compare(ours: &Info, theirs: &Info) -> Vec<Finding> {
             notice: Some("friendly_fire differs between you: the host's setting is used.".into()),
         });
     }
-    for k in ["sync_art", "death_debuffs"] {
+    for k in ["sync_art", "death_debuffs", "sync_objact", "loadout_sync", "player_packet_hz", "shop_stock_per_player", "fix_debug_item_unlocks"] {
         if differs(k) {
             out.push(Finding { log: format!("{k} differs: {} (each side uses its own)", pair(k)), notice: None });
         }
@@ -252,6 +252,13 @@ fn gather(is_host: bool) -> Info {
     put("sync_art", (tuning::sync_art_effects() as u8).to_string());
     put("enemy_mode", tuning::enemy_mode().to_string());
     put("friendly_fire", (crate::pvp::FRIENDLY_FIRE.load(std::sync::atomic::Ordering::Relaxed) as u8).to_string());
+    // test2 merge: the other fork features' switches, compared log-only (an older build sends
+    // none of them: nothing to compare).
+    put("sync_objact", crate::objact::MODE.load(std::sync::atomic::Ordering::Relaxed).to_string());
+    put("loadout_sync", (tuning::loadout_sync() as u8).to_string());
+    put("player_packet_hz", tuning::player_packet_hz().to_string());
+    put("shop_stock_per_player", (crate::world::SHOP_STOCK_PER_PLAYER.load(std::sync::atomic::Ordering::Relaxed) as u8).to_string());
+    put("fix_debug_item_unlocks", (crate::items::FIX_UNLOCKS.load(std::sync::atomic::Ordering::Relaxed) as u8).to_string());
     put("merge_quests", tuning::merge_quests().to_string());
     put("own_world_mode", crate::ownworld::mode_name().into());
     match crate::me3scan::result() {
@@ -561,6 +568,15 @@ mod tests {
         let f = compare(&host, &info(&[("pkgs", "none"), ("natives", "fps.dll")]));
         assert_eq!(f.len(), 1);
         assert!(f[0].notice.is_none());
+    }
+
+    #[test]
+    fn fork_feature_switches_differ_in_the_log_only() {
+        let f = compare(&info(&[("sync_objact", "1"), ("player_packet_hz", "30")]), &info(&[("sync_objact", "0"), ("player_packet_hz", "12")]));
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().all(|x| x.notice.is_none() && x.log.contains("each side uses its own")));
+        // An older build sends none of them.
+        assert!(compare(&info(&[("sync_objact", "1"), ("loadout_sync", "1")]), &info(&[])).is_empty());
     }
 
     #[test]
