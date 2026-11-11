@@ -659,13 +659,14 @@ block_ng_in_coop = 1
 ;     with a notice and the client leaves (enemy HP would differ). 1 = allowed on both PCs
 ;     (set it on both), with a warning only.
 allow_cross_cycle = 0
-; EXPERIMENTAL, not tested in play yet. 1 = player-vs-player damage with the game's own hit
-;     packet: your hits on the companion are sent to their PC and applied there against their
-;     guard, deflect and dodge. Duels are never lethal: at 1 HP the duel is over and hits are
-;     ignored for 5 s. The host's value is used by both. 0 = off (default).
+; EXPERIMENTAL. 1 = friendly fire: the companion stays your ally (no lock-on, no enemy health
+;     bar, idols work, no deathblows or throws on each other), but your careless hits on them
+;     hurt: they are sent to their PC and applied there against their guard, deflect and
+;     dodge. Never lethal: a hit that would leave them at 1 HP ends the round, both refill and
+;     hits are ignored for 5 s. The host's value is used by both. 0 = off (default).
 friendly_fire = 0
-; With friendly_fire: 0 = while a boss health bar is shown, your hits do not reach each other
-;     (the companion is a friend again for lock-on and allied characters). 1 = PvP also there.
+; With friendly_fire: 0 = while a boss health bar is shown, your hits do not reach each other.
+;     1 = friendly fire also there.
 friendly_fire_in_boss_fights = 0
 ; 1 = while a companion is connected, menus, the inventory, item pickup messages and the
 ;     co-op yes/no boxes do not pause the game (as in FromSoft's online play): both worlds

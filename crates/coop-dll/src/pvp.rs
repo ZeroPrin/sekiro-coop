@@ -1,5 +1,8 @@
-//! PvP on the game's own hit packet (experimental, `[GAMEPLAY] friendly_fire`, default 0;
-//! FORK.md "PvP on the native hit packet"). NOT verified live.
+//! Friendly fire on the game's own hit packet (experimental, `[GAMEPLAY] friendly_fire`,
+//! default 0; FORK.md "Friendly fire on the native hit packet"). NOT verified live.
+//!
+//! "Friendly fire", not duels: the friend stays an ally (no lock-on, no enemy HP bar, idols
+//! usable, no deathblow / throw on them), but our careless hits on their copy hurt them.
 //!
 //! The game already knows "detected by the attacker, computed by the victim" [VAR, Ghidra on
 //! the 2026-11-11 dump, E:\RE\notes-2026-11-11.md and E:\RE\work_pvp]:
@@ -17,24 +20,46 @@
 //!   record of any session member and the PlayerIns whose session is that member (the
 //!   attacker), `0xB680C0` rebuilds a full hit from it, and `0xB68FF0(dmgModule, attacker,
 //!   hit, 0)` applies it to us by OUR current state (guard, deflect, i-frames, `0xBD4D40`).
+//!   [VAR, Ghidra 2026-11-12, E:\RE\work_pvpff] PlayerIns+0x2088 is allocated in `0xA37560`
+//!   only while `0x9F3430(player)` (`[[0x143D7A1E0]+0x88] == player`, the game's own online
+//!   player) holds, and `0xB72A80` starts with `test rdx,rdx; jz <end>`: in our session rx is
+//!   NULL [ARV, first live test: 22 / 24 hits received, 0 applied], so the vanilla call never
+//!   reaches the call sites below. `drive_receive` therefore calls `0xB72A80` itself from the
+//!   frame task (game thread) with a sentinel rx whenever hits are queued.
 //!
 //! What this module adds (only while `friendly_fire` is on and a link is up):
-//! - Team 29 (Rival with everyone, hostility matrix `0x143B0A680`) on every friend's native
-//!   remote only (`chr+0x74`), so our hitboxes hit it; our own team is never touched. The
-//!   original team comes back when the feature goes off. The remote also gets the game's
-//!   "cannot die" bit (`data+0x228 & 1`, read by `0xBD5DF0`) while its owner is alive: a
-//!   local-only hit (e.g. table `0x2A7C660`'s `[2][1]` = 1) can then never kill the copy.
+//! - Team 28 ("Coop NPC") on every friend's native remote only (`chr+0x74`); our own team is
+//!   never touched, the original team comes back when the feature goes off. Team matrices
+//!   (E:\RE\work_team\team_matrices.txt): M1 `0x143B0A680` [1][28] is the same functor as
+//!   [1][29] (our hitboxes hit it; the router `[2][1]` = 4 still makes the type-20 packet),
+//!   M2 `0x143B0CAA0` [1][28] / [28][1] are not hostile (no lock-on, so no enemy HP bar; the
+//!   idol's enemy finder ignores it), enemies treat 28 like 2, and M1[28][1] = F (the copy's
+//!   own hitboxes no longer hit us locally). Team 29 (Rival) made the friend a full enemy.
+//!   The remote also gets the game's "cannot die" bit (`data+0x228 & 1`, read by `0xBD5DF0`)
+//!   while its owner is alive: a local-only hit can then never kill the copy.
 //! - Sender: the remote's session is native.rs's recv session (slot 4 = PlayerDebugSession
 //!   `0x1061880` -> our slot 1); `capture` takes the type-20 record there and `tick` sends it
 //!   to that remote's owner (bulk kind `BULK_PVP`, reliable, nonce + seq for duplicates).
 //! - Receiver: call-site patches inside `0xB72A80` (threads suspended, every byte checked):
 //!   both `call 0x8D7B10` -> `recv_hook` serves our queued records first (the record into the
 //!   game's own buffer, returns the sender's native remote as the attacker), then the
-//!   original; `call 0xB68FF0` -> `apply_hook` runs the game's application with OUR
-//!   "cannot die" bit set for that one call (the HP setter `0xBD64E0` then keeps HP at 1),
-//!   logs HP / posture before and after, and ends the duel at 1 HP.
+//!   original (never for our sentinel rx); `call 0xB68FF0` -> `apply_hook` runs the game's
+//!   application with OUR "cannot die" bit set for that one call (the HP setter `0xBD64E0`
+//!   then keeps HP at 1), logs HP / posture before and after, and ends the round at 1 HP.
+//!   Neither `0xB680C0` nor `0xB68FF0` (2 levels down) checks the team matrices [VAR].
+//! - No deathblow / throw on a friend's copy: M1 decides those too (M1[1][28] passes), so the
+//!   candidate checks of the two chr finders are wrapped in their vtables [VAR, RTTI]:
+//!   `SprjChrThrowModule::RequestThrow_AllChr` finder (vtable slot `0x142A8EBD0` =
+//!   `0xBDF930`) and `FdpChrCeremonyModule::_GetEnableExecuteCremonyChr` finder (slot
+//!   `0x142A7BC20` = `0xB5DD30`) refuse every native remote. A received hit of type 5 is
+//!   still never applied.
 //! - Diagnostics only: `call 0xB6AB40` in `0xB6A040` -> `reaction_hook` counts the friend's
-//!   copy hitting us (the laggy local path that vanilla already leaves reaction-only).
+//!   copy hitting us (the laggy local path; 0 expected with team 28).
+//! - Prosthetic tools, bullets, explosions need nothing extra [VAR, E:\RE\work_pvpff_bul]:
+//!   `0x995600` -> `0xB06360(hit, victim, bullet)` (chr owner) -> `0xB68A50` -> victim damage
+//!   module slot 9 (router) -> action 4 -> `0xB72CC0`, the same type-20 record (flags `+0x3B`
+//!   bit 1 = bullet; the first live test already sent such records). Not covered: damage over
+//!   time (SpEffects tick locally) and owner-less bullets (traps).
 //!
 //! Non-lethal duels: a hit that brings us to 1 HP (or a deathblow, hit type 5, which is not
 //! applied at all) ends the duel: `pvp: duel over, <name> wins`, a DuelOver message to the
@@ -82,7 +107,8 @@ const KIND_DUEL_OVER: u8 = 2;
 const KIND_HELLO: u8 = 3;
 const HEADER: usize = 11;
 
-const PVP_TEAM: u32 = 29;
+/// "Coop NPC": hit by us, not hostile for lock-on / idols (see the header).
+const PVP_TEAM: u32 = 28;
 const DUEL_OVER_FOR: Duration = Duration::from_secs(5);
 /// A received hit that waited longer than this (a load, a hitch) is dropped.
 const STALE_AFTER: Duration = Duration::from_millis(2000);
@@ -124,6 +150,19 @@ const DEBUG_SESSION_VT_RVA: usize = 0x2B86048;
 /// `jz 0x66CEE0` (returns 0).
 const SITE_DEATH_ATTACKER: usize = 0x66CE5C;
 const FN_CHR_BY_HANDLE: usize = 0xA4A3F0;
+/// The type-20 receive loop itself: `test rdx,rdx; jz +0x176` (rx NULL = nothing to do).
+const FN_RECV_LOOP: usize = 0xB72A80;
+const RECV_LOOP_HEAD: [u8; 9] = [0x48, 0x85, 0xD2, 0x0F, 0x84, 0x76, 0x01, 0x00, 0x00];
+/// PlayerIns+0x2088: the rx `0xA37560` hands to `0xB72A80` (diagnostic read only).
+const PLAYER_RX: usize = 0x2088;
+/// `0x9F3430(player)` = `[[0x143D7A1E0]+0x88] == player` (diagnostic read only).
+const ONLINE_HOLDER_RVA: usize = 0x3D7A1E0;
+const ONLINE_PLAYER: usize = 0x88;
+/// Chr finder candidate checks (vtable slot RVA, function RVA, its first bytes, name).
+const FINDERS: [(usize, usize, [u8; 8], &str); 2] = [
+    (0x2A8EBD0, 0xBDF930, [0x4C, 0x8B, 0xDC, 0x57, 0x48, 0x83, 0xEC, 0x50], "throw finder (SprjChrThrowModule::RequestThrow_AllChr)"),
+    (0x2A7BC20, 0xB5DD30, [0x40, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57], "deathblow finder (FdpChrCeremonyModule::_GetEnableExecuteCremonyChr)"),
+];
 
 // --- Layout ---------------------------------------------------------------------------
 const CHR_TEAM: usize = 0x74;
@@ -142,8 +181,12 @@ const HIT_TYPE: usize = 0x28;
 const HIT_HP: usize = 0x1E0;
 const HIT_POSTURE: usize = 0x1E4;
 const HIT_TYPE_DEATHBLOW: i32 = 5;
-/// Record: AtkParam id (`0xB680C0` looks the attack up by it), scaled damage shorts.
+/// Record: BehaviorParam id (`0xB686A0` copies hit+0x4C; `0xB680C0` resolves it by table
+/// 0xC + attacker kind), scaled damage shorts, flags (bit 1 = bullet: `+0x4C` then holds the
+/// BulletParam id and the victim takes the AtkParam from that row).
 const REC_ATK_ID: usize = 0x48;
+const REC_DMG_FLAGS: usize = 0x3B;
+const REC_FLAG_BULLET: u8 = 2;
 const REC_DMG: usize = 0x30;
 
 // ===================================================================== pure, unit-tested
@@ -298,6 +341,32 @@ pub fn skip_death_attacker(chr: usize, is_native_remote: bool) -> bool {
     chr != 0 && is_native_remote
 }
 
+/// The record came from a bullet (prosthetic tool, explosion): flags `+0x3B` bit 1.
+pub fn record_is_bullet(record: &[u8]) -> bool {
+    record.get(REC_DMG_FLAGS).is_some_and(|f| f & REC_FLAG_BULLET != 0)
+}
+
+pub fn hit_kind(bullet: bool) -> &'static str {
+    if bullet { "bullet" } else { "melee" }
+}
+
+/// The throw / deathblow finders' decision: a candidate that is one of our native remotes is
+/// refused (the friend is an ally: no deathblow, no throw).
+pub fn finder_refuses(candidate: usize, is_native_remote: bool) -> bool {
+    candidate != 0 && is_native_remote
+}
+
+/// What `drive_receive` reports once about the vanilla receive path: `rx` = PlayerIns+0x2088,
+/// `online` = the game's own online player is ours (`0x9F3430`).
+pub fn vanilla_receive_note(rx: Option<usize>, online: Option<bool>) -> &'static str {
+    match (rx, online) {
+        (Some(r), _) if r != 0 => "set: the game's own receive runs too (our queue is served by whichever comes first)",
+        (Some(_), Some(true)) => "NULL although the game counts us as its online player (allocated on the next update)",
+        (Some(_), _) => "NULL: the game's own receive never runs (expected in our session); the mod drives it",
+        (None, _) => "unreadable",
+    }
+}
+
 /// The copy may keep the "cannot die" bit: its owner's snapshot says more than 1 HP and its
 /// type-1 frames are fresh (an owner who is dying or gone must be able to die here).
 pub fn replica_undying(owner_hp: Option<i32>, frame_age_ms: Option<u64>) -> bool {
@@ -349,6 +418,17 @@ static HELLOS: Mutex<HelloBook> = Mutex::new(HelloBook { at: [0; MAX_PLAYERS] })
 /// The remotes we changed (static so `shutdown` can restore them).
 static CHANGED: Mutex<Vec<Changed>> = Mutex::new(Vec::new());
 static N_NO_HELLO: AtomicU64 = AtomicU64::new(0);
+/// Our calls of `0xB72A80` (frames with queued hits) and finder candidates refused.
+static N_DRIVES: AtomicU64 = AtomicU64::new(0);
+static N_FINDER_REFUSED: AtomicU64 = AtomicU64::new(0);
+static ORIG_FINDERS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+/// Its address is the rx `drive_receive` passes to `0xB72A80` (never dereferenced by the game:
+/// both `0x8D7B10` calls are ours and return 0 for it once our queue is empty).
+static RX_SENTINEL: u8 = 0;
+
+fn sentinel_rx() -> usize {
+    &RX_SENTINEL as *const u8 as usize
+}
 
 struct Captured {
     peer: PeerId,
@@ -372,6 +452,9 @@ struct Serving {
     held_ms: u16,
     queued_ms: u64,
     attacker: usize,
+    /// BehaviorParam id of the record and whether it is a bullet (prosthetic tools, explosions).
+    atk: i32,
+    bullet: bool,
 }
 
 /// What the hooks saw, logged by `tick` (names, pings are only there).
@@ -499,29 +582,53 @@ fn serve(buf: *mut u8) -> Option<usize> {
             event(Event::Dropped { from: inc.from, seq: inc.seq, why: "no native remote of the sender" });
             continue;
         };
+        let atk = i32::from_le_bytes(inc.record[REC_ATK_ID..REC_ATK_ID + 4].try_into().unwrap_or([0xFF; 4]));
         if DRY_RUN.load(Ordering::Relaxed) {
             N_DRY.fetch_add(1, Ordering::Relaxed);
-            let atk = i32::from_le_bytes(inc.record[REC_ATK_ID..REC_ATK_ID + 4].try_into().unwrap_or([0xFF; 4]));
             event(Event::Dry { from: inc.from, seq: inc.seq, atk });
             continue;
         }
         unsafe { std::ptr::copy_nonoverlapping(inc.record.as_ptr(), buf, HIT_RECORD) };
         if let Ok(mut s) = SERVING.lock() {
-            *s = Some(Serving { from: inc.from, seq: inc.seq, held_ms: inc.held_ms, queued_ms: queued.as_millis() as u64, attacker });
+            *s = Some(Serving { from: inc.from, seq: inc.seq, held_ms: inc.held_ms, queued_ms: queued.as_millis() as u64, attacker, atk, bullet: record_is_bullet(&inc.record) });
         }
         return Some(attacker);
     }
 }
 
-/// `0x8D7B10(rx, record*) -> PlayerIns*` at both call sites in `0xB72A80`.
+/// `0x8D7B10(rx, record*) -> PlayerIns*` at both call sites in `0xB72A80`. Our sentinel rx
+/// (`drive_receive`) never reaches the original.
 extern "C" fn recv_hook(rx: usize, buf: *mut u8) -> usize {
     if ACTIVE.load(Ordering::Relaxed)
         && let Ok(Some(attacker)) = std::panic::catch_unwind(|| serve(buf))
     {
         return attacker;
     }
+    if rx == sentinel_rx() {
+        return 0;
+    }
     let f: extern "C" fn(usize, *mut u8) -> usize = unsafe { std::mem::transmute(ORIG_RECV.load(Ordering::Relaxed)) };
     f(rx, buf)
+}
+
+/// Chr finder candidate check `(finder, candidate chr, ..) -> bool` (`0xBDF930` takes two
+/// arguments, `0xB5DD30` four; the extra registers are passed through untouched).
+fn finder_call(i: usize, this: usize, chr: usize, a3: usize, a4: usize) -> u64 {
+    let refuse = std::panic::catch_unwind(|| finder_refuses(chr, native::peer_of_chr(chr).is_some())).unwrap_or(false);
+    if refuse {
+        N_FINDER_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    }
+    let f: extern "C" fn(usize, usize, usize, usize) -> u64 = unsafe { std::mem::transmute(ORIG_FINDERS[i].load(Ordering::Relaxed)) };
+    f(this, chr, a3, a4)
+}
+
+extern "C" fn throw_finder_hook(this: usize, chr: usize, a3: usize, a4: usize) -> u64 {
+    finder_call(0, this, chr, a3, a4)
+}
+
+extern "C" fn ceremony_finder_hook(this: usize, chr: usize, a3: usize, a4: usize) -> u64 {
+    finder_call(1, this, chr, a3, a4)
 }
 
 fn local_data() -> Option<usize> {
@@ -716,12 +823,33 @@ fn install() -> Result<(), (bool, String)> {
     if read_ptr(base + DEBUG_SESSION_VT_RVA + 8 * 4) != Some(base + DEBUG_SEND_HIT_RVA) {
         return Err((false, "PlayerDebugSession vtable slot 4 is not 0x1061880".into()));
     }
+    // drive_receive calls 0xB72A80 itself: its first bytes must be the rx NULL check.
+    let head: Vec<u8> = (0..RECV_LOOP_HEAD.len()).filter_map(|i| read::<u8>(base + FN_RECV_LOOP + i)).collect();
+    if head != RECV_LOOP_HEAD {
+        return Err((false, format!("type-20 receive loop 0xB72A80 starts with {head:02x?}")));
+    }
+    // The finders: each vtable slot holds its function, whose first bytes are as expected.
+    let mut finder_old: Vec<[u8; 8]> = Vec::with_capacity(FINDERS.len());
+    for &(slot, func, prologue, name) in &FINDERS {
+        let found = read_ptr(base + slot);
+        if found != Some(base + func) {
+            return Err((false, format!("{name}: vtable slot {:#x} holds {found:#x?}, not {:#x}", base + slot, base + func)));
+        }
+        let code: Vec<u8> = (0..prologue.len()).filter_map(|i| read::<u8>(base + func + i)).collect();
+        if code != prologue {
+            return Err((false, format!("{name}: {:#x} starts with {code:02x?}", base + func)));
+        }
+        finder_old.push(((base + func) as u64).to_le_bytes());
+    }
     let Some(page) = stub_page() else {
         return Err((false, "no memory near the module for the stubs".into()));
     };
     ORIG_RECV.store(base + FN_RECV, Ordering::Relaxed);
     ORIG_APPLY.store(base + FN_APPLY, Ordering::Relaxed);
     ORIG_REACTION.store(base + FN_REACTION, Ordering::Relaxed);
+    for (i, &(_, func, ..)) in FINDERS.iter().enumerate() {
+        ORIG_FINDERS[i].store(base + func, Ordering::Relaxed);
+    }
     let mut news: Vec<[u8; 4]> = Vec::with_capacity(sites.len());
     for (i, &(site, _, hook_fn, name)) in sites.iter().enumerate() {
         let Some(rel) = make_stub(page, i, base + site, hook_fn) else {
@@ -729,16 +857,25 @@ fn install() -> Result<(), (bool, String)> {
         };
         news.push(rel);
     }
-    let items: Vec<(usize, &[u8], &[u8])> =
+    // Vtable slots take the absolute address of our wrapper (no stub needed).
+    let finder_new: [[u8; 8]; 2] =
+        [(throw_finder_hook as *const () as u64).to_le_bytes(), (ceremony_finder_hook as *const () as u64).to_le_bytes()];
+    let mut items: Vec<(usize, &[u8], &[u8])> =
         sites.iter().zip(rels.iter().zip(&news)).map(|(&(site, ..), (old, new))| (base + site + 1, &old[..], &new[..])).collect();
+    for (i, &(slot, ..)) in FINDERS.iter().enumerate() {
+        items.push((base + slot, &finder_old[i][..], &finder_new[i][..]));
+    }
     match hook::write_frozen(&items) {
         Ok(()) => {
             log::line(&format!(
-                "pvp: hooks installed (type-20 recv x2 + apply in 0xB72A80, action 0 counter in 0xB6A040; tables [1][2] = {l12:?}, [2][1] = {r21}; stubs {page:#x})"
+                "pvp: hooks installed (type-20 recv x2 + apply in 0xB72A80, driven by the mod; action 0 counter in 0xB6A040; throw + deathblow finders refuse friends' copies (vtable 0x142A8EBD0, 0x142A7BC20); tables [1][2] = {l12:?}, [2][1] = {r21}; stubs {page:#x})"
             ));
             Ok(())
         }
-        Err(hook::freeze::Error::Bytes(i)) => Err((false, format!("{} changed under us (nothing written)", sites[i].3))),
+        Err(hook::freeze::Error::Bytes(i)) => Err((
+            false,
+            format!("{} changed under us (nothing written)", sites.get(i).map_or_else(|| FINDERS[i - sites.len()].3, |s| s.3)),
+        )),
         Err(e) => Err((true, format!("frozen write failed: {e:?} (nothing written)"))),
     }
 }
@@ -878,6 +1015,8 @@ pub struct Pvp {
     links: Vec<(PeerId, u64)>,
     /// Remotes already reported as "held at 1 HP while the owner is dead".
     held_logged: Vec<usize>,
+    /// PlayerIns+0x2088 was logged once (diagnostic).
+    rx_noted: bool,
 }
 
 impl Drop for Pvp {
@@ -984,6 +1123,9 @@ impl Pvp {
         if !active {
             self.hello_at = None;
         }
+        if active {
+            self.drive_receive(f.player);
+        }
         self.flush_out(&mut *f.net, f.peers, f.player, active);
         self.drain_events(&mut *f.net, f.peers, f.player);
         self.stats(active);
@@ -1021,11 +1163,14 @@ impl Pvp {
                 Some(i) => changed[i].no_dead,
                 None => {
                     let Some(fl) = flags else { continue };
-                    // Already 29 (our hub was rebuilt after a frame panic): the remote's own
+                    // Already ours (our hub was rebuilt after a frame panic): the remote's own
                     // values were the chr type's team 2 and no bit.
                     let (t, b) = if team == PVP_TEAM { (2, 0) } else { (team, fl & FLAG_NO_DEAD) };
                     changed.push(Changed { chr, peer, team: t, no_dead: b });
-                    log::line(&format!("pvp: peer {}'s native remote {chr:#x}: team {t} -> {PVP_TEAM} (Rival), our player's team unchanged", peer.slot()));
+                    log::line(&format!(
+                        "pvp: peer {}'s native remote {chr:#x}: team {t} -> {PVP_TEAM} (Coop NPC: our hits reach it, no lock-on / enemy bar), our player's team unchanged",
+                        peer.slot()
+                    ));
                     b
                 }
             };
@@ -1045,6 +1190,33 @@ impl Pvp {
                 }
             }
         }
+    }
+
+    /// Frame task (game thread), hits queued: the game's own receive loop
+    /// `0xB72A80(our dmgModule, sentinel rx)` applies them (`recv_hook` serves the queue, then 0
+    /// for the sentinel; `apply_hook` logs each). Vanilla only calls it with PlayerIns+0x2088,
+    /// which stays NULL in our session.
+    fn drive_receive(&mut self, player: Chr) {
+        if INBOX.lock().map_or(true, |q| q.is_empty()) {
+            return;
+        }
+        if !self.rx_noted {
+            self.rx_noted = true;
+            let rx = read_ptr(player.0 + PLAYER_RX);
+            let online = read_ptr(module_base() + ONLINE_HOLDER_RVA).filter(|&h| h != 0).and_then(|h| read_ptr(h + ONLINE_PLAYER)).map(|p| p == player.0);
+            log::line(&format!(
+                "pvp: receive path: PlayerIns+0x2088 = {} ({}); game's online player is ours: {}",
+                rx.map_or("?".into(), |v| format!("{v:#x}")),
+                vanilla_receive_note(rx, online),
+                online.map_or("?".into(), |o| o.to_string())
+            ));
+        }
+        let Some(module) = read_ptr(player.0 + CHR_MODULES).and_then(|m| read_ptr(m + MOD_DAMAGE)).filter(|&m| m != 0) else {
+            return; // a load: the queue goes stale and is dropped with a reason on a later frame
+        };
+        N_DRIVES.fetch_add(1, Ordering::Relaxed);
+        let f: extern "C" fn(usize, usize) = unsafe { std::mem::transmute(module_base() + FN_RECV_LOOP) };
+        f(module, sentinel_rx());
     }
 
     /// Once per remote recv vtable: its slot 4 must be PlayerDebugSession's `0x1061880`
@@ -1081,6 +1253,7 @@ impl Pvp {
             let held_ms = c.at.elapsed().as_millis().min(u16::MAX as u128) as u16;
             let atk = i32::from_le_bytes(c.record[REC_ATK_ID..REC_ATK_ID + 4].try_into().unwrap_or([0xFF; 4]));
             let dmg: Vec<i16> = (0..5).map(|k| i16::from_le_bytes([c.record[REC_DMG + 2 * k], c.record[REC_DMG + 2 * k + 1]])).collect();
+            let bullet = record_is_bullet(&c.record);
             let msg = encode(&Msg::Hit { nonce: nonce(), seq, held_ms, record: c.record });
             let ok = net.send_bulk_to(Dest::Peer(c.peer), BULK_PVP, &msg);
             if ok {
@@ -1094,9 +1267,10 @@ impl Pvp {
                 _ => "? m".into(),
             };
             log::line(&format!(
-                "pvp: hit #{seq} (local {id}) sent to {} (peer {}, ok {ok}): atk param {atk}, record dmg {dmg:?}, held {held_ms} ms; us {ours:?}, replica {theirs:?} ({dist}); last type 1 of the victim {} ms ago; ping {} ms",
+                "pvp: hit #{seq} (local {id}) sent to {} (peer {}, ok {ok}): behavior {atk} ({}), record dmg {dmg:?}, held {held_ms} ms; us {ours:?}, replica {theirs:?} ({dist}); last type 1 of the victim {} ms ago; ping {} ms",
                 p.map_or("?", |p| p.name.as_str()),
                 c.peer.slot(),
+                hit_kind(bullet),
                 native::frame_age_ms(c.peer).map_or("?".into(), |v| v.to_string()),
                 p.and_then(|p| p.rtt_ms).map_or("?".into(), |v| v.to_string()),
             ));
@@ -1112,9 +1286,11 @@ impl Pvp {
                 Event::Applied { s, hp, posture, dmg_hp, dmg_posture, hit_type, result, lost } => {
                     let est = rtt(s.from).map_or("?".into(), |r| (s.held_ms as u32 + r / 2).to_string());
                     log::line(&format!(
-                        "pvp: hit #{} from {} received (+~{est} ms sender->here incl. {} ms held there, {} ms queued here) -> applied hp {}->{} posture {}->{} (hit hp {} posture {dmg_posture}, type {hit_type}, result {result}){}",
+                        "pvp: hit #{} from {} received (behavior {} ({}), +~{est} ms sender->here incl. {} ms held there, {} ms queued here) -> applied hp {}->{} posture {}->{} (hit hp {} posture {dmg_posture}, type {hit_type}, result {result}){}",
                         s.seq,
                         name(s.from),
+                        s.atk,
+                        hit_kind(s.bullet),
                         s.held_ms,
                         s.queued_ms,
                         hp.0,
@@ -1135,7 +1311,7 @@ impl Pvp {
                     refill(player);
                 }
                 Event::Dry { from, seq, atk } => {
-                    log::line(&format!("pvp: hit #{seq} from {} received, atk param {atk}: DRY RUN, not applied", name(from)))
+                    log::line(&format!("pvp: hit #{seq} from {} received, behavior {atk}: DRY RUN, not applied", name(from)))
                 }
                 Event::Dropped { from, seq, why } => log::line(&format!("pvp: hit #{seq} from {} dropped: {why}", name(from))),
                 Event::Hello { from } => log::line(&format!("pvp: {} has friendly fire on: our hits on their copy are sent to them", name(from))),
@@ -1189,13 +1365,15 @@ impl Pvp {
             take(&N_DRY),
             take(&N_NO_HELLO),
             take(&N_DROP_BOSS),
+            take(&N_DRIVES),
+            take(&N_FINDER_REFUSED),
         ];
         if !active && v.iter().all(|&n| n == 0) {
             return;
         }
         log::line(&format!(
-            "pvp: 10 s: our hits captured {} sent {}; friend's received {} applied {}; local-vs-replica hit dropped (laggy path, reaction only) {}; dropped: cooldown {} stale {} no remote {} off {} duplicate {} deathblow {} dry run {} friend without friendly fire {} boss fight {}",
-            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]
+            "pvp: 10 s: our hits captured {} sent {}; friend's received {} applied {} (receive loop driven {}x); local-vs-replica hit dropped (laggy path, reaction only) {}; throw / deathblow on a friend refused {}; dropped: cooldown {} stale {} no remote {} off {} duplicate {} deathblow {} dry run {} friend without friendly fire {} boss fight {}",
+            v[0], v[1], v[2], v[3], v[14], v[4], v[15], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]
         ));
     }
 }
@@ -1365,6 +1543,50 @@ mod tests {
         assert!(!skip_death_attacker(0x7ff0_1234_0000, false), "an enemy killer stays");
         assert!(!skip_death_attacker(0, false), "no attacker: unchanged");
         assert!(!skip_death_attacker(0, true));
+    }
+
+    #[test]
+    fn bullet_flag_is_record_byte_0x3b_bit_1() {
+        let mut r = vec![0u8; HIT_RECORD];
+        assert!(!record_is_bullet(&r));
+        r[0x3B] = 0x02;
+        assert!(record_is_bullet(&r));
+        r[0x3B] = 0xFD;
+        assert!(!record_is_bullet(&r), "other bits only");
+        assert!(!record_is_bullet(&[]), "short record");
+        assert_eq!(hit_kind(true), "bullet");
+        assert_eq!(hit_kind(false), "melee");
+    }
+
+    #[test]
+    fn finders_refuse_only_native_remotes() {
+        assert!(finder_refuses(0x7ff0_1234_0000, true), "a friend's copy: no throw / deathblow");
+        assert!(!finder_refuses(0x7ff0_1234_0000, false), "an enemy stays a candidate");
+        assert!(!finder_refuses(0, true));
+        assert!(!finder_refuses(0, false));
+    }
+
+    #[test]
+    fn receive_note_tells_why_the_mod_drives() {
+        assert!(vanilla_receive_note(Some(0), Some(false)).starts_with("NULL: the game's own receive never runs"));
+        assert!(vanilla_receive_note(Some(0), None).starts_with("NULL: the game's own receive never runs"));
+        assert!(vanilla_receive_note(Some(0), Some(true)).starts_with("NULL although"));
+        assert!(vanilla_receive_note(Some(0x1234), Some(true)).starts_with("set"));
+        assert!(vanilla_receive_note(Some(0x1234), None).starts_with("set"));
+        assert_eq!(vanilla_receive_note(None, Some(true)), "unreadable");
+    }
+
+    #[test]
+    fn team_and_patch_constants() {
+        // 28 = Coop NPC (hit by us, not hostile); 29 (Rival) made the friend a full enemy.
+        assert_eq!(PVP_TEAM, 28);
+        // 0xB72A80: test rdx,rdx; jz rel32 -> 0xB72BFF (the function's end).
+        assert_eq!(&RECV_LOOP_HEAD[..5], &[0x48, 0x85, 0xD2, 0x0F, 0x84]);
+        let rel = i32::from_le_bytes(RECV_LOOP_HEAD[5..9].try_into().unwrap());
+        assert_eq!(FN_RECV_LOOP as i64 + 3 + 6 + rel as i64, 0xB72BFF);
+        // Two distinct finder slots, each holding a distinct function.
+        assert_ne!(FINDERS[0].0, FINDERS[1].0);
+        assert_ne!(FINDERS[0].1, FINDERS[1].1);
     }
 
     #[test]
