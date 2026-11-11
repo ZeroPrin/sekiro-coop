@@ -3819,6 +3819,93 @@ pub(crate) mod dblock {
         }
     }
 
+    // --- Fresh-life veto (1.0.11 `getup_deathblow_veto`) -------------------------------
+
+    /// `[GAMEPLAY] getup_deathblow_veto`: after a boss / miniboss loses a life (our deathblow
+    /// seen here, or the friend's applied by livesync) our player's throws on it are refused
+    /// at the gate for `FRESH_LIFE_MS`. Stops a second deathblow taking the next life in the
+    /// same posture break while the copy gets up (the other machine's posture can still read
+    /// broken for a moment, live 1.0.9: lives differ 7x in the audit).
+    pub static FRESH_LIFE_VETO: AtomicBool = AtomicBool::new(true);
+    pub const FRESH_LIFE_MS: u64 = 10_000;
+    const MAX_FRESH: usize = 32;
+
+    /// netIds that lost a life, with the time their veto ends.
+    #[derive(Debug, Default)]
+    pub struct FreshLives {
+        pub until: Vec<(u16, u64)>,
+    }
+
+    impl FreshLives {
+        pub const fn new() -> Self {
+            FreshLives { until: Vec::new() }
+        }
+
+        /// A life went at `now`: the veto runs (again) for `FRESH_LIFE_MS`.
+        pub fn mark(&mut self, net: u16, now: u64) {
+            self.until.retain(|(n, _)| *n != net);
+            if self.until.len() >= MAX_FRESH
+                && let Some(i) = self.until.iter().enumerate().min_by_key(|(_, (_, u))| *u).map(|(i, _)| i)
+            {
+                self.until.swap_remove(i);
+            }
+            self.until.push((net, now + FRESH_LIFE_MS));
+        }
+
+        /// The gate reads `FRESH_BITS` instead (lock-free); this is the same rule, for the tests.
+        #[cfg(test)]
+        pub fn active(&self, net: u16, now: u64) -> bool {
+            self.until.iter().any(|&(n, u)| n == net && now < u)
+        }
+
+        /// Drops the ended vetoes; returns their netIds.
+        pub fn expire(&mut self, now: u64) -> Vec<u16> {
+            let gone: Vec<u16> = self.until.iter().filter(|(_, u)| now >= *u).map(|(n, _)| *n).collect();
+            self.until.retain(|(_, u)| now < *u);
+            gone
+        }
+    }
+
+    static FRESH: Mutex<FreshLives> = Mutex::new(FreshLives::new());
+    /// The gate's lock-free copy of `FRESH` (game threads: atomics only).
+    static ANY_FRESH: AtomicBool = AtomicBool::new(false);
+    static FRESH_BITS: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+    static FRESH_LOGGED: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+    static FRESH_VETOES: AtomicU32 = AtomicU32::new(0);
+    /// `PENDING_LOG` entries with this bit are fresh-life vetoes (the others peer locks).
+    const PENDING_FRESH: u32 = 0x2_0000;
+
+    fn fresh_locked(n: u16) -> bool {
+        let (i, m) = bit(n);
+        ANY_FRESH.load(Ordering::Acquire) && FRESH_BITS[i].load(Ordering::Relaxed) & m != 0
+    }
+
+    fn set_fresh(n: u16, on: bool) {
+        let (i, m) = bit(n);
+        if on {
+            FRESH_BITS[i].fetch_or(m, Ordering::Relaxed);
+            FRESH_LOGGED[i].fetch_and(!m, Ordering::Relaxed);
+            ANY_FRESH.store(true, Ordering::Release);
+        } else {
+            FRESH_BITS[i].fetch_and(!m, Ordering::Relaxed);
+        }
+    }
+
+    /// livesync: enemy `n` (entity `entity`) lost a life with lives left (`why` = "seen here" /
+    /// "the friend's deathblow"). No throw of ours on it starts for `FRESH_LIFE_MS`.
+    pub fn life_lost(n: u16, entity: i32, why: &str) {
+        if !FRESH_LIFE_VETO.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = crate::game::now_ms();
+        FRESH.lock().unwrap_or_else(std::sync::PoisonError::into_inner).mark(n, now);
+        set_fresh(n, true);
+        log::line(&format!(
+            "deathblow: enemy {entity} netId {n:#x} lost a life ({why}): no new deathblow on it here for {} s (it gets up with full HP and posture)",
+            FRESH_LIFE_MS / 1000
+        ));
+    }
+
     // --- Live state ---------------------------------------------------------------------
 
     static TABLE: Mutex<Table> = Mutex::new(Table::new());
@@ -3893,20 +3980,26 @@ pub(crate) mod dblock {
         // SAFETY: the trampoline (or the original once unhooked) has this signature.
         let f: extern "C" fn(usize, usize, usize) -> u64 = unsafe { std::mem::transmute(if t != 0 { t } else { module_base() + GATE_RVA }) };
         let r = f(atk, def, kind);
-        if r & 0xFF == 0 || !ANY.load(Ordering::Acquire) || atk == 0 || atk != PLAYER.load(Ordering::Relaxed) || def < 0x10000 || !crate::mod_alive() {
+        let any = ANY.load(Ordering::Acquire) || ANY_FRESH.load(Ordering::Acquire);
+        if r & 0xFF == 0 || !any || atk == 0 || atk != PLAYER.load(Ordering::Relaxed) || def < 0x10000 || !crate::mod_alive() {
             return r;
         }
         // SAFETY: the original just read this ChrIns (`def+0x1FF8`, `def+8`); `+0x78` is its
         // netId (netai::net_id).
         let n = unsafe { ((def + CHR_NET_ID) as *const u16).read_volatile() };
-        if !peer_locked(n) {
-            return r;
-        }
-        VETOES.fetch_add(1, Ordering::Relaxed);
         let (i, m) = bit(n);
-        if LOGGED[i].fetch_or(m, Ordering::Relaxed) & m == 0 {
+        let first_log = if peer_locked(n) {
+            VETOES.fetch_add(1, Ordering::Relaxed);
+            (LOGGED[i].fetch_or(m, Ordering::Relaxed) & m == 0).then_some(0x1_0000)
+        } else if fresh_locked(n) {
+            FRESH_VETOES.fetch_add(1, Ordering::Relaxed);
+            (FRESH_LOGGED[i].fetch_or(m, Ordering::Relaxed) & m == 0).then_some(PENDING_FRESH)
+        } else {
+            return r;
+        };
+        if let Some(tag) = first_log {
             for s in &PENDING_LOG {
-                if s.compare_exchange(0, 0x1_0000 | n as u32, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                if s.compare_exchange(0, tag | n as u32, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                     break;
                 }
             }
@@ -4063,9 +4156,23 @@ pub(crate) mod dblock {
                 ANY.store(false, Ordering::Release);
             }
         }
+        if let Ok(mut f) = FRESH.try_lock() {
+            for n in f.expire(now) {
+                set_fresh(n, false);
+            }
+            if f.until.is_empty() {
+                ANY_FRESH.store(false, Ordering::Release);
+            }
+        }
         for s in &PENDING_LOG {
             let v = s.swap(0, Ordering::Relaxed);
-            if v != 0 {
+            if v & PENDING_FRESH != 0 {
+                log_limited(format!(
+                    "deathblow: our attempt on {:#x} refused: it lost a life less than {} s ago and gets up (fresh-life veto)",
+                    v & 0xFFFF,
+                    FRESH_LIFE_MS / 1000
+                ));
+            } else if v != 0 {
                 log_limited(format!("deathblow: our attempt on {:#x} suppressed (peer first): its deathblow marker / throw is off for our player while another player's runs", v & 0xFFFF));
             }
         }
@@ -4074,16 +4181,17 @@ pub(crate) mod dblock {
             STATS_AT.store(now, Ordering::Relaxed);
         } else if now.saturating_sub(at) >= STATS_MS {
             STATS_AT.store(now, Ordering::Relaxed);
-            let c = [&OURS_NEW, &PEERS_NEW, &VETOES, &DROPPED, &GAVE_WAY, &MISSED].map(|a| a.swap(0, Ordering::Relaxed));
+            let c = [&OURS_NEW, &PEERS_NEW, &VETOES, &DROPPED, &GAVE_WAY, &MISSED, &FRESH_VETOES].map(|a| a.swap(0, Ordering::Relaxed));
             if c.iter().any(|&x| x > 0) {
                 log::line(&format!(
-                    "deathblow: 10 s: locks ours {} / other players' {}, gate vetoes {}, their throws not applied {}, ours gave way {}, ours started during another's lock {} (gate {})",
+                    "deathblow: 10 s: locks ours {} / other players' {}, gate vetoes {}, their throws not applied {}, ours gave way {}, ours started during another's lock {}, fresh-life vetoes {} (gate {})",
                     c[0],
                     c[1],
                     c[2],
                     c[3],
                     c[4],
                     c[5],
+                    c[6],
                     if TRAMP.load(Ordering::Acquire) != 0 { "hooked" } else { "not hooked" }
                 ));
             }
@@ -7240,6 +7348,30 @@ mod dblock_tests {
         assert_eq!(their_start(5000, Some(80)), 4960);
         assert_eq!(their_start(5000, None), 5000 - DEFAULT_RTT_MS as u64 / 2);
         assert_eq!(their_start(10, Some(400)), 0);
+    }
+
+    #[test]
+    fn fresh_life_veto_runs_ten_seconds_per_enemy() {
+        let mut f = FreshLives::new();
+        // 1.0.11 live: 1100300 netId 0x83e lost a life, the veto held for 10 s.
+        f.mark(0x83e, 1000);
+        assert!(f.active(0x83e, 1000));
+        assert!(f.active(0x83e, 1000 + FRESH_LIFE_MS - 1));
+        assert!(!f.active(0x83e, 1000 + FRESH_LIFE_MS));
+        assert!(!f.active(0x83f, 1000), "other enemies are not vetoed");
+        // A second life lost later restarts the window (no duplicate entry).
+        f.mark(0x83e, 6000);
+        assert_eq!(f.until.len(), 1);
+        assert!(f.active(0x83e, 1000 + FRESH_LIFE_MS));
+        assert!(f.expire(6000 + FRESH_LIFE_MS - 1).is_empty());
+        assert_eq!(f.expire(6000 + FRESH_LIFE_MS), vec![0x83e]);
+        assert!(f.until.is_empty());
+        // Bounded: the oldest goes first.
+        for n in 0..40u16 {
+            f.mark(n, 100 + n as u64);
+        }
+        assert_eq!(f.until.len(), 32);
+        assert!(!f.active(0, 101) && f.active(39, 200));
     }
 
     #[test]

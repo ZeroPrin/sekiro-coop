@@ -367,6 +367,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::doctor::ALLOW_CROSS_CYCLE.store(ini.flag("allow_cross_cycle", false, warn), Relaxed);
     crate::nopause::ENABLED.store(ini.flag("no_pause_in_coop", true, warn), Relaxed);
     crate::livesync::ENABLED.store(ini.flag("native_lives_sync", true, warn), Relaxed);
+    crate::nsession::dblock::FRESH_LIFE_VETO.store(ini.flag("getup_deathblow_veto", true, warn), Relaxed);
     crate::puppetguard::ENABLED.store(ini.flag("puppet_type5_guard", true, warn), Relaxed);
     crate::bossrules::CLEAR_STALE_NO_REVIVE.store(ini.flag("clear_stale_no_revive", true, warn), Relaxed);
     crate::persist::BOSS_PERSIST.store(ini.flag("boss_persist_on_death", true, warn), Relaxed);
@@ -626,6 +627,10 @@ no_pause_in_coop = 1
 ;     death on either machine are applied on the other one too (within about half a
 ;     second), so both see the same life orbs and the same dead enemies. 0 = off.
 native_lives_sync = 1
+; 1 = after a boss or miniboss loses a life to a deathblow, nobody can deathblow it again
+;     for 10 seconds while it gets up (stops a second deathblow taking both lives in one
+;     posture break when another player made the first one). 0 = off.
+getup_deathblow_veto = 1
 ; 1 = a Puppeteer Ninjutsu puppet (an enemy you raised to fight for you) is not killed by
 ;     the host's copy of that enemy, which stays dead there (native session). 0 = off.
 puppet_type5_guard = 1
