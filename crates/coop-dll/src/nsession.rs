@@ -4476,6 +4476,9 @@ struct Link {
     held: bool,
     /// Engaged and the blocks differ: since when (a short border flicker is not a leave).
     elsewhere_since: Option<Instant>,
+    /// Engaged and OUR block differs from the engaged one: since when (blockgrace.rs; the
+    /// border flicker of our own block is not a load either).
+    own_moved_since: Option<Instant>,
     /// Idle while the peer is known to be in another block (no handshakes then).
     elsewhere_logged: bool,
     /// Host: the 23 distribution was forced after this client's first 22 of the engagement.
@@ -4530,6 +4533,7 @@ impl Link {
             failed_attempt: false,
             held: false,
             elsewhere_since: None,
+            own_moved_since: None,
             elsewhere_logged: false,
             first22_forced: false,
             host22_logs: 0,
@@ -4871,6 +4875,7 @@ impl Engine {
             self.teardown();
         }
         l.elsewhere_since = None;
+        l.own_moved_since = None;
         if leave && was != Phase::Idle {
             queue_ctrl(slot, &Msg::Leave { generation: l.generation, latch, reason: reason as u8 });
         }
@@ -5327,12 +5332,11 @@ impl Engine {
             return;
         }
         let peer_block = f.block_of(l.id);
-        if f.here != Some(l.block) || peer_block.is_some_and(|b| b != l.block) {
-            // Our own block changed = a load is coming (it disengages anyway; every link
-            // sees it); the peer's block flickering at a border is not a reason to drop
-            // the ownership tables.
+        if peer_block.is_some_and(|b| b != l.block) {
+            // The peer's block flickering at a border is not a reason to drop the ownership
+            // tables. Our own block change has its own grace in `tick` (all links at once).
             let since = *l.elsewhere_since.get_or_insert_with(Instant::now);
-            if f.here != Some(l.block) || since.elapsed() >= ELSEWHERE_GRACE {
+            if since.elapsed() >= ELSEWHERE_GRACE {
                 let why = format!(
                     "peer in another block (ours {:?}, its {peer_block:?}, for {} ms)",
                     f.here,
@@ -5981,11 +5985,45 @@ impl Engine {
         }
         let changed: Vec<PeerId> = self.links.iter().filter(|(_, l)| l.phase != Phase::Idle && l.stage != stage).map(|(id, _)| *id).collect();
         self.disengage_many(&changed, "native_session_stage changed", Reason::Other, true, false);
-        // Our own block changed (a load is coming): every engaged link goes in one call, no
-        // record clearing for the links still to go (`disengage_many`).
-        let moved: Vec<PeerId> = self.links.iter().filter(|(_, l)| l.phase == Phase::Engaged && f.here != Some(l.block)).map(|(id, _)| *id).collect();
+        // Our own block changed: every engaged link goes in one call, no record clearing for
+        // the links still to go (`disengage_many`). Not at once (blockgrace.rs): walking along
+        // a block border flips our block back and forth without a load (live 2026-11-12: four
+        // disengage / re-engage rounds in 15 s, each one a Leave to the peer, the patches
+        // restored and re-applied, enemies' AI handed over twice). A real load or warp takes
+        // every link down through `on_world_reset` anyway.
+        let grace = tuning::block_change_grace();
+        let now = Instant::now();
+        let mut moved: Vec<PeerId> = Vec::new();
+        let mut moved_for = Duration::ZERO;
+        for (id, l) in self.links.iter_mut().filter(|(_, l)| l.phase == Phase::Engaged) {
+            match crate::blockgrace::step(&mut l.own_moved_since, f.here != Some(l.block), now, grace) {
+                crate::blockgrace::Step::Started => log::line(&format!(
+                    "nsession: our block changed (ours {:?}, engaged in {}) with peer {}: grace started, disengage in {} ms unless we come back",
+                    f.here,
+                    l.block,
+                    l.slot(),
+                    grace.as_millis()
+                )),
+                crate::blockgrace::Step::Cancelled(t) => log::line(&format!(
+                    "nsession: back in block {} after {} ms: grace cancelled, still engaged with peer {}",
+                    l.block,
+                    t.as_millis(),
+                    l.slot()
+                )),
+                crate::blockgrace::Step::Expired(t) => {
+                    moved.push(*id);
+                    moved_for = moved_for.max(t);
+                }
+                crate::blockgrace::Step::Same | crate::blockgrace::Step::Holding(_) => {}
+            }
+        }
         if !moved.is_empty() {
-            let why = format!("our block changed (ours {:?}, was {:?})", f.here, self.links.get(&moved[0]).map(|l| l.block));
+            let why = format!(
+                "our block changed (ours {:?}, was {:?}, for {} ms: grace expired)",
+                f.here,
+                self.links.get(&moved[0]).map(|l| l.block),
+                moved_for.as_millis()
+            );
             self.disengage_many(&moved, &why, Reason::FriendElsewhere, true, false);
         }
         let broken = BROKEN.load(Ordering::Acquire);

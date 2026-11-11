@@ -913,6 +913,8 @@ struct PeerNative {
     retry_at: Option<Instant>,
     /// The peer alive again while our remote of it lies dead since then.
     revive_seen: Option<Instant>,
+    /// Its snapshot block differs from ours since then while its remote exists (blockgrace.rs).
+    elsewhere_since: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -947,6 +949,9 @@ pub struct Native {
     /// `follow_peers`: one position pin per peer, each in its own UpdateCoords hook slot.
     pins: BTreeMap<PeerId, Pin>,
     pin_stats: PinStats,
+    /// This frame's snapshot position of each peer in our block (`wants_for`): where a remote
+    /// created this frame is pinned from its first frame on (`spawn_one`).
+    spawn_at: BTreeMap<PeerId, [f32; 3]>,
 }
 
 /// Net remotes and N0 clones are created at least this far apart (one PlayerIns per
@@ -970,6 +975,13 @@ fn want_rule(option_on: bool, connected: bool, snap: Option<(i32, i32)>, here: O
     let elsewhere = snap.is_some_and(|(_, block)| here != Some(block));
     let spawnable = snap.is_some_and(|(hp, block)| hp > 0 && here == Some(block)) && settled;
     option_on && connected && !elsewhere && (has_remote || spawnable)
+}
+
+/// `want_rule` with the border grace (blockgrace.rs): an existing remote whose peer is in
+/// another block only for less than `block_change_grace_ms` stays (no delete + re-create on
+/// every border crossing, live 2026-11-12). Never creates one.
+fn want_with_grace(rule: bool, option_on: bool, connected: bool, has_remote: bool, in_grace: bool) -> bool {
+    rule || (option_on && connected && has_remote && in_grace)
 }
 
 /// The listed remotes that must go: their peer is not in `wants` with `want` set.
@@ -1025,17 +1037,66 @@ impl Native {
     }
 
     /// puppet.rs: one `NetWant` per peer of the frame's set (id order), by `want_rule`.
-    pub fn wants_for(&self, peers: &PeerSet, here: Option<i32>, in_world_for: Duration, connected: bool) -> Vec<NetWant> {
+    pub fn wants_for(&mut self, peers: &PeerSet, here: Option<i32>, in_world_for: Duration, connected: bool) -> Vec<NetWant> {
         let on = crate::tuning::native_remote();
         let settled = in_world_for.as_secs_f32() > crate::tuning::native_spawn_delay_s() as f32;
-        peers
-            .iter()
-            .map(|p| {
-                let snap = p.snapshot.map(|s| (s.hp, s.block));
-                let has = self.remote_of(p.id).is_some();
-                NetWant { peer: p.id, want: want_rule(on, connected, snap, here, has, settled), hp: p.hp() }
-            })
-            .collect()
+        let grace = crate::tuning::block_change_grace();
+        let now = Instant::now();
+        self.spawn_at.clear();
+        let mut out = Vec::new();
+        for p in peers.iter() {
+            let snap = p.snapshot.map(|s| (s.hp, s.block));
+            let has = self.remote_of(p.id).is_some();
+            let rule = want_rule(on, connected, snap, here, has, settled);
+            let in_grace = self.border_grace(p.id, has, snap.map(|s| s.1), here, now, grace);
+            // A creation this frame starts at the peer's own position (`spawn_one`).
+            if let Some(s) = p.snapshot.filter(|s| !s.hidden && here == Some(s.block) && crate::game::sane_pos(s.pos)) {
+                self.spawn_at.insert(p.id, s.pos);
+            }
+            out.push(NetWant { peer: p.id, want: want_with_grace(rule, on, connected, has, in_grace), hp: p.hp() });
+        }
+        out
+    }
+
+    /// The border grace of `peer`'s remote: true while its snapshot block has differed from
+    /// ours for less than `grace` (blockgrace.rs). Only while the remote exists; logs start,
+    /// cancel and expiry.
+    fn border_grace(&mut self, peer: PeerId, has: bool, its: Option<i32>, here: Option<i32>, now: Instant, grace: Duration) -> bool {
+        let st = self.peer_state.entry(peer).or_default();
+        if !has {
+            st.elsewhere_since = None;
+            return false;
+        }
+        let differs = its.is_some_and(|b| here != Some(b));
+        match crate::blockgrace::step(&mut st.elsewhere_since, differs, now, grace) {
+            crate::blockgrace::Step::Same => false,
+            crate::blockgrace::Step::Started => {
+                log::line(&format!(
+                    "native: peer slot {} in another block (ours {here:?}, its {its:?}): grace started, its remote stays up to {} ms",
+                    peer.slot(),
+                    grace.as_millis()
+                ));
+                true
+            }
+            crate::blockgrace::Step::Holding(_) => true,
+            crate::blockgrace::Step::Cancelled(t) => {
+                log::line(&format!(
+                    "native: peer slot {} back in our block {here:?} after {} ms: grace cancelled, remote kept",
+                    peer.slot(),
+                    t.as_millis()
+                ));
+                false
+            }
+            crate::blockgrace::Step::Expired(t) => {
+                st.elsewhere_since = None;
+                log::line(&format!(
+                    "native: peer slot {} in another block for {} ms (ours {here:?}, its {its:?}): grace expired, its remote goes",
+                    peer.slot(),
+                    t.as_millis()
+                ));
+                false
+            }
+        }
     }
 
     /// Removes `peer`'s Net remote, if any (it left, or no longer wants one). The other
@@ -1280,7 +1341,20 @@ impl Native {
             return;
         }
         let delay = crate::tuning::native_dress_delay_ms();
-        if delay == 0 {
+        // The peer's loadout is here already (a re-creation after a border crossing, a
+        // respawn): dress before the model is built, so the CharaInitParam template never
+        // shows. The delay only stays for the fallback dress in OUR equipment (no loadout yet)
+        // and the N0 clones: it was a driver-crash mitigation for the model churn of a late
+        // dress (gpuguard.rs), and a dress before the model is built causes no extra churn.
+        let known = r.peer.is_some_and(|p| crate::tuning::loadout_sync() && crate::loadout::of(p).is_some());
+        if delay > 0 && known {
+            log::line(&format!(
+                "native: dressing {:#x} at once: peer slot {}'s loadout is known (no template look, native_dress_delay_ms {delay} skipped)",
+                r.chr.0,
+                r.peer.map_or(0, |p| p.slot())
+            ));
+            Self::dress_now(r, player);
+        } else if delay == 0 {
             log::line("native: dressing right after the factory (native_dress_delay_ms = 0)");
             Self::dress_now(r, player);
         } else {
@@ -1493,7 +1567,8 @@ impl Native {
                 ));
                 self.finish_spawn(&mut r, player);
                 log_checks(&r, player, "N1 spawn");
-                let at = self.remotes.iter().position(|q| q.peer > Some(peer)).unwrap_or(self.remotes.len());
+                self.place_at_spawn(&r, peer);
+                let at =self.remotes.iter().position(|q| q.peer > Some(peer)).unwrap_or(self.remotes.len());
                 self.remotes.insert(at, r);
                 self.last_create = Some((peer, Instant::now()));
                 let st = self.peer_state.entry(peer).or_default();
@@ -1515,6 +1590,33 @@ impl Native {
                 self.last_error = Some(e);
             }
         }
+    }
+
+    /// A new remote of `peer` starts where the peer is: its pin target is set in the frame
+    /// it is created, so its first physics update already puts it there. Without this it
+    /// stood next to us or ~300 m off until the next frame's pin (live 2026-11-12: `313.17 m
+    /// from player`, `moves by the game (max 313.7 m)`). There is no verified "do not draw"
+    /// switch for a ChrIns, so placing it is what keeps the factory spot from showing.
+    fn place_at_spawn(&mut self, r: &Remote, peer: PeerId) {
+        let Some(pos) = self.spawn_at.get(&peer).copied() else {
+            log::line(&format!("native: remote {:#x} of peer slot {}: no position of the friend yet, the pin places it next frame", r.chr.0, peer.slot()));
+            return;
+        };
+        let (Some(physics), Some(cur)) = (r.chr.physics(), r.chr.position4()) else {
+            log::line(&format!("native: remote {:#x} of peer slot {}: no physics yet, the pin places it next frame", r.chr.0, peer.slot()));
+            return;
+        };
+        hook::set_target(pin_slot(peer), physics, [pos[0], pos[1], pos[2], cur[3]]);
+        let pin = self.pins.entry(peer).or_default();
+        pin.on = true;
+        pin.last = Some((r.chr, pos, Instant::now()));
+        pin.block = crate::game::current_block();
+        log::line(&format!(
+            "native: remote {:#x} of peer slot {} placed at the friend's position before its first frame ({:.1} m from where the factory put it)",
+            r.chr.0,
+            peer.slot(),
+            crate::game::distance([cur[0], cur[1], cur[2]], pos)
+        ));
     }
 
     /// Every in-world frame: stale cleanup, vanished remotes, the send tee
@@ -1723,6 +1825,7 @@ impl Native {
     /// throw, a game warp).
     pub fn follow_peers(&mut self, net: Option<&crate::net::Net>) {
         let now = Instant::now();
+        let here = crate::game::current_block();
         for r in &self.remotes {
             let Some(peer) = r.peer else { continue };
             let target = net
@@ -1770,11 +1873,57 @@ impl Native {
             if std::mem::take(&mut pin.in_throw) {
                 pin.resume = true; // ease from where the throw left the remote
             }
+            // Border crossings (blockgrace.rs): the peer's coordinates mean nothing in another
+            // block, and the smoothed target mixes both blocks for a moment after a flip.
+            let its = net.and_then(|n| n.peer(peer)).and_then(|p| p.remote()).map(|s| s.block);
+            let was = pin.mode;
+            let mode = pin.border(its, here, now);
+            if mode != was {
+                log::line(&format!(
+                    "native: pin of peer slot {}: {} (its block {its:?}, ours {here:?}, {} ms after {})",
+                    peer.slot(),
+                    match mode {
+                        PinMode::Follow => "follows the friend again",
+                        PinMode::Hold => "held where it is (other block / block just changed)",
+                        PinMode::Release => "released to the game (our block changed)",
+                    },
+                    pin.mode_since.map_or(0, |t| now.saturating_duration_since(t).as_millis()),
+                    match was {
+                        PinMode::Follow => "following",
+                        PinMode::Hold => "holding",
+                        PinMode::Release => "release",
+                    }
+                ));
+                pin.mode_since = Some(now);
+            }
+            match mode {
+                PinMode::Follow => {}
+                PinMode::Hold => {
+                    match (pin.last.filter(|(c, ..)| *c == r.chr), r.chr.physics(), r.chr.position4()) {
+                        (Some((_, last, _)), Some(physics), Some(cur)) => {
+                            hook::set_target(pin_slot(peer), physics, [last[0], last[1], last[2], cur[3]]);
+                            pin.on = true;
+                        }
+                        _ => pin.release(peer),
+                    }
+                    continue;
+                }
+                PinMode::Release => {
+                    pin.release(peer);
+                    continue;
+                }
+            }
             match target {
                 Some((p, _)) if let (Some(physics), Some(cur)) = (r.chr.physics(), r.chr.position4()) => {
+                    // Back from a release: ease from where the game left it, unless that is
+                    // as far as a warp (set at once then, no 300 m flight).
+                    if was == PinMode::Release && pin.last.is_none() {
+                        pin.resume = crate::game::distance([cur[0], cur[1], cur[2]], p) < NATIVE_WARP_M;
+                    }
                     let out = pin.step(&mut self.pin_stats, r.chr, [cur[0], cur[1], cur[2]], p, now);
                     hook::set_target(pin_slot(peer), physics, [out[0], out[1], out[2], cur[3]]);
                     pin.on = true;
+                    pin.block = here;
                 }
                 _ => pin.release(peer),
             }
@@ -1828,6 +1977,45 @@ struct Pin {
     throw_since: Option<Instant>,
     extended_logged: bool,
     gave_up_logged: bool,
+    /// Border handling (`pin_mode`): our block at the last write, the (its, ours) block pair
+    /// last seen and since when (None = since the pin was made), the mode and since when.
+    block: Option<i32>,
+    blocks: Option<(Option<i32>, Option<i32>)>,
+    blocks_since: Option<Instant>,
+    mode: PinMode,
+    mode_since: Option<Instant>,
+}
+
+/// What a pin does this frame at a map-block border.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PinMode {
+    /// Write the friend's smoothed snapshot position (the normal case).
+    #[default]
+    Follow,
+    /// Keep the remote where we last put it: the friend's block differs from ours, or the
+    /// blocks changed less than `PIN_BLOCK_SETTLE` ago (the smoothed target still mixes both).
+    Hold,
+    /// Let go (the game's own NetworkManipulator moves it): our own block changed since the
+    /// last write, so that position belongs to another block's coordinates.
+    Release,
+}
+
+/// After a block flip the smoothed target (60-130 ms in the past) mixes both blocks'
+/// coordinates for a moment: the pin follows again only after the blocks agreed this long.
+const PIN_BLOCK_SETTLE: Duration = Duration::from_millis(400);
+
+/// `PinMode` from the friend's snapshot block `its`, ours `here`, our block at the last write
+/// `written_in` and how long the (its, here) pair has not changed. No snapshot block: follow
+/// (the target is None then, as before).
+fn pin_mode(its: Option<i32>, here: Option<i32>, written_in: Option<i32>, stable_for: Duration) -> PinMode {
+    let same = its.is_none() || (here.is_some() && its == here);
+    if same && stable_for >= PIN_BLOCK_SETTLE {
+        PinMode::Follow
+    } else if written_in.is_some() && written_in == here {
+        PinMode::Hold
+    } else {
+        PinMode::Release
+    }
 }
 
 /// The pin never stays released longer than this for one throw.
@@ -1870,6 +2058,19 @@ impl Pin {
             hook::clear_target(pin_slot(peer));
             self.on = false;
         }
+    }
+
+    /// This frame's `PinMode` (tracks when the block pair last changed).
+    fn border(&mut self, its: Option<i32>, here: Option<i32>, now: Instant) -> PinMode {
+        if self.blocks != Some((its, here)) {
+            if self.blocks.is_some() {
+                self.blocks_since = Some(now);
+            }
+            self.blocks = Some((its, here));
+        }
+        let stable_for = self.blocks_since.map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+        self.mode = pin_mode(its, here, self.block, stable_for);
+        self.mode
     }
 
     /// The position to write this frame for `target`; `cur` = where the remote is now.
@@ -2112,6 +2313,55 @@ mod tests {
         // Option off or link down: never.
         assert!(!want_rule(false, true, Some((100, 7)), here, true, true));
         assert!(!want_rule(true, false, Some((100, 7)), here, true, true));
+    }
+
+    #[test]
+    fn border_grace_keeps_an_existing_remote_only() {
+        let here = Some(3);
+        // Live 2026-11-12: we stepped into block 3, the friend's snapshot still says 2.
+        let rule = want_rule(true, true, Some((100, 2)), here, true, true);
+        assert!(!rule);
+        assert!(want_with_grace(rule, true, true, true, true), "kept during the grace");
+        assert!(!want_with_grace(rule, true, true, true, false), "goes once the grace expired");
+        // The grace never creates one, and never overrides the option or the link.
+        let none = want_rule(true, true, Some((100, 2)), here, false, true);
+        assert!(!want_with_grace(none, true, true, false, true));
+        assert!(!want_with_grace(rule, false, true, true, true));
+        assert!(!want_with_grace(rule, true, false, true, true));
+        // The plain rule still wins when it says yes.
+        assert!(want_with_grace(want_rule(true, true, Some((100, 3)), here, true, true), true, true, true, false));
+    }
+
+    #[test]
+    fn pin_holds_or_lets_go_at_a_border() {
+        let long = Duration::from_secs(5);
+        let short = Duration::from_millis(100);
+        // Same block for a while: follow.
+        assert_eq!(pin_mode(Some(2), Some(2), Some(2), long), PinMode::Follow);
+        // No snapshot block: follow (the target decides, as before).
+        assert_eq!(pin_mode(None, Some(2), None, long), PinMode::Follow);
+        // The friend in another block, we did not move: hold our last write.
+        assert_eq!(pin_mode(Some(3), Some(2), Some(2), long), PinMode::Hold);
+        // Back in the same block a moment ago: still hold until the smoothed target settled.
+        assert_eq!(pin_mode(Some(2), Some(2), Some(2), short), PinMode::Hold);
+        assert_eq!(pin_mode(Some(2), Some(2), Some(2), PIN_BLOCK_SETTLE), PinMode::Follow);
+        // We moved into another block: our last write is in the old block's coordinates.
+        assert_eq!(pin_mode(Some(2), Some(3), Some(2), long), PinMode::Release);
+        assert_eq!(pin_mode(Some(3), Some(3), Some(2), short), PinMode::Release);
+        // Nothing written yet (a fresh pin) right after a flip: let go.
+        assert_eq!(pin_mode(Some(2), Some(2), None, short), PinMode::Release);
+    }
+
+    #[test]
+    fn pin_border_tracks_the_block_pair() {
+        let t0 = Instant::now();
+        let mut pin = Pin { block: Some(2), ..Default::default() };
+        // First sight counts as settled.
+        assert_eq!(pin.border(Some(2), Some(2), t0), PinMode::Follow);
+        // The friend flips to 3 and back within the settle time: held throughout.
+        assert_eq!(pin.border(Some(3), Some(2), t0 + Duration::from_millis(10)), PinMode::Hold);
+        assert_eq!(pin.border(Some(2), Some(2), t0 + Duration::from_millis(300)), PinMode::Hold);
+        assert_eq!(pin.border(Some(2), Some(2), t0 + Duration::from_millis(300) + PIN_BLOCK_SETTLE), PinMode::Follow);
     }
 
     #[test]

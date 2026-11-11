@@ -173,6 +173,15 @@ pub fn death_restore_delay_s() -> u32 {
     DEATH_RESTORE_DELAY_S.load(Ordering::Relaxed)
 }
 
+/// `[DEBUG] block_change_grace_ms` (blockgrace.rs): a map-block difference between us and a
+/// peer (border flicker) must last this long before its native remote is deleted and before
+/// our own block change ends the native session engagement. 0 = at once (the old rule).
+pub static BLOCK_CHANGE_GRACE_MS: AtomicU32 = AtomicU32::new(2500);
+
+pub fn block_change_grace() -> std::time::Duration {
+    std::time::Duration::from_millis(BLOCK_CHANGE_GRACE_MS.load(Ordering::Relaxed) as u64)
+}
+
 /// Join / idol-follow always through a loading screen (fresh world).
 /// `[GAMEPLAY] dialog_default_yes`: the co-op yes/no box highlights Yes by default (dialog.rs
 /// `open_default_yes`); false = the game's own default (No).
