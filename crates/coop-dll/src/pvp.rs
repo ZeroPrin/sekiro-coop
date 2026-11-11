@@ -38,8 +38,12 @@
 //!
 //! Non-lethal duels: a hit that brings us to 1 HP (or a deathblow, hit type 5, which is not
 //! applied at all) ends the duel: `pvp: duel over, <name> wins`, a DuelOver message to the
-//! attacker, and for 5 s both sides drop player hits. Lethal PvP is NOT supported (the kill
-//! handler `0xB53BA0` reads the killer's session member; untested with a remote killer).
+//! attacker, for 5 s both sides drop that peer's hits, and both refill HP / posture. Lethal
+//! PvP is NOT supported: the death event `0x66CDA0` looks the killer's session member up and
+//! crashes on a native remote (`0x66CE96`, the 1.0.11 crash). The death guard
+//! (`death_attacker_hook`, `[DEBUG] pvp_death_guard`, on even without friendly_fire) makes it
+//! see no killer when our player dies in the same frame as a friend's applied hit.
+//! Boss fights (`friendly_fire_in_boss_fights = 0`): own teams back, hits dropped.
 //!
 //! Hooks run on the game thread and never panic into the game.
 
@@ -57,6 +61,12 @@ use crate::{hook, log, native};
 pub static FRIENDLY_FIRE: AtomicBool = AtomicBool::new(false);
 /// `[DEBUG] pvp_dry_run` (default off): received hits are logged, never applied.
 pub static DRY_RUN: AtomicBool = AtomicBool::new(false);
+/// `[GAMEPLAY] friendly_fire_in_boss_fights` (default off): while a boss gauge is shown the
+/// friends' copies get their own team back and player hits are dropped (lock-on, allied NPCs).
+pub static IN_BOSS_FIGHTS: AtomicBool = AtomicBool::new(false);
+/// `[DEBUG] pvp_death_guard` (default on, independent of friendly_fire): the death event's
+/// "killed by a player" branch is skipped when the attacker is one of our native remotes.
+pub static DEATH_GUARD: AtomicBool = AtomicBool::new(true);
 
 /// Bulk kind of our messages (world 1/5/6/8, puppet 7, testsync 20-23, doctor 30, keyitems
 /// 41-46, persist 50, audit 60, nsession 0x4E; 0xA6-0xA8 are taken by other fork branches).
@@ -84,6 +94,10 @@ const INSTALL_TRIES: u32 = 10;
 /// within `HELLO_VALID` (an older build would leave our bulk kind in its 24-entry inbox).
 const HELLO_EVERY: Duration = Duration::from_secs(10);
 const HELLO_VALID_MS: u64 = 35_000;
+/// The friend's type-1 frames older than this: its copy loses the "cannot die" bit.
+const REPLICA_FRAME_FRESH_MS: u64 = 1000;
+const DATA_MAX_HP: usize = 0x134;
+const DATA_MAX_POSTURE: usize = 0x14C;
 
 // --- Game code (RVAs, Sekiro 1.06) -------------------------------------------------
 
@@ -103,6 +117,13 @@ const DEBUG_SEND_HIT_RVA: usize = 0x1061880;
 const DEBUG_SEND_HIT_BYTES: [u8; 19] =
     [0x48, 0x8B, 0x01, 0x41, 0xB9, 0x14, 0x00, 0x00, 0x00, 0x41, 0xB8, 0xC0, 0x00, 0x00, 0x00, 0x48, 0xFF, 0x60, 0x08];
 const DEBUG_SESSION_VT_RVA: usize = 0x2B86048;
+/// Death event handler `0x66CDA0`: `call 0xA4A3F0(WorldChrMan, handle)` = the last attacker of
+/// our dead player (damage list `[[0x143D56058]+0x38]`), whose session member it then looks up
+/// (`0xA29DD0`, `0x8E40F0` -> -1 for a native remote, `0x7B2980(-1)` = NULL, then
+/// `mov r8d,[rax+0x10]` at `0x66CE96` = the 1.0.11 crash). A null result takes its own
+/// `jz 0x66CEE0` (returns 0).
+const SITE_DEATH_ATTACKER: usize = 0x66CE5C;
+const FN_CHR_BY_HANDLE: usize = 0xA4A3F0;
 
 // --- Layout ---------------------------------------------------------------------------
 const CHR_TEAM: usize = 0x74;
@@ -227,6 +248,62 @@ pub fn tables_ok(local_by_remote: [u32; 2], remote_by_local: u32) -> bool {
     local_by_remote == [0, 0] && remote_by_local == 4
 }
 
+/// Per-peer duel-over cooldowns (`now_ms` values; 0 = none).
+#[derive(Clone, Copy, Debug)]
+pub struct Cooldowns {
+    until: [u64; MAX_PLAYERS],
+}
+
+impl Cooldowns {
+    pub fn start(&mut self, p: PeerId, now: u64) {
+        self.until[p.index()] = now + DUEL_OVER_FOR.as_millis() as u64;
+    }
+    pub fn active(&self, p: PeerId, now: u64) -> bool {
+        now < self.until[p.index()]
+    }
+    pub fn reset(&mut self, p: PeerId) {
+        self.until[p.index()] = 0;
+    }
+}
+
+/// Each peer's last Hello (`now_ms`, 0 = none since it joined).
+#[derive(Clone, Copy, Debug)]
+pub struct HelloBook {
+    at: [u64; MAX_PLAYERS],
+}
+
+impl HelloBook {
+    /// Records a Hello; true when it is the first since the peer joined.
+    pub fn seen(&mut self, p: PeerId, now: u64) -> bool {
+        let first = self.at[p.index()] == 0;
+        self.at[p.index()] = now.max(1);
+        first
+    }
+    pub fn fresh(&self, p: PeerId, now: u64) -> bool {
+        let at = self.at[p.index()];
+        at != 0 && now.saturating_sub(at) <= HELLO_VALID_MS
+    }
+    pub fn reset(&mut self, p: PeerId) {
+        self.at[p.index()] = 0;
+    }
+}
+
+/// Peers of `before` that are gone from `now` or came back on a new link epoch.
+pub fn left_peers(before: &[(PeerId, u64)], now: &[(PeerId, u64)]) -> Vec<PeerId> {
+    before.iter().filter(|b| !now.contains(b)).map(|&(p, _)| p).collect()
+}
+
+/// The death guard's decision: the death event's attacker is one of our native remotes.
+pub fn skip_death_attacker(chr: usize, is_native_remote: bool) -> bool {
+    chr != 0 && is_native_remote
+}
+
+/// The copy may keep the "cannot die" bit: its owner's snapshot says more than 1 HP and its
+/// type-1 frames are fresh (an owner who is dying or gone must be able to die here).
+pub fn replica_undying(owner_hp: Option<i32>, frame_age_ms: Option<u64>) -> bool {
+    owner_hp.is_some_and(|h| h > 1) && frame_age_ms.is_some_and(|a| a <= REPLICA_FRAME_FRESH_MS)
+}
+
 /// Every call site is `call rel32` to its expected target.
 fn call_target(site_addr: usize, op: u8, rel: [u8; 4]) -> Option<usize> {
     (op == 0xE8).then(|| (site_addr as i64 + 5 + i32::from_le_bytes(rel) as i64) as usize)
@@ -242,8 +319,16 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static ORIG_RECV: AtomicUsize = AtomicUsize::new(0);
 static ORIG_APPLY: AtomicUsize = AtomicUsize::new(0);
 static ORIG_REACTION: AtomicUsize = AtomicUsize::new(0);
-/// `now_ms()` until which player hits are dropped on both sides (0 = no cooldown).
-static DUEL_OVER_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// Per peer: until when its player hits are dropped (both directions).
+static COOLDOWN: Mutex<Cooldowns> = Mutex::new(Cooldowns { until: [0; MAX_PLAYERS] });
+/// A boss gauge is shown and `friendly_fire_in_boss_fights` is off: hits dropped.
+static BOSS_PAUSE: AtomicBool = AtomicBool::new(false);
+static N_DROP_BOSS: AtomicU64 = AtomicU64::new(0);
+/// One near page for every stub (allocated once; slots 16 bytes apart).
+static STUB_PAGE: AtomicUsize = AtomicUsize::new(0);
+static DG_INSTALLED: AtomicBool = AtomicBool::new(false);
+static DG_TRIED: AtomicBool = AtomicBool::new(false);
+static ORIG_CHR_BY_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
 static N_CAPTURED: AtomicU64 = AtomicU64::new(0);
 static N_SENT: AtomicU64 = AtomicU64::new(0);
@@ -259,8 +344,10 @@ static N_DRY: AtomicU64 = AtomicU64::new(0);
 /// The friend's copy hit us: vanilla `[1][2]` = 0, reaction only (the laggy path, not applied).
 static N_REACTION_ONLY: AtomicU64 = AtomicU64::new(0);
 static HIT_IDS: AtomicU32 = AtomicU32::new(0);
-/// `now_ms()` of each peer's (by index) last Hello, 0 = never.
-static HELLO_AT: [AtomicU64; MAX_PLAYERS] = [const { AtomicU64::new(0) }; MAX_PLAYERS];
+/// Each peer's last Hello.
+static HELLOS: Mutex<HelloBook> = Mutex::new(HelloBook { at: [0; MAX_PLAYERS] });
+/// The remotes we changed (static so `shutdown` can restore them).
+static CHANGED: Mutex<Vec<Changed>> = Mutex::new(Vec::new());
 static N_NO_HELLO: AtomicU64 = AtomicU64::new(0);
 
 struct Captured {
@@ -295,6 +382,7 @@ enum Event {
     Dropped { from: PeerId, seq: u32, why: &'static str },
     WeWon { from: PeerId, reason: u8 },
     Hello { from: PeerId },
+    DeathGuard { peer: Option<PeerId> },
 }
 
 static OUTBOX: Mutex<VecDeque<Captured>> = Mutex::new(VecDeque::new());
@@ -311,12 +399,34 @@ fn event(e: Event) {
     }
 }
 
-fn cooling_down() -> bool {
-    now_ms() < DUEL_OVER_UNTIL.load(Ordering::Relaxed)
+fn cooling_down(p: PeerId) -> bool {
+    COOLDOWN.lock().is_ok_and(|c| c.active(p, now_ms()))
 }
 
-fn start_cooldown() {
-    DUEL_OVER_UNTIL.store(now_ms() + DUEL_OVER_FOR.as_millis() as u64, Ordering::Relaxed);
+fn start_cooldown(p: PeerId) {
+    if let Ok(mut c) = COOLDOWN.lock() {
+        c.start(p, now_ms());
+    }
+}
+
+fn hello_fresh(p: PeerId) -> bool {
+    HELLOS.lock().is_ok_and(|h| h.fresh(p, now_ms()))
+}
+
+/// Forget everything about a peer that left (or reconnected: new link epoch).
+fn reset_peer(p: PeerId) {
+    if let Ok(mut h) = HELLOS.lock() {
+        h.reset(p);
+    }
+    if let Ok(mut c) = COOLDOWN.lock() {
+        c.reset(p);
+    }
+    if let Ok(mut d) = DEDUP.lock() {
+        d[p.index()] = None;
+    }
+    if let Ok(mut q) = INBOX.lock() {
+        q.retain(|i| i.from != p);
+    }
 }
 
 /// Our process' message nonce (a restart of our game = new nonce on the friend's filter).
@@ -341,7 +451,11 @@ pub fn capture(i: usize, data: usize, size: u32) {
         N_DROP_OFF.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    if cooling_down() {
+    if BOSS_PAUSE.load(Ordering::Relaxed) {
+        N_DROP_BOSS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if cooling_down(peer) {
         N_DROP_COOLDOWN.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -362,7 +476,12 @@ fn serve(buf: *mut u8) -> Option<usize> {
     }
     loop {
         let inc = INBOX.lock().ok()?.pop_front()?;
-        if cooling_down() {
+        if BOSS_PAUSE.load(Ordering::Relaxed) {
+            N_DROP_BOSS.fetch_add(1, Ordering::Relaxed);
+            event(Event::Dropped { from: inc.from, seq: inc.seq, why: "boss fight (friendly_fire_in_boss_fights = 0)" });
+            continue;
+        }
+        if cooling_down(inc.from) {
             N_DROP_COOLDOWN.fetch_add(1, Ordering::Relaxed);
             event(Event::Dropped { from: inc.from, seq: inc.seq, why: "duel over cooldown" });
             continue;
@@ -373,7 +492,9 @@ fn serve(buf: *mut u8) -> Option<usize> {
             event(Event::Dropped { from: inc.from, seq: inc.seq, why: "stale (waited > 2 s here)" });
             continue;
         }
-        let Some(attacker) = native::chr_of_peer(inc.from) else {
+        // Re-checked against the player chr set now: the remote may have been deleted since
+        // native.rs published it.
+        let Some(attacker) = native::chr_of_peer(inc.from).filter(|&c| native::live_remote(c) == Some(inc.from)) else {
             N_DROP_NO_REMOTE.fetch_add(1, Ordering::Relaxed);
             event(Event::Dropped { from: inc.from, seq: inc.seq, why: "no native remote of the sender" });
             continue;
@@ -440,7 +561,7 @@ extern "C" fn apply_hook(module: usize, attacker: usize, hit: usize, remote: u8)
         let deathblow = read::<i32>(hit + HIT_TYPE) == Some(HIT_TYPE_DEATHBLOW);
         if deathblow {
             N_DEATHBLOW.fetch_add(1, Ordering::Relaxed);
-            start_cooldown();
+            start_cooldown(s.from);
             event(Event::Deathblow { s });
         } else {
             event(Event::Dropped { from: s.from, seq: s.seq, why: "our HP / data module unreadable or HP 0" });
@@ -458,7 +579,7 @@ extern "C" fn apply_hook(module: usize, attacker: usize, hit: usize, remote: u8)
         let dmg_hp = read::<u32>(hit + HIT_HP).and_then(hp_damage);
         let lost = duel_lost(b.hp, hp, dmg_hp);
         if lost {
-            start_cooldown();
+            start_cooldown(s.from);
         }
         N_APPLIED.fetch_add(1, Ordering::Relaxed);
         event(Event::Applied {
@@ -491,7 +612,77 @@ extern "C" fn reaction_hook(module: usize, attacker: usize, hit: usize) {
     f(module, attacker, hit)
 }
 
+/// `0xA4A3F0(WorldChrMan, handle) -> ChrIns*` at `0x66CE5C` (death event handler `0x66CDA0`):
+/// a native remote as the killer would crash the session-member lookup after it; null makes
+/// the handler leave through its own "no attacker" path.
+extern "C" fn death_attacker_hook(wcm: usize, handle: u32) -> usize {
+    let f: extern "C" fn(usize, u32) -> usize = unsafe { std::mem::transmute(ORIG_CHR_BY_HANDLE.load(Ordering::Relaxed)) };
+    let chr = f(wcm, handle);
+    let peer = std::panic::catch_unwind(|| native::peer_of_chr(chr)).ok().flatten();
+    if skip_death_attacker(chr, peer.is_some()) {
+        event(Event::DeathGuard { peer });
+        return 0;
+    }
+    chr
+}
+
 // ===================================================================== install
+
+/// The shared stub page (allocated once, near the module).
+fn stub_page() -> Option<usize> {
+    let have = STUB_PAGE.load(Ordering::Acquire);
+    if have != 0 {
+        return Some(have);
+    }
+    let page = hook::alloc_near_pub(module_base() + SITE_RECV_A)?;
+    STUB_PAGE.store(page, Ordering::Release);
+    Some(page)
+}
+
+/// Writes `mov rax, hook_fn; jmp rax` into stub slot `i` and returns the rel32 from `site_addr`.
+fn make_stub(page: usize, i: usize, site_addr: usize, hook_fn: usize) -> Option<[u8; 4]> {
+    let stub = page + i * 16;
+    let mut code = [0u8; 12];
+    code[0] = 0x48;
+    code[1] = 0xB8;
+    code[2..10].copy_from_slice(&(hook_fn as u64).to_le_bytes());
+    code[10] = 0xFF;
+    code[11] = 0xE0;
+    unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len()) };
+    i32::try_from(stub as i64 - (site_addr + 5) as i64).ok().map(i32::to_le_bytes)
+}
+
+/// Stub slot of the death guard (0..3 are the PvP sites).
+const DG_STUB: usize = 4;
+
+/// The death guard (`[DEBUG] pvp_death_guard`): one call-site patch, independent of
+/// friendly_fire, tried once when the first native remote exists.
+fn install_death_guard() {
+    let base = module_base();
+    let site = base + SITE_DEATH_ATTACKER;
+    let op = read::<u8>(site).unwrap_or(0);
+    let rel = read::<[u8; 4]>(site + 1).unwrap_or([0; 4]);
+    if call_target(site, op, rel) != Some(base + FN_CHR_BY_HANDLE) {
+        log::line(&format!("pvp: death guard NOT installed: {site:#x} has {op:02x} {rel:02x?}, not call {:#x}", base + FN_CHR_BY_HANDLE));
+        return;
+    }
+    let Some(page) = stub_page() else {
+        log::line("pvp: death guard NOT installed: no memory near the module");
+        return;
+    };
+    ORIG_CHR_BY_HANDLE.store(base + FN_CHR_BY_HANDLE, Ordering::Relaxed);
+    let Some(new) = make_stub(page, DG_STUB, site, death_attacker_hook as *const () as usize) else {
+        log::line("pvp: death guard NOT installed: stub out of rel32 range");
+        return;
+    };
+    match hook::write_frozen(&[(site + 1, &rel[..], &new[..])]) {
+        Ok(()) => {
+            DG_INSTALLED.store(true, Ordering::Relaxed);
+            log::line(&format!("pvp: death guard installed at {site:#x} (death event 0x66CDA0: a native remote as the killer = no killer)"));
+        }
+        Err(e) => log::line(&format!("pvp: death guard NOT installed: frozen write failed: {e:?}")),
+    }
+}
 
 /// Every check first (call sites, damage tables, PlayerDebugSession slot 4), then one
 /// frozen write of the four rel32s. Err(true) = busy, try again later.
@@ -525,7 +716,7 @@ fn install() -> Result<(), (bool, String)> {
     if read_ptr(base + DEBUG_SESSION_VT_RVA + 8 * 4) != Some(base + DEBUG_SEND_HIT_RVA) {
         return Err((false, "PlayerDebugSession vtable slot 4 is not 0x1061880".into()));
     }
-    let Some(page) = hook::alloc_near_pub(base + SITE_RECV_A) else {
+    let Some(page) = stub_page() else {
         return Err((false, "no memory near the module for the stubs".into()));
     };
     ORIG_RECV.store(base + FN_RECV, Ordering::Relaxed);
@@ -533,19 +724,10 @@ fn install() -> Result<(), (bool, String)> {
     ORIG_REACTION.store(base + FN_REACTION, Ordering::Relaxed);
     let mut news: Vec<[u8; 4]> = Vec::with_capacity(sites.len());
     for (i, &(site, _, hook_fn, name)) in sites.iter().enumerate() {
-        // Stub: mov rax, hook_fn; jmp rax (16 bytes apart).
-        let stub = page + i * 16;
-        let mut code = [0u8; 12];
-        code[0] = 0x48;
-        code[1] = 0xB8;
-        code[2..10].copy_from_slice(&(hook_fn as u64).to_le_bytes());
-        code[10] = 0xFF;
-        code[11] = 0xE0;
-        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len()) };
-        let Ok(rel) = i32::try_from(stub as i64 - (base + site + 5) as i64) else {
-            return Err((false, format!("{name}: stub {stub:#x} out of rel32 range")));
+        let Some(rel) = make_stub(page, i, base + site, hook_fn) else {
+            return Err((false, format!("{name}: stub out of rel32 range")));
         };
-        news.push(rel.to_le_bytes());
+        news.push(rel);
     }
     let items: Vec<(usize, &[u8], &[u8])> =
         sites.iter().zip(rels.iter().zip(&news)).map(|(&(site, ..), (old, new))| (base + site + 1, &old[..], &new[..])).collect();
@@ -564,6 +746,8 @@ fn install() -> Result<(), (bool, String)> {
 /// lib.rs, when the mod disables itself: every hook passes straight through.
 pub fn shutdown() {
     ACTIVE.store(false, Ordering::Relaxed);
+    BOSS_PAUSE.store(false, Ordering::Relaxed);
+    restore_all("mod shutdown");
     if let Ok(mut q) = INBOX.lock() {
         q.clear();
     }
@@ -606,12 +790,12 @@ pub fn on_bulk(from: PeerId, data: &[u8]) {
                 }
             }
             Msg::Hello { .. } => {
-                if HELLO_AT[from.index()].swap(now_ms(), Ordering::Relaxed) == 0 {
+                if HELLOS.lock().is_ok_and(|mut h| h.seen(from, now_ms())) {
                     event(Event::Hello { from });
                 }
             }
             Msg::DuelOver { reason, .. } => {
-                start_cooldown();
+                start_cooldown(from);
                 if let Ok(mut q) = INBOX.lock() {
                     q.retain(|i| i.from != from);
                 }
@@ -640,23 +824,106 @@ struct Changed {
     no_dead: u8,
 }
 
-#[derive(Default)]
-pub struct Pvp {
-    changed: Vec<Changed>,
-    install_at: Option<Instant>,
-    install_tries: u32,
-    stats_at: Option<Instant>,
-    last_reason: String,
-    seq: u32,
-    hello_at: Option<Instant>,
+/// Puts one remote's team and bit back, only while it is still that peer's live remote.
+fn restore(c: &Changed, why: &str) {
+    if native::live_remote(c.chr) != Some(c.peer) {
+        log::line(&format!("pvp: peer {}'s native remote {:#x} is gone ({why}): nothing to restore", c.peer.slot(), c.chr));
+        return;
+    }
+    write(c.chr + CHR_TEAM, c.team);
+    if let Some(d) = data_of(c.chr)
+        && let Some(fl) = read::<u8>(d + DATA_FLAGS)
+    {
+        write(d + DATA_FLAGS, (fl & !FLAG_NO_DEAD) | (c.no_dead & FLAG_NO_DEAD));
+    }
+    log::line(&format!("pvp: peer {}'s native remote {:#x}: team {} restored ({why})", c.peer.slot(), c.chr, c.team));
+}
+
+/// Every changed remote back (feature off, link gone, mod shutdown, hub reset).
+fn restore_all(why: &str) {
+    let all: Vec<Changed> = CHANGED.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+    for c in &all {
+        restore(c, why);
+    }
 }
 
 fn data_of(chr: usize) -> Option<usize> {
     read_ptr(read_ptr(chr + CHR_MODULES)? + MOD_DATA)
 }
 
+/// Our player back to full HP and posture after a duel (`posture::set_hp` = the game's
+/// setter `0xBD64E0`, `add_posture` = `0xBD4DE0`, as livesync's refill).
+fn refill(player: Chr) {
+    let Some(d) = data_of(player.0) else { return };
+    let max_hp = read::<i32>(d + DATA_MAX_HP).unwrap_or(0);
+    let max_posture = read::<i32>(d + DATA_MAX_POSTURE).unwrap_or(0);
+    if max_hp > 0 {
+        crate::posture::set_hp(player, max_hp);
+    }
+    if max_posture > 0 {
+        crate::posture::add_posture(d, max_posture, false);
+    }
+    log::line(&format!("pvp: duel over: our HP {max_hp} and posture {max_posture} refilled"));
+}
+
+#[derive(Default)]
+pub struct Pvp {
+    install_at: Option<Instant>,
+    install_tries: u32,
+    stats_at: Option<Instant>,
+    last_reason: String,
+    seq: u32,
+    hello_at: Option<Instant>,
+    /// Connected peers and their link epochs last frame (leave / rejoin detection).
+    links: Vec<(PeerId, u64)>,
+    /// Remotes already reported as "held at 1 HP while the owner is dead".
+    held_logged: Vec<usize>,
+}
+
+impl Drop for Pvp {
+    /// The hub is dropped on a frame panic: nothing of ours stays on a living remote.
+    fn drop(&mut self) {
+        let _ = std::panic::catch_unwind(|| {
+            ACTIVE.store(false, Ordering::Relaxed);
+            BOSS_PAUSE.store(false, Ordering::Relaxed);
+            restore_all("co-op hub reset");
+        });
+    }
+}
+
 impl Pvp {
+    /// puppet.rs, every frame without a Net: everything off and restored.
+    pub fn off(&mut self, why: &str) {
+        let was = ACTIVE.swap(false, Ordering::Relaxed);
+        BOSS_PAUSE.store(false, Ordering::Relaxed);
+        if was {
+            log::line(&format!("pvp: player-vs-player damage off ({why})"));
+            if let Ok(mut q) = INBOX.lock() {
+                q.clear();
+            }
+        }
+        if CHANGED.lock().is_ok_and(|g| !g.is_empty()) {
+            restore_all(why);
+        }
+        for (p, _) in std::mem::take(&mut self.links) {
+            reset_peer(p);
+        }
+        self.hello_at = None;
+    }
+
     pub fn tick(&mut self, f: Frame) {
+        // Leave / rejoin: forget the peer's Hello, cooldown, duplicate filter and queue.
+        let links: Vec<(PeerId, u64)> = f.peers.iter().map(|p| (p.id, p.epoch)).collect();
+        for p in left_peers(&self.links, &links) {
+            reset_peer(p);
+            log::line(&format!("pvp: peer {} left or reconnected: its Hello, cooldown and duplicate filter are reset", p.slot()));
+        }
+        self.links = links;
+        if DEATH_GUARD.load(Ordering::Relaxed) && !DG_TRIED.load(Ordering::Relaxed) && f.peers.iter().any(|p| p.native.is_some()) {
+            DG_TRIED.store(true, Ordering::Relaxed);
+            install_death_guard();
+        }
+
         let connected = f.net.connected();
         let is_host = f.net.is_host();
         let own = FRIENDLY_FIRE.load(Ordering::Relaxed);
@@ -694,7 +961,16 @@ impl Pvp {
             }
         }
         self.last_reason = reason;
-        self.teams(f.peers, active);
+        // Boss fights: own teams back and hits dropped unless friendly_fire_in_boss_fights.
+        let boss = active && !IN_BOSS_FIGHTS.load(Ordering::Relaxed) && crate::game::boss_state().is_some();
+        if BOSS_PAUSE.swap(boss, Ordering::Relaxed) != boss {
+            log::line(&format!(
+                "pvp: boss fight {}: {}",
+                if boss { "started" } else { "over" },
+                if boss { "friends' copies get their own team back, player hits are dropped (friendly_fire_in_boss_fights = 0)" } else { "friendly fire again" }
+            ));
+        }
+        self.teams(f.peers, active && !boss);
         if active {
             self.check_send_path(f.peers);
         }
@@ -709,56 +985,63 @@ impl Pvp {
             self.hello_at = None;
         }
         self.flush_out(&mut *f.net, f.peers, f.player, active);
-        self.drain_events(&mut *f.net, f.peers);
+        self.drain_events(&mut *f.net, f.peers, f.player);
         self.stats(active);
     }
 
-    /// Team 29 + "cannot die while the owner lives" on every native remote while active;
-    /// the originals back otherwise. A remote that is gone is just forgotten.
-    fn teams(&mut self, peers: &PeerSet, active: bool) {
+    /// Team 29 + "cannot die while the owner lives" on the native remote of every peer with
+    /// a fresh Hello while `on`; the originals back for every other remote.
+    fn teams(&mut self, peers: &PeerSet, on: bool) {
         let remotes: Vec<(PeerId, usize, Option<i32>)> =
             peers.iter().filter_map(|p| Some((p.id, p.native?.0, p.snapshot.map(|s| s.hp)))).collect();
-        self.changed.retain(|c| {
-            let alive = remotes.iter().any(|&(_, chr, _)| chr == c.chr);
-            if !alive {
+        let Ok(mut changed) = CHANGED.lock() else { return };
+        // Gone remotes: forget (never write to a deleted chr).
+        changed.retain(|c| {
+            let here = remotes.iter().any(|&(p, chr, _)| chr == c.chr && p == c.peer);
+            if !here {
                 log::line(&format!("pvp: peer {}'s native remote {:#x} is gone (nothing to restore)", c.peer.slot(), c.chr));
             }
-            alive
+            here
         });
-        if !active {
-            for c in self.changed.drain(..) {
-                write(c.chr + CHR_TEAM, c.team);
-                if let Some(d) = data_of(c.chr)
-                    && let Some(fl) = read::<u8>(d + DATA_FLAGS)
-                {
-                    write(d + DATA_FLAGS, (fl & !FLAG_NO_DEAD) | (c.no_dead & FLAG_NO_DEAD));
-                }
-                log::line(&format!("pvp: peer {}'s native remote {:#x}: team {} restored", c.peer.slot(), c.chr, c.team));
-            }
-            return;
-        }
+        self.held_logged.retain(|chr| remotes.iter().any(|&(_, c, _)| c == *chr));
         for &(peer, chr, hp) in &remotes {
+            let want = on && hello_fresh(peer);
+            let pos = changed.iter().position(|c| c.chr == chr);
+            if !want {
+                if let Some(i) = pos {
+                    let c = changed.remove(i);
+                    restore(&c, if on { "no Hello from that peer" } else { "friendly fire off or paused" });
+                }
+                continue;
+            }
             let Some(team) = read::<u32>(chr + CHR_TEAM) else { continue };
             let data = data_of(chr);
             let flags = data.and_then(|d| read::<u8>(d + DATA_FLAGS));
-            if !self.changed.iter().any(|c| c.chr == chr) {
-                let Some(fl) = flags else { continue };
-                // Already 29 (our Pvp was rebuilt after a frame panic): the remote's own
-                // values were the chr type's team 2 and no bit.
-                let (team, no_dead) = if team == PVP_TEAM { (2, 0) } else { (team, fl & FLAG_NO_DEAD) };
-                self.changed.push(Changed { chr, peer, team, no_dead });
-                log::line(&format!("pvp: peer {}'s native remote {chr:#x}: team {team} -> {PVP_TEAM} (Rival), our player's team unchanged", peer.slot()));
-            }
+            let orig_bit = match pos {
+                Some(i) => changed[i].no_dead,
+                None => {
+                    let Some(fl) = flags else { continue };
+                    // Already 29 (our hub was rebuilt after a frame panic): the remote's own
+                    // values were the chr type's team 2 and no bit.
+                    let (t, b) = if team == PVP_TEAM { (2, 0) } else { (team, fl & FLAG_NO_DEAD) };
+                    changed.push(Changed { chr, peer, team: t, no_dead: b });
+                    log::line(&format!("pvp: peer {}'s native remote {chr:#x}: team {t} -> {PVP_TEAM} (Rival), our player's team unchanged", peer.slot()));
+                    b
+                }
+            };
             if team != PVP_TEAM {
                 write(chr + CHR_TEAM, PVP_TEAM);
             }
-            // The copy cannot die from a local-only hit while its owner is alive; once the
-            // owner's snapshot reads dead the game may kill it the vanilla way (type 1 HP 0).
             if let (Some(d), Some(fl)) = (data, flags) {
-                let orig = self.changed.iter().find(|c| c.chr == chr).map_or(0, |c| c.no_dead);
-                let want = if hp.is_some_and(|h| h > 0) { fl | FLAG_NO_DEAD } else { (fl & !FLAG_NO_DEAD) | orig };
-                if want != fl {
-                    write(d + DATA_FLAGS, want);
+                let undying = replica_undying(hp, native::frame_age_ms(peer));
+                let bit = if undying { fl | FLAG_NO_DEAD } else { (fl & !FLAG_NO_DEAD) | orig_bit };
+                if bit != fl {
+                    write(d + DATA_FLAGS, bit);
+                }
+                let copy_hp = read::<i32>(d + DATA_HP);
+                if hp.is_some_and(|h| h <= 0) && copy_hp == Some(1) && !self.held_logged.contains(&chr) {
+                    self.held_logged.push(chr);
+                    log::line(&format!("pvp: replica held at 1 HP while its owner is dead (peer {}, remote {chr:#x}): undying bit cleared", peer.slot()));
                 }
             }
         }
@@ -788,8 +1071,7 @@ impl Pvp {
                 N_DROP_OFF.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            let hello = HELLO_AT.get(c.peer.index()).map_or(0, |a| a.load(Ordering::Relaxed));
-            if hello == 0 || now_ms().saturating_sub(hello) > HELLO_VALID_MS {
+            if !hello_fresh(c.peer) {
                 N_NO_HELLO.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -821,7 +1103,7 @@ impl Pvp {
         }
     }
 
-    fn drain_events(&mut self, net: &mut Net, peers: &PeerSet) {
+    fn drain_events(&mut self, net: &mut Net, peers: &PeerSet, player: Chr) {
         let evs: Vec<Event> = EVENTS.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
         let name = |id: PeerId| peers.by_id(id).map_or_else(|| format!("peer {}", id.slot()), |p| p.name.clone());
         let rtt = |id: PeerId| peers.by_id(id).and_then(|p| p.rtt_ms);
@@ -844,22 +1126,31 @@ impl Pvp {
                     ));
                     if lost {
                         self.duel_lost(net, s.from, 1, &name(s.from));
+                        refill(player);
                     }
                 }
                 Event::Deathblow { s } => {
                     log::line(&format!("pvp: hit #{} from {} is a deathblow: not applied (lethal PvP is not supported)", s.seq, name(s.from)));
                     self.duel_lost(net, s.from, 2, &name(s.from));
+                    refill(player);
                 }
                 Event::Dry { from, seq, atk } => {
                     log::line(&format!("pvp: hit #{seq} from {} received, atk param {atk}: DRY RUN, not applied", name(from)))
                 }
                 Event::Dropped { from, seq, why } => log::line(&format!("pvp: hit #{seq} from {} dropped: {why}", name(from))),
                 Event::Hello { from } => log::line(&format!("pvp: {} has friendly fire on: our hits on their copy are sent to them", name(from))),
-                Event::WeWon { from, reason } => log::line(&format!(
-                    "pvp: duel over, we win ({} {}); player hits ignored for {} s",
-                    name(from),
-                    if reason == 2 { "took a deathblow" } else { "is down to 1 HP" },
-                    DUEL_OVER_FOR.as_secs()
+                Event::WeWon { from, reason } => {
+                    log::line(&format!(
+                        "pvp: duel over, we win ({} {}); player hits ignored for {} s",
+                        name(from),
+                        if reason == 2 { "took a deathblow" } else { "is down to 1 HP" },
+                        DUEL_OVER_FOR.as_secs()
+                    ));
+                    refill(player);
+                }
+                Event::DeathGuard { peer } => log::line(&format!(
+                    "pvp: death event with a player attacker skipped (replica {})",
+                    peer.map_or_else(|| "?".into(), |p| format!("of {}", name(p)))
                 )),
             }
         }
@@ -869,7 +1160,7 @@ impl Pvp {
         self.seq = self.seq.wrapping_add(1);
         let ok = net.send_bulk_to(Dest::Peer(winner), BULK_PVP, &encode(&Msg::DuelOver { nonce: nonce(), seq: self.seq, reason }));
         if let Ok(mut q) = INBOX.lock() {
-            q.clear();
+            q.retain(|i| i.from != winner);
         }
         log::line(&format!(
             "pvp: duel over, {winner_name} wins; player hits ignored for {} s (told the winner: {ok})",
@@ -897,13 +1188,14 @@ impl Pvp {
             take(&N_DEATHBLOW),
             take(&N_DRY),
             take(&N_NO_HELLO),
+            take(&N_DROP_BOSS),
         ];
         if !active && v.iter().all(|&n| n == 0) {
             return;
         }
         log::line(&format!(
-            "pvp: 10 s: our hits captured {} sent {}; friend's received {} applied {}; local-vs-replica hit dropped (laggy path, reaction only) {}; dropped: cooldown {} stale {} no remote {} off {} duplicate {} deathblow {} dry run {} friend without friendly fire {}",
-            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12]
+            "pvp: 10 s: our hits captured {} sent {}; friend's received {} applied {}; local-vs-replica hit dropped (laggy path, reaction only) {}; dropped: cooldown {} stale {} no remote {} off {} duplicate {} deathblow {} dry run {} friend without friendly fire {} boss fight {}",
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]
         ));
     }
 }
@@ -1025,6 +1317,64 @@ mod tests {
         assert_eq!(call_target(base + 0xB72BB8, 0xE8, [0x33, 0x64, 0xFF, 0xFF]), Some(base + 0xB68FF0));
         assert_eq!(call_target(base + 0xB6A12A, 0xE8, [0x11, 0x0A, 0x00, 0x00]), Some(base + 0xB6AB40));
         assert_eq!(call_target(base + 0xB72BC7, 0xE9, [0x44, 0x4F, 0xD6, 0xFF]), None, "jmp, not call");
+    }
+
+    fn peer(i: u8) -> PeerId {
+        PeerId::new(i).unwrap()
+    }
+
+    #[test]
+    fn cooldown_is_per_peer() {
+        let mut c = Cooldowns { until: [0; MAX_PLAYERS] };
+        c.start(peer(1), 1000);
+        assert!(c.active(peer(1), 1000));
+        assert!(c.active(peer(1), 5999));
+        assert!(!c.active(peer(1), 6000), "5 s");
+        assert!(!c.active(peer(2), 1000), "another peer keeps fighting");
+        c.reset(peer(1));
+        assert!(!c.active(peer(1), 1001));
+    }
+
+    #[test]
+    fn hello_expires_and_resets_when_the_peer_leaves() {
+        let mut h = HelloBook { at: [0; MAX_PLAYERS] };
+        assert!(!h.fresh(peer(1), 10));
+        assert!(h.seen(peer(1), 10), "first Hello");
+        assert!(!h.seen(peer(1), 20), "not the first any more");
+        assert!(h.fresh(peer(1), 20 + HELLO_VALID_MS));
+        assert!(!h.fresh(peer(1), 21 + HELLO_VALID_MS), "expired");
+        assert!(!h.fresh(peer(2), 20));
+        // Leave / rejoin detection, then the reset.
+        let before = [(peer(1), 7), (peer(2), 3)];
+        assert_eq!(left_peers(&before, &[(peer(2), 3)]), vec![peer(1)], "left");
+        assert_eq!(left_peers(&before, &[(peer(1), 8), (peer(2), 3)]), vec![peer(1)], "new link epoch");
+        assert!(left_peers(&before, &before).is_empty());
+        h.seen(peer(1), 30);
+        h.reset(peer(1));
+        assert!(!h.fresh(peer(1), 31));
+        assert!(h.seen(peer(1), 40), "first again after the reset");
+        // A Hello at now_ms 0 still counts.
+        let mut z = HelloBook { at: [0; MAX_PLAYERS] };
+        z.seen(peer(3), 0);
+        assert!(z.fresh(peer(3), 0));
+    }
+
+    #[test]
+    fn death_guard_skips_only_native_remotes() {
+        assert!(skip_death_attacker(0x7ff0_1234_0000, true));
+        assert!(!skip_death_attacker(0x7ff0_1234_0000, false), "an enemy killer stays");
+        assert!(!skip_death_attacker(0, false), "no attacker: unchanged");
+        assert!(!skip_death_attacker(0, true));
+    }
+
+    #[test]
+    fn replica_undying_only_while_its_owner_lives_and_streams() {
+        assert!(replica_undying(Some(500), Some(80)));
+        assert!(!replica_undying(Some(1), Some(80)), "owner at 1 HP");
+        assert!(!replica_undying(Some(0), Some(80)), "owner dead");
+        assert!(!replica_undying(None, Some(80)), "no snapshot");
+        assert!(!replica_undying(Some(500), Some(REPLICA_FRAME_FRESH_MS + 1)), "stale frames");
+        assert!(!replica_undying(Some(500), None));
     }
 
     #[test]

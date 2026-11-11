@@ -432,6 +432,13 @@ pub fn chr_of_peer(peer: PeerId) -> Option<usize> {
     PEER_CHR.get(peer.index()).map(|a| a.load(Ordering::Acquire)).filter(|&c| c != 0)
 }
 
+/// pvp.rs (game thread): the peer whose native remote `chr` is, only while `chr` is still in
+/// the WorldChrMan player set (a deleted remote may linger in `PEER_CHR` until the next publish).
+pub fn live_remote(chr: usize) -> Option<PeerId> {
+    let p = peer_of_chr(chr)?;
+    player_set().is_some_and(|(_, used)| used.contains(&chr)).then_some(p)
+}
+
 /// pvp.rs: milliseconds since `peer`'s last type-1 frame arrived (None = none yet).
 pub fn frame_age_ms(peer: PeerId) -> Option<u64> {
     let g = INBOXES.get(peer.index())?.lock().ok()?;

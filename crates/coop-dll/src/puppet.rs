@@ -885,6 +885,9 @@ impl Puppet {
         let host_ff = self.scale_remote.and_then(|c| c.friendly_fire);
         if let Some(Some(n)) = self.net.as_mut() {
             self.pvp.tick(crate::pvp::Frame { net: n, player, peers: &self.peers, host_ff });
+        } else {
+            // No Net (offline, or being rebuilt after a settings change): nothing may stay on.
+            self.pvp.off("no network session");
         }
         // The ghost is the fallback for at most one peer, the friend (`peers.first()`, whose
         // snapshots `Net::remote()` reads): only while no native remote stands for it and
