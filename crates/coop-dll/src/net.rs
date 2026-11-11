@@ -1834,6 +1834,21 @@ mod tests {
         }
     }
 
+    /// PlayerRaw types claimed by the mod (net.rs `Event::PlayerRaw`: nsession, then artfx, then
+    /// remotefx; the rest goes to the game) never overlap each other, nsession's 0x4E53xxxx
+    /// range or the game's own small packet types (native.rs 1, 61, ...).
+    #[test]
+    fn player_raw_types_are_unique() {
+        let ours = [(crate::artfx::PTYPE, "artfx"), (crate::remotefx::PTYPE, "remotefx")];
+        for (i, a) in ours.iter().enumerate() {
+            assert!(a.0 > 0xFF, "{} type {:#x} may be a game packet type", a.1, a.0);
+            assert_ne!(a.0 & 0xFFFF_0000, crate::nsession::PTYPE_BASE, "{} type {:#x} in the nsession range", a.1, a.0);
+            for b in &ours[i + 1..] {
+                assert_ne!(a.0, b.0, "PlayerRaw type {:#x} used by {} and {}", a.0, a.1, b.1);
+            }
+        }
+    }
+
     fn snap(hp: i32, hidden: bool) -> Snapshot {
         Snapshot { hp, hidden, pos: [1.0, 2.0, 3.0], ..Default::default() }
     }

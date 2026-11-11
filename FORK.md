@@ -2,15 +2,17 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test3`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test4`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test3`: nothing in the sections below marked experimental or
+> **Test build `1.0.9-pickups.3-test4`: nothing in the sections below marked experimental or
 > "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
 > onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
 > `prosthetic-active` (active prosthetic slot), `zone-flicker` (block-border grace for the
 > native remote, `docs/IMPLEMENTATION-NOTES.md`), `objact-doors2` (one-loop doors at mode 1)
-> and `pvp-ff` (friendly fire, team 28). The oracle is a playtest with both logs.
+> and `pvp-ff` (friendly fire, team 28). `test3` was never played live. `test4` adds `remote-fx`
+> (the friend's art slashes / sounds and full-detail parts, `docs/RE-REMOTE-FX.md`) and `wardrobe`.
+> The oracle is a playtest with both logs.
 
 ## New settings in this build
 
@@ -40,12 +42,20 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `block_change_grace_ms` | DEBUG | 2500 (0..3000; 0 = the old immediate rule) | Block-border grace (IMPLEMENTATION-NOTES) |
 | `wardrobe`, `wardrobe_key`, `wardrobe_pad`, `wardrobe_pad_button`, `wardrobe_reload` | DISPLAY | 1, 113 (F2), 1, none, 1 | Wardrobe |
 | `wardrobe_skin`, `wardrobe_head`, `wardrobe_legs`, `wardrobe_original`, `wardrobe_added` | DISPLAY | game, skin, skin, empty, empty (written by the panel) | Wardrobe |
+| `fx_speffect_mirror` | DEBUG | 1 (0 off, 2 = also enchant states) | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
+| `native_full_parts` | DEBUG | 1 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
+| `fx_debug` | DEBUG | 0 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 
 Reliable bulk kinds added by the fork: 46 (pickups), 0xA7 (ObjAct), 0xA8 (loadout), 0xA9
 (PvP); `net::tests::bulk_kinds_are_unique` checks them against the upstream kinds. The doctor
 compares `friendly_fire` (notice), the me3 packages (notice) and, log only, `sync_objact`,
 `loadout_sync`, `player_packet_hz`, `shop_stock_per_player`, `fix_debug_item_unlocks`; an older
-build that does not send a key is not compared.
+build that does not send a key is not compared. PlayerRaw types of the mod: 0xAF63 (artfx),
+0xAF64 (remotefx gate SpEffects), 0x4E53xxxx (nsession); `net::tests::player_raw_types_are_unique`.
+The full-detail parts hook (`remotefx.rs`, `0xA363BC`) only ever clears the low-detail flag of a
+friend's model; the local player's build (wardrobe reload included) passes 0 there and its
+model is excluded by address, and a replica re-dressed by the loadout keeps its ChrAsmModel, so
+the hook still sees it.
 
 ## What it adds: shared map pickups (`[GAMEPLAY] share_pickups`, default 1)
 
