@@ -600,9 +600,17 @@ fn open_decision(loop_door: bool, v: &ObjView) -> bool {
     if loop_door { v.reached() } else { v.done() }
 }
 
+/// Only doors and chests (by ObjActParam) are ever replayed from their flag. Windows,
+/// rotating floors, bells and hidden tatami (one-loop, `Kind::Other`) keep what the game and
+/// their EMEVD do: test2 replayed the meditation room window 61110703 after every load and
+/// rest (live 2026-11-12), and m11_01 11115614 shuts those windows in phase 8302.
+fn reopens(param: i32) -> bool {
+    kind(param) != Kind::Other
+}
+
 /// Opens `d` like the game replays a friend's ObjAct, unless it is open or running.
 fn open_if_closed(s: &mut State, d: &Door, why: &str) -> bool {
-    if d.running || !crate::game::event_flag(d.flag).unwrap_or(false) {
+    if d.running || !reopens(d.param) || !crate::game::event_flag(d.flag).unwrap_or(false) {
         return false;
     }
     let view = object_view(d.block, d.slot, d.index, d.handle, 1);
@@ -689,6 +697,12 @@ pub fn keep_open(id: u32) -> bool {
     let quiet = rest_quiet(now);
     let own_toggle = take_own_loop_toggle(id, now);
     with(|s| {
+        // The detour notes only a start whose info is a one-loop door (`loop_door` of its state
+        // class and ObjActParam, objact.rs `pre_start`): that is proof enough, also for a door
+        // in a block streamed in after the last walk (no loading screen, no scan since).
+        if own_toggle && s.loop_doors.insert(id) {
+            log::line(&format!("doors: one-loop door flag {id} learnt from our own start (no walk had seen it yet)"));
+        }
         // Guard 5 (no rest window: a rest never resets these MSB flags; a script's OFF, e.g.
         // m11_00 11100600 closing gate 61100610, is no start of ours and is not noted).
         if keep_open_loop_decision(s.loop_doors.contains(&id), own_toggle) {
@@ -698,9 +712,6 @@ pub fn keep_open(id: u32) -> bool {
                 s.loop_kept_on
             ));
             return true;
-        }
-        if own_toggle {
-            log::line(&format!("doors: our start toggled one-loop door flag {id} off, but no walk has seen that door yet: not kept on"));
         }
         // Guard 2 never for one-loop doors: their OFF without a start of ours is a script's.
         if s.loop_doors.contains(&id) {
@@ -982,6 +993,15 @@ mod tests {
         assert!(!loop_door(Some(Class::OneLoop), 252_555));
         assert!(!loop_door(Some(Class::One), 999_941));
         assert!(!loop_door(None, 999_900));
+    }
+
+    #[test]
+    fn only_doors_and_chests_are_reopened_from_their_flag() {
+        assert!(reopens(999_900) && reopens(999_941) && reopens(101_050) && reopens(999_980));
+        // The window 61110703 (ObjActParam 1100000), rotating floor, bell, hidden tatami, lever.
+        for p in [1_100_000, 90_061, 252_555, 109_950, 205_011, -1] {
+            assert!(!reopens(p), "{p}");
+        }
     }
 
     #[test]
