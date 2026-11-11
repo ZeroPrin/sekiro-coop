@@ -1337,6 +1337,8 @@ impl Native {
                 return;
             }
         };
+        // The active prosthetic index into the PGD before its ChrAsm is copied below.
+        crate::loadout::follow_active(r.chr, r.pgd, peer, l);
         if n == 0 && !first {
             return;
         }
@@ -1371,6 +1373,9 @@ impl Native {
         }
         let Some(l) = crate::loadout::of(peer) else { return };
         if r.applied == Some(l.slots) {
+            // Same items: only the active prosthetic may have switched (no parts reload; the
+            // game's PlayerIns update swaps the tool from the PGD's index).
+            crate::loadout::follow_active(r.chr, r.pgd, peer, &l);
             return;
         }
         log::line(&format!("native: new loadout from peer slot {}, re-dressing {:#x}", peer.slot(), r.chr.0));

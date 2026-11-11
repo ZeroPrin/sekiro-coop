@@ -316,8 +316,8 @@ friend played as Whirlwind Slash (the template's default art).
   as Whirlwind Slash: the replica's PGD kept the template's slot 1.
 - **Message**: bulk kind 0xA8 (`loadout::BULK_LOADOUT`; reliable, to every peer; the host
   relays). Body (`coop_net::encode_loadout`): magic `LD`, **layout version 2**, the sender's
-  25 EquipGameData ids (GameDataMan+8 -> PGD -> `+0x5EC`), `art` and `extra[3]` (reserved,
-  -1; the art is slot 1). Sent when our ids change and every 3 s as a refresh (late join, lost
+  25 EquipGameData ids (GameDataMan+8 -> PGD -> `+0x5EC`), `art` and `extra[3]` (`art`
+  reserved, -1, the art is slot 1; `extra[0]` = the active prosthetic, next section). Sent when our ids change and every 3 s as a refresh (late join, lost
   packets; only while no bulk chunk is unacked). A layout-1 body (the previous build) is
   ignored and logged once per peer.
 - **Receiver**: the last loadout per peer slot (`loadout::of`). When the deferred dress is due
@@ -372,6 +372,70 @@ friend played as Whirlwind Slash (the template's default art).
   must show `loadout: peer N ids` matching the friend's `loadout: sent ids`, `slot 1 ... ->
   <art> applied`, the holder sync and the reload; the friend's art must play as itself on the
   replica, the friend's prosthetics must be visible.
+
+## Active prosthetic (part of loadout sync, `[DEBUG] loadout_sync`; NOT verified live)
+
+**Bug (live test 2026-11-12).** The replica always showed the tool of the FIRST prosthetic
+slot. On "switch prosthetic tool" the other side saw the switch animation and sparks, but the
+tool did not change and the switch sound was missing (both directions). The loadout carried
+the 25 ids only; the game sends no equipment packet in our session (only types 1 and 24).
+
+### What RE says (static, Ghidra copy `E:\RE\ghidra_prost`, dump 2026-11-11) [VAR]
+
+- **ChrAsm** (class vtable `0x2A1EDD0`; `PGD+0x310` and the PlayerIns holder `chr+0x2140`):
+  `+0x08` arm style, `+0x0C + 4*hand` the ACTIVE slot index of that hand (i32; getter
+  `0xBF1480(asm+8, hand)`, setter `0xBF1640(asm+8, hand, idx)`; copy `0x9CC9A0` and
+  save/load `0x9CC790` / `0x9CC8A0` carry `+0x08..+0x20`), `+0x24` the 25 handles. Hand 0 =
+  left = the prosthetic: active ChrAsm slot `2 * idx` (`0x9CB210`, `0xE72220`), idx 0..=2.
+  Dump: local `PGD+0x318` = 1 (arm style), **`PGD+0x31C` = 1 = slot 2 = 73000 (Axe)**,
+  `PGD+0x320` = 0; the local holder `chr+0x2140` has the same values.
+- **The game's switch**: `0xB57E30` (handler with `*(arg+8)` = hand) computes
+  `(PlayerIns vtable 0x420 (= holder+0xC+4*hand) + 1) % 3`, skips a slot holding 110000 (bare
+  hands), and calls **`0xA26150(chr, hand, idx)`**: sets the holder index, arm style, `0x9F6780`
+  / `0x9F6460`, `0xA284D0` (left) / `0xA28570` (right), copies holder -> PGD (`0x9CCDB0`) and
+  sets `chr+0x2060` (equipment dirty). `0xB57E30` returns early unless the chr is the local
+  player (`WorldChrMan+0x88`) or PlayerIns vtable `0x1B0` holds; `0xA284D0` also acts only
+  for the local player. The equip menu (`0xD592F0`, `0xD5A480`) calls `0xA26150` too.
+- **Why the replica stuck at slot 0**: every PlayerIns update (`0xA37560`) copies the PGD's
+  ChrAsm INTO the holder (`0x9CC9A0(holder, pgd+0x310)`) when the chr-type table
+  `0x143B0A3B0[type*0x14+1]` is 0: true for type 0 (local) and type 1 (our replicas). If the
+  left/right hand weapon changed by that copy it calls `0x7E3C60(.., 1)` and `0xA23AF0(egd)`,
+  then updates `chr+0x120` and calls `0x9F6780` / `0x9F6460` (the same reactions the local
+  switch gets). So the replica's PGD index (template, 0) is the master; writing a holder alone
+  would be overwritten the next frame.
+
+### What the mod does (`loadout.rs`)
+
+- **Sender**: `extra[0]` (`coop_net::LOADOUT_EXTRA_ACTIVE_PROSTHETIC`) = local `PGD+0x31C`.
+  A change makes the loadout differ, so it goes out at once (not on the 3 s cadence). No
+  layout change: older builds ignore `extra[0]`, and -1 from an older sender keeps the old
+  behaviour.
+- **Runtime check of the offsets** (sender): the ChrAsm vtable at `PGD+0x310`, arm style
+  0..=3, index 0..=2, and the local holder `chr+0x2140 +0xC` equal to the PGD's. Failing 180
+  ticks in a row disables only this feature (-1 sent, one log line).
+- **Receiver** (`loadout::follow_active`, from `native.rs` every dress tick and in the dress
+  itself before `sync_chr`): validates (`check_active`: 0..=2, the sender's slot `2*idx` holds a
+  weapon id that is not 110000, the replica's PGD already holds that id), checks the replica's
+  ChrAsm (vtable, ranges; failing disables this side once), writes the replica's `PGD+0x31C`
+  only when it differs. No game function is called and no parts reload is done mid-switch: the
+  game's update copies it and reacts. 400 ms later the holder must hold the index; if not, the
+  old refresh runs (`sync_chr` + vtable-21 parts reload) and says so.
+- **Sound** [ARV]: the switch sound is most likely part of the local path (`0xA284D0`, local
+  only) or of the TAE keyed on the new tool; the missing sound is probably the same missing
+  state (the replica's tool never changed). This fix may restore it; not verified.
+- **Log lines**: `loadout: sent active prosthetic I (ChrAsm slot S, id X)`, `loadout: peer
+  slot N active prosthetic a -> b applied on 0x... (ChrAsm slot S, id X)`, `loadout: peer slot
+  N active prosthetic b: holder of 0x... followed (game swap)` or `... did not follow (...),
+  fallback sync ..., parts reload ...`, `loadout: peer slot N active prosthetic I skipped
+  (Unknown / OutOfRange / NotATool / NotDressed), replica keeps J` (once per reason), and
+  `loadout: active prosthetic DISABLED ...` (check failed). Unit tests: `loadout::tests`
+  (`check_active`, `prosthetic_slot`, `asm_sanity`, round trip),
+  `protocol::tests::loadout_active_prosthetic_in_extra0`.
+- **Live test**: both on this build, each with 3 different tools. Each switches several times.
+  Owner's log: one `sent active prosthetic` per switch. Observer's log: `applied` then
+  `followed (game swap)`; the replica must show the new tool (and the sound, if it comes back).
+  A `did not follow` means the update copy does not run for the replica (the fallback then
+  reloads parts). `NotDressed` lasting more than a moment means the ids did not apply.
 
 ## Player packet rate (experimental)
 

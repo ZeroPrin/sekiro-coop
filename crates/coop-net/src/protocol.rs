@@ -161,9 +161,16 @@ pub const LOADOUT_VERSION: u8 = 2;
 /// magic, version, 25 slots, art, 3 extra.
 pub const LOADOUT_LEN: usize = 2 + 1 + 4 * (LOADOUT_SLOTS + 1 + 3);
 
+/// `Loadout::extra` index of the active prosthetic slot: the left-hand slot index of the
+/// sender's ChrAsm (`PGD+0x310` `+0xC`), 0..=2 = ChrAsm slot 0 / 2 / 4. -1 = unknown (an
+/// older build, or the sender's sanity check failed): the receiver keeps the replica's slot.
+pub const LOADOUT_EXTRA_ACTIVE_PROSTHETIC: usize = 0;
+
 /// The sender's equipment (reliable bulk, sent on change and as a periodic refresh).
-/// `art` and `extra` are reserved (-1): the combat art is `slots[1]` (FORK.md "Loadout
-/// sync").
+/// `art` is reserved (-1): the combat art is `slots[1]` (FORK.md "Loadout sync").
+/// `extra[LOADOUT_EXTRA_ACTIVE_PROSTHETIC]` is the active prosthetic slot (FORK.md "Active
+/// prosthetic"); `extra[1..]` stay reserved (-1). Same layout version: a build that does not
+/// know `extra[0]` ignores it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Loadout {
     pub slots: [i32; LOADOUT_SLOTS],
@@ -174,6 +181,11 @@ pub struct Loadout {
 impl Loadout {
     pub fn new(slots: [i32; LOADOUT_SLOTS]) -> Self {
         Self { slots, art: -1, extra: [-1; 3] }
+    }
+
+    /// The sender's active prosthetic slot index as sent (-1 unknown; not validated).
+    pub fn active_prosthetic(&self) -> i32 {
+        self.extra[LOADOUT_EXTRA_ACTIVE_PROSTHETIC]
     }
 }
 
@@ -1150,6 +1162,24 @@ pub(crate) mod tests {
         assert_eq!(decode_loadout(&encode_loadout(&ids)), Some(ids));
         // One bulk chunk.
         assert!(LOADOUT_LEN <= BULK_CHUNK);
+    }
+
+    #[test]
+    fn loadout_active_prosthetic_in_extra0() {
+        let mut l = Loadout::new([-1; LOADOUT_SLOTS]);
+        assert_eq!(l.active_prosthetic(), -1);
+        for a in [0, 1, 2, -1] {
+            l.extra[LOADOUT_EXTRA_ACTIVE_PROSTHETIC] = a;
+            let bytes = encode_loadout(&l);
+            // Same length and layout version as before: extra[0] is the last-but-two i32.
+            assert_eq!(bytes.len(), LOADOUT_LEN);
+            assert_eq!(bytes[2], LOADOUT_VERSION);
+            let at = 3 + 4 * (LOADOUT_SLOTS + 1);
+            assert_eq!(&bytes[at..at + 4], &a.to_le_bytes());
+            let d = decode_loadout(&bytes).unwrap();
+            assert_eq!(d.active_prosthetic(), a);
+            assert_eq!(d.extra[1..], [-1, -1]);
+        }
     }
 
     /// VERSION 13: the hidden byte carries two bits; each combination survives the trip.
