@@ -52,10 +52,25 @@
 //!   watched for `JOURNAL_SETTLE`, has not run since the load and whose object is not at that
 //!   animation is replayed and kicked once ("doors close again after a reload", issue #3).
 //!
-//! **What is synced** (2026-11-12, after the first live test): by `doors::kind` of the
-//! ObjActParam id, not by the state class (table in doors.rs: every Sekiro bar door and gate
-//! is a one-loop state, the temple lift levers are one-state). `sync_objact = 1`: Door and
-//! Chest of any class; 2: everything with a known class.
+//! **What is synced** (2026-11-12, test3): every LIVE execution of a known state class while
+//! `sync_objact` is on (1; 2 = old alias), except the m15 rotating floors (`never_live`).
+//! `doors::kind` of the ObjActParam (table in doors.rs) decides the rest:
+//! - Door / Chest: one-shot. Replayed once per load, journaled, reopened from the flag by
+//!   doors.rs; one-loop doors converge to open (below).
+//! - Other (`repeatable`: levers, bells, rotating walls, windows, hidden tatami): every
+//!   message is one event. Replay unless the object plays that animation right now (the game's
+//!   own `0x8777F0` check) or, for a flag state, the flag already is the sender's and the
+//!   object is at that animation; kick only when it ran here a moment ago as a type 45 replay.
+//!   Target = the sender's flag AFTER its execution (a window that closes carries 0). Never
+//!   journaled, never reopened after a load (doors.rs `reopens`): their persistent state is
+//!   their MSB flag (world flag sync) or their EMEVD (the temple lift resets to its 20005620
+//!   pose at every load), so a reload can not make them move by themselves.
+//! - Temple lift (m20, common 20005621): the four lever ObjActs (12000651-654, one-state,
+//!   ObjActParam 205011 / -1) only kick the receiver's own lift script, which moves its own
+//!   lift (`ForceAnimationPlayback`) and sets 12000656. A kick for the other branch (the
+//!   receiver's lift is already where the sender's went) is ignored by the script, so one
+//!   pull makes both lifts agree. A player on the platform rides it as with his own pull; one
+//!   under it is in the vanilla invader situation (the script's network branch moves it too).
 //!
 //! **One-loop doors** (doors.rs header, [VAR] Ghidra): every execution plays the same
 //! opening animation and toggles the MSB flag, so "open" = flag ON and there is no closing
@@ -90,8 +105,8 @@ use crate::log;
 use crate::net::{Dest, Net};
 use crate::peers::PeerId;
 
-/// `[GAMEPLAY] sync_objact`: 0 off, 1 doors / gates / chests of any state class (default; by
-/// ObjActParam, `doors::kind`), 2 also levers, lifts, bells, rotating walls / floors, windows.
+/// `[GAMEPLAY] sync_objact`: 0 off, 1 every kind (default: doors, gates, chests, levers / the
+/// lift, bells, rotating walls, windows; not the rotating floors), 2 = 1 (old ini files).
 pub static MODE: AtomicU8 = AtomicU8::new(1);
 /// `[DEBUG] objact_debug`: log every execution, every map flag, raw infos and prologues.
 pub static DEBUG: AtomicBool = AtomicBool::new(false);
@@ -457,16 +472,37 @@ struct Evidence {
     own_anim: bool,
 }
 
-/// Does `sync_objact = mode` sync an ObjAct of state `class` and ObjActParam `param` (Ok) or
-/// not (Err, why)? Mode 1: doors and chests of any class (`doors::kind`); 2: every known class.
+/// Does `sync_objact = mode` sync an ObjAct of state `class` (Ok) or not (Err, why)? Every
+/// kind with a known state class while it is on (1; 2 is an old alias of 1). What differs per
+/// kind is the receiver's plan (`receive_plan`) and the persistence (journal, doors.rs).
 fn syncs(class: Option<Class>, param: i32, mode: u8) -> Result<(), &'static str> {
+    if mode == 0 {
+        return Err("sync_objact = 0");
+    }
     if class.is_none() {
         return Err("unknown state class");
     }
-    if mode >= 2 || kind(param) != Kind::Other {
-        return Ok(());
+    if let Some(why) = never_live(param) {
+        return Err(why);
     }
-    Err("not a door or chest by its ObjActParam (a lever, lift, bell, rotating wall / floor or window): synced only with sync_objact = 2")
+    Ok(())
+}
+
+/// Kinds left off on purpose (static check, 2026-11-12). The m15 rotating floors (どんでん床,
+/// ObjActParam 90060-90066, one-loop, flags 61500700 / 61500710, used through EMEVD 11505696
+/// `ForceUseObjact(10000, ...)`) carry the player who uses them (player animation 7104xx):
+/// replayed here with no actor the floor would flip away under a player standing on it. Their
+/// flags still travel with the world flag sync and set the floor up at the next load.
+fn never_live(param: i32) -> Option<&'static str> {
+    (90_060..=90_066)
+        .contains(&param)
+        .then_some("a rotating floor (ObjActParam 9006x) carries its user: replaying it could flip it under a player standing on it (left off; its flag still syncs)")
+}
+
+/// A repeatable ObjAct (`Kind::Other`: lever, bell, rotating wall / floor, window, tatami):
+/// every execution is an event of its own, so no "once per load" limits apply to it.
+fn repeatable(param: i32) -> bool {
+    kind(param) == Kind::Other
 }
 
 /// Poll sender: send this execution (Ok, why) or not (Err, why).
@@ -505,14 +541,19 @@ fn hook_decision(class: Option<Class>, param: i32, mode: u8, actor: i32, own: Op
 }
 
 /// Value for the receiver's `0x6BA910`: a one-loop door 1 (every execution opens it, the
-/// flag's toggle is a use parity: header), another flag state toggles (the opposite of the
-/// flag before), a one-state takes 1 (its `vt[5]` ignores it).
-fn target_state(class: Option<Class>, param: i32, flag_before: Option<bool>) -> u8 {
+/// flag's toggle is a use parity: header); another flag state the sender's flag AFTER its
+/// execution (read right after the start: the toggle is synchronous), else the opposite of
+/// the flag before; a one-state takes 1 (its `vt[5]` ignores it).
+fn target_state(class: Option<Class>, param: i32, flag_before: Option<bool>, flag_after: Option<bool>) -> u8 {
     if loop_door(class, param) {
         return 1;
     }
-    match (class.is_some_and(Class::has_flag), flag_before) {
-        (true, Some(v)) => u8::from(!v),
+    if !class.is_some_and(Class::has_flag) {
+        return 1;
+    }
+    match (flag_after, flag_before) {
+        (Some(v), _) => u8::from(v),
+        (None, Some(v)) => u8::from(!v),
         _ => 1,
     }
 }
@@ -540,6 +581,10 @@ struct Here {
     kicked: bool,
     /// Our own player started it since the load (hook sender).
     ours: bool,
+    /// It executed here within `REPLAY_MARK_FOR` (repeatable kinds).
+    recent: bool,
+    /// We kicked its EMEVD within `REPLAY_MARK_FOR` (repeatable kinds).
+    kicked_recently: bool,
 }
 
 /// What the receiver does with a peer's execution.
@@ -573,6 +618,22 @@ fn receive_plan(class: Option<Class>, param: i32, state: u8, mode: u8, h: Here) 
     if h.marked {
         return Err("doors.rs or objact.rs replayed it a moment ago");
     }
+    if repeatable(param) {
+        // A lever pull / bell ring / wall turn: one replay per message, never "since the load".
+        if h.executing || h.recent {
+            if h.local_start {
+                return Err("it ran here a moment ago as a local start (our player or a script): its EMEVD kick ran");
+            }
+            if h.kicked_recently {
+                return Err("it ran here a moment ago as a replay and we kicked it already");
+            }
+            return Ok(Plan::KickOnly);
+        }
+        return match h.idle {
+            None => Err("not watched yet since the load"),
+            Some(_) => Ok(Plan::Replay),
+        };
+    }
     if h.replayed {
         return Err("replayed once already since the load");
     }
@@ -593,6 +654,20 @@ fn receive_plan(class: Option<Class>, param: i32, state: u8, mode: u8, h: Here) 
         Some(false) => Err("its run state is not the one it had at the load"),
         Some(true) => Ok(Plan::Replay),
     }
+}
+
+/// Receiver, the object of a repeatable kind: replay unless it plays that animation right now
+/// (`done`, the game's own refusal `0x8777F0` [VAR]: `anim == want && (obj+0x128 & 4)`), or a
+/// flag state is in the target state already: flag equal and the object at that animation.
+fn repeat_decision(view: Option<doors::ObjView>, flag_here: Option<bool>, state: u8) -> Result<(), &'static str> {
+    let Some(v) = view else { return Err("the object or its request was not found here") };
+    if v.done() {
+        return Err("the object plays that execution's animation right now");
+    }
+    if flag_here == Some(state != 0) && v.reached() {
+        return Err("already in that state here (its flag is the sender's and the object is at that animation)");
+    }
+    Ok(())
 }
 
 /// Receiver, the object: replay only when it is found and not at that animation yet.
@@ -768,6 +843,9 @@ struct State {
     own_keys: HashSet<usize>,
     /// ObjActs whose EMEVD we kicked since the load.
     kicked_keys: HashSet<usize>,
+    /// When each ObjAct last executed here / we last kicked it (repeatable kinds).
+    executed_at: HashMap<usize, Instant>,
+    kicked_at: HashMap<usize, Instant>,
     /// ObjActs sent lately (`objact_key`, when).
     sent_keys: Vec<(usize, Instant)>,
     journal: Journal,
@@ -1051,6 +1129,7 @@ fn kick_text(s: &mut State, info: usize, key: usize) -> String {
     match kick(info) {
         Ok(entity) => {
             s.kicked_keys.insert(key);
+            s.kicked_at.insert(key, Instant::now());
             s.kicks += 1;
             format!("EMEVD kicked: ObjActEventFlag({entity}) holds as after the opener's own start ({} kicks so far)", s.kicks)
         }
@@ -1116,6 +1195,8 @@ pub fn tick(net: &mut Net, in_world_for: Duration, ready: bool) {
             s.executed_keys.clear();
             s.own_keys.clear();
             s.kicked_keys.clear();
+            s.executed_at.clear();
+            s.kicked_at.clear();
             s.journal_tried.clear();
             s.journal_at = None;
             s.sent_keys.clear();
@@ -1245,6 +1326,7 @@ fn poll(s: &mut State, base: usize, now: Instant, debug: bool, by_hook: bool) {
     for (b, i, prev_b114) in new {
         let key = i.objact_key();
         s.executed_keys.insert(key);
+        s.executed_at.insert(key, now);
         let class = class_of(&mem, base, i.state);
         let replay = replay_marked(s, key, now);
         let flag = class.and_then(|c| flag_of(&mem, i.state, c));
@@ -1317,7 +1399,8 @@ fn own_start(s: &mut State, base: usize, ev: OwnStart, mode: u8, debug: bool, no
         }
         s.foreign_logged += 1;
     }
-    let state = target_state(class, i.param, ev.flag_before);
+    let flag_after = class.and_then(|c| flag_of(&mem, i.state, c)).and_then(game::event_flag);
+    let state = target_state(class, i.param, ev.flag_before, flag_after);
     let mut msg = None;
     let decision: Result<u32, &str> = match verdict {
         Err(why) => Err(why),
@@ -1336,6 +1419,7 @@ fn own_start(s: &mut State, base: usize, ev: OwnStart, mode: u8, debug: bool, no
     let journaled = if verdict.is_ok() {
         s.own_keys.insert(key);
         s.executed_keys.insert(key);
+        s.executed_at.insert(key, now);
         match b.map {
             Some(map) => journal_note(
                 s,
@@ -1437,7 +1521,7 @@ fn decide(s: &mut State, now: Instant, mode: u8, debug: bool, by_hook: bool) -> 
             .flag
             .and_then(|f| s.flags.iter().rev().find(|&&(t, id, _)| id == f && t + Duration::from_millis(500) >= e.at).map(|&(_, _, on)| !on))
             .or(e.flag_at_edge);
-        let state = target_state(e.class, e.info.param, flag_before);
+        let state = target_state(e.class, e.info.param, flag_before, flag_now);
         let key = e.info.objact_key();
         let decision: Result<u32, &str> = match verdict {
             Err(why) => Err(why),
@@ -1573,6 +1657,8 @@ fn here_of(s: &State, i: &Info, now: Instant) -> Here {
         local_start: i.b114 == 1,
         kicked: s.kicked_keys.contains(&key),
         ours: s.own_keys.contains(&key),
+        recent: s.executed_at.get(&key).is_some_and(|&t| now.duration_since(t) < REPLAY_MARK_FOR),
+        kicked_recently: s.kicked_at.get(&key).is_some_and(|&t| now.duration_since(t) < REPLAY_MARK_FOR),
     }
 }
 
@@ -1616,10 +1702,11 @@ fn apply(s: &mut State, base: usize, now: Instant, mode: u8) {
         let here = here_of(s, &i, now);
         let state = u32::from(m.state);
         let plan = receive_plan(class, i.param, m.state, mode, here);
+        let here_flag = class.and_then(|c| flag_of(&mem, i.state, c)).and_then(game::event_flag);
         // 0x6BCBC0 only for a known class and a valid state (the plan checks both).
         let view = if plan == Ok(Plan::Replay) { doors::object_view(b.addr, b.slot, i.index, i.handle, state) } else { None };
         let what = match plan {
-            Ok(Plan::Replay) => match object_decision(view.map(|v| v.reached())) {
+            Ok(Plan::Replay) => match if repeatable(i.param) { repeat_decision(view, here_flag, m.state) } else { object_decision(view.map(|v| v.reached())) } {
                 Ok(()) => replay_and_kick(s, base, &b, &i, state, now),
                 Err(why) => format!("not replayed: {why}"),
             },
@@ -1854,7 +1941,18 @@ mod tests {
     }
 
     fn here() -> Here {
-        Here { executing: false, idle: Some(true), marked: false, replayed: false, executed: false, local_start: false, kicked: false, ours: false }
+        Here {
+            executing: false,
+            idle: Some(true),
+            marked: false,
+            replayed: false,
+            executed: false,
+            local_start: false,
+            kicked: false,
+            ours: false,
+            recent: false,
+            kicked_recently: false,
+        }
     }
 
     fn entry(entity: i32, class: u8, state: u8) -> Entry {
@@ -1978,7 +2076,7 @@ mod tests {
         assert!(send_decision(ev(false, true, true), Some(Class::One), DOOR, 1).is_ok());
         assert!(send_decision(ev(true, true, false), Some(Class::Door), DOOR, 1).is_ok());
         assert!(send_decision(ev(false, false, false), Some(Class::One), DOOR, 1).is_err());
-        assert!(send_decision(ev(true, true, true), Some(Class::OneLoop), LEVER, 1).is_err());
+        assert!(send_decision(ev(true, true, true), Some(Class::OneLoop), LEVER, 1).is_ok());
         assert!(send_decision(ev(true, true, true), Some(Class::OneLoop), LEVER, 2).is_ok());
         assert!(send_decision(ev(true, true, true), None, DOOR, 2).is_err());
     }
@@ -1995,19 +2093,19 @@ mod tests {
         assert!(hook_decision(Some(Class::One), DOOR, 1, 0x1000_0001, me, false).is_err());
         // Off, one-loop below mode 2, unknown class.
         assert!(hook_decision(Some(Class::One), DOOR, 0, 0x1000_0001, me, true).is_err());
-        assert!(hook_decision(Some(Class::OneLoop), LEVER, 1, 0x1000_0001, me, true).is_err());
+        assert!(hook_decision(Some(Class::OneLoop), LEVER, 1, 0x1000_0001, me, true).is_ok());
         assert!(hook_decision(Some(Class::OneLoop), LEVER, 2, 0x1000_0001, me, true).is_ok());
         assert!(hook_decision(None, DOOR, 2, 0x1000_0001, me, true).is_err());
     }
 
     #[test]
     fn target_state_toggles_flag_states_only() {
-        assert_eq!(target_state(Some(Class::Door), DOOR, Some(false)), 1);
-        assert_eq!(target_state(Some(Class::Door), DOOR, Some(true)), 0);
-        assert_eq!(target_state(Some(Class::OneLoop), LEVER, Some(false)), 1);
-        assert_eq!(target_state(Some(Class::Door), DOOR, None), 1);
-        assert_eq!(target_state(Some(Class::One), DOOR, Some(true)), 1);
-        assert_eq!(target_state(None, DOOR, Some(true)), 1);
+        assert_eq!(target_state(Some(Class::Door), DOOR, Some(false), None), 1);
+        assert_eq!(target_state(Some(Class::Door), DOOR, Some(true), None), 0);
+        assert_eq!(target_state(Some(Class::OneLoop), LEVER, Some(false), None), 1);
+        assert_eq!(target_state(Some(Class::Door), DOOR, None, None), 1);
+        assert_eq!(target_state(Some(Class::One), DOOR, Some(true), Some(false)), 1);
+        assert_eq!(target_state(None, DOOR, Some(true), None), 1);
     }
 
     #[test]
@@ -2039,7 +2137,7 @@ mod tests {
         assert!(receive_plan(Some(Class::Door), DOOR, 0, 2, here()).is_err());
         assert!(receive_plan(Some(Class::OneDirDoor), DOOR, 0, 2, here()).is_err());
         assert!(receive_plan(None, DOOR, 1, 2, here()).is_err());
-        assert!(receive_plan(Some(Class::OneLoop), LEVER, 1, 1, here()).is_err());
+        assert_eq!(receive_plan(Some(Class::OneLoop), LEVER, 1, 1, here()), Ok(Plan::Replay));
         assert_eq!(receive_plan(Some(Class::OneLoop), LEVER, 0, 2, here()), Ok(Plan::Replay));
         assert_eq!(object_decision(Some(false)), Ok(()));
         assert!(object_decision(Some(true)).is_err() && object_decision(None).is_err());
@@ -2103,36 +2201,137 @@ mod tests {
     }
 
     #[test]
-    fn mode_1_syncs_doors_and_chests_of_any_class() {
-        // The live case: gate 1113602 (one-loop, ObjActParam 999900) goes out at mode 1.
-        assert!(syncs(Some(Class::OneLoop), GATE, 1).is_ok());
-        assert!(syncs(Some(Class::One), DOOR, 1).is_ok());
-        assert!(syncs(Some(Class::One), 999_980, 1).is_ok());
-        // Levers (one-state!), windows, bells, rotating walls / floors: only at mode 2.
-        for (c, p) in [(Class::One, LEVER), (Class::OneLoop, WINDOW), (Class::OneLoop, 252_555), (Class::One, 90_075), (Class::OneLoop, 90_061), (Class::One, -1)] {
-            assert!(syncs(Some(c), p, 1).is_err(), "{p}");
-            assert!(syncs(Some(c), p, 2).is_ok(), "{p}");
-        }
-        assert!(syncs(None, GATE, 2).is_err());
+    fn mode_1_syncs_every_kind_but_the_rotating_floors() {
+        // (class, ObjActParam): gate, HUB door, chest, temple lift lever (205011 and -1), bells
+        // (the Bell Demon's bell is -1, the corridor bell 205101, m25 252555), rotating walls,
+        // the window, hidden tatami (-1).
+        let all = [
+            (Class::OneLoop, GATE),
+            (Class::One, DOOR),
+            (Class::One, 999_980),
+            (Class::One, LEVER),
+            (Class::One, -1),
+            (Class::One, 205_101),
+            (Class::OneLoop, 252_555),
+            (Class::One, 90_075),
+            (Class::One, 90_071),
+            (Class::OneLoop, WINDOW),
+            (Class::OneLoop, -1),
+        ];
         let me = Some(0x1000_0001);
-        assert!(hook_decision(Some(Class::OneLoop), GATE, 1, 0x1000_0001, me, true).is_ok());
-        assert!(hook_decision(Some(Class::One), LEVER, 1, 0x1000_0001, me, true).is_err());
         let ev = Evidence { our_replay: false, b114_rose: true, b114_now: true, own_anim: true };
-        assert!(send_decision(ev, Some(Class::OneLoop), GATE, 1).is_ok());
-        assert!(send_decision(ev, Some(Class::OneLoop), WINDOW, 1).is_err());
-        assert_eq!(receive_plan(Some(Class::OneLoop), GATE, 1, 1, here()), Ok(Plan::Replay));
-        assert!(receive_plan(Some(Class::One), LEVER, 1, 1, here()).is_err());
+        for (c, p) in all {
+            for mode in [1, 2] {
+                assert!(syncs(Some(c), p, mode).is_ok(), "{p} mode {mode}");
+                assert!(hook_decision(Some(c), p, mode, 0x1000_0001, me, true).is_ok(), "{p}");
+                assert!(send_decision(ev, Some(c), p, mode).is_ok(), "{p}");
+                assert_eq!(receive_plan(Some(c), p, 1, mode, here()), Ok(Plan::Replay), "{p}");
+            }
+            // 0 is the off switch for every kind.
+            assert!(syncs(Some(c), p, 0).is_err());
+            assert!(receive_plan(Some(c), p, 1, 0, here()).is_err());
+        }
+        // The rotating floors never go live (they carry their user), at any mode.
+        for p in [90_060, 90_061, 90_066] {
+            assert!(syncs(Some(Class::OneLoop), p, 1).unwrap_err().starts_with("a rotating floor"));
+            assert!(syncs(Some(Class::OneLoop), p, 2).is_err());
+        }
+        assert!(!never_live(90_059).is_some() && !never_live(90_071).is_some());
+        assert!(syncs(None, GATE, 1).is_err());
+    }
+
+    #[test]
+    fn repeatable_kinds_replay_every_message() {
+        // A lever pulled twice in one load: replayed twice (doors stop at the first).
+        let again = Here { replayed: true, executed: true, kicked: true, ours: true, local_start: true, ..here() };
+        assert_eq!(receive_plan(Some(Class::One), LEVER, 1, 1, again), Ok(Plan::Replay));
+        assert!(receive_plan(Some(Class::One), DOOR, 1, 1, again).is_err());
+        // It ran here a moment ago: as a type 45 replay -> only the kick; as a local start (the
+        // receiver's own pull, a script's ForceUseObjact on both sides) or kicked -> nothing.
+        assert_eq!(receive_plan(Some(Class::One), LEVER, 1, 1, Here { recent: true, ..here() }), Ok(Plan::KickOnly));
+        assert_eq!(receive_plan(Some(Class::One), LEVER, 1, 1, Here { executing: true, ..here() }), Ok(Plan::KickOnly));
+        assert!(receive_plan(Some(Class::One), LEVER, 1, 1, Here { recent: true, local_start: true, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), LEVER, 1, 1, Here { recent: true, kicked_recently: true, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), LEVER, 1, 1, Here { marked: true, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), LEVER, 1, 1, Here { idle: None, ..here() }).is_err());
+        // Not idle since the load (it ran long ago): still replayed.
+        assert_eq!(receive_plan(Some(Class::One), LEVER, 1, 1, Here { idle: Some(false), ..here() }), Ok(Plan::Replay));
+    }
+
+    #[test]
+    fn repeatable_object_check() {
+        let v = |anim, playing| Some(doors::ObjView { obj: 0x1000, anim, playing, want: 1 });
+        // One-state (lever, bell, wall): no flag; refused only while it plays that animation.
+        assert_eq!(repeat_decision(v(1, false), None, 1), Ok(()));
+        assert_eq!(repeat_decision(v(0, false), None, 1), Ok(()));
+        assert!(repeat_decision(v(1, true), None, 1).is_err());
+        assert!(repeat_decision(None, None, 1).is_err());
+        // A window: target = the sender's flag. Same flag and at the animation: nothing; other
+        // flag (it closed there) or not at the animation: replay.
+        assert!(repeat_decision(v(1, false), Some(true), 1).is_err());
+        assert_eq!(repeat_decision(v(1, false), Some(true), 0), Ok(()));
+        assert_eq!(repeat_decision(v(0, false), Some(true), 1), Ok(()));
+        assert_eq!(repeat_decision(v(1, false), Some(false), 1), Ok(()));
+    }
+
+    #[test]
+    fn non_door_flag_states_carry_the_senders_flag() {
+        // The window toggled ON -> OFF at the sender: target 0, replayed at mode 1.
+        assert_eq!(target_state(Some(Class::OneLoop), WINDOW, Some(true), Some(false)), 0);
+        assert_eq!(target_state(Some(Class::OneLoop), WINDOW, Some(false), Some(true)), 1);
+        // The flag after wins over "not before" (a script wrote it in between).
+        assert_eq!(target_state(Some(Class::OneLoop), WINDOW, Some(false), Some(false)), 0);
+        assert_eq!(receive_plan(Some(Class::OneLoop), WINDOW, 0, 1, here()), Ok(Plan::Replay));
+        assert_eq!(receive_plan(Some(Class::OneLoop), -1, 0, 1, here()), Ok(Plan::Replay));
+        // One-state levers / bells: always 1.
+        assert_eq!(target_state(Some(Class::One), LEVER, None, None), 1);
+    }
+
+    /// The m20 temple lift (common 20005621): a lever's kick moves a lift only from the branch
+    /// that waits for it; the lever ObjActs are stateless. Model: `up` = 12000656.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Lever {
+        /// 12000652 / 12000653: waited for while the lift is down.
+        Raise,
+        /// 12000651 / 12000654: waited for while the lift is up.
+        Lower,
+    }
+
+    fn lift_kick(up: bool, l: Lever) -> bool {
+        match (up, l) {
+            (false, Lever::Raise) => true,
+            (true, Lever::Lower) => false,
+            (u, _) => u,
+        }
+    }
+
+    #[test]
+    fn temple_lift_agrees_after_one_pull() {
+        for a_up in [false, true] {
+            for b_up in [false, true] {
+                for l in [Lever::Raise, Lever::Lower] {
+                    // A pulls (its own script moves A's lift); B gets the replay + kick.
+                    let a = lift_kick(a_up, l);
+                    assert_eq!(receive_plan(Some(Class::One), LEVER, 1, 1, here()), Ok(Plan::Replay));
+                    let b = lift_kick(b_up, l);
+                    // A lever that was live for A moved it; B follows or was there already.
+                    if a != a_up {
+                        assert_eq!(b, a, "a {a_up} b {b_up} {l:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
     fn a_loop_door_always_targets_open() {
         // The live case: the host used the gate whose flag (from the client) was on already.
-        assert_eq!(target_state(Some(Class::OneLoop), GATE, Some(true)), 1);
-        assert_eq!(target_state(Some(Class::OneLoop), GATE, Some(false)), 1);
-        assert_eq!(target_state(Some(Class::OneLoop), GATE, None), 1);
+        assert_eq!(target_state(Some(Class::OneLoop), GATE, Some(true), Some(false)), 1);
+        assert_eq!(target_state(Some(Class::OneLoop), GATE, Some(false), Some(true)), 1);
+        assert_eq!(target_state(Some(Class::OneLoop), GATE, None, None), 1);
         // A window (one-loop, not a door) keeps the toggle.
-        assert_eq!(target_state(Some(Class::OneLoop), WINDOW, Some(true)), 0);
-        // Target 0 for a one-loop door is refused at every mode; for a window at mode 2 it is not.
+        assert_eq!(target_state(Some(Class::OneLoop), WINDOW, Some(true), None), 0);
+        // Target 0 for a one-loop door is refused at every mode; for a window it is not.
         assert!(receive_plan(Some(Class::OneLoop), GATE, 0, 1, here()).is_err());
         assert!(receive_plan(Some(Class::OneLoop), GATE, 0, 2, here()).is_err());
         assert_eq!(receive_plan(Some(Class::OneLoop), WINDOW, 0, 2, here()), Ok(Plan::Replay));
@@ -2181,7 +2380,7 @@ mod tests {
             if let Some(v) = sent {
                 self.known = v;
             }
-            Some((target_state(Some(Class::OneLoop), GATE, Some(before)), sent))
+            Some((target_state(Some(Class::OneLoop), GATE, Some(before), Some(self.flag)), sent))
         }
 
         /// world.rs applies the friend's flag (no guard for one-loop door flags).

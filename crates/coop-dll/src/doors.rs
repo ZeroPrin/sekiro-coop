@@ -83,7 +83,8 @@
 //! The door rows all use a door player animation (700200-700330) and, where an EMEVD uses
 //! them, the door templates 20005615 / 20005616 (or a plot `ForceUseObjact`); levers, bells,
 //! walls, floors and windows have their own animations (7104xx-7108xx, 7110xx) and no door
-//! template. `sync_objact = 1` syncs Door and Chest of any state class; Other only with 2.
+//! template. `sync_objact = 1` syncs the live executions of every kind (objact.rs); only
+//! Door and Chest are ever replayed from a flag or a journal (persistence, `reopens`).
 //!
 //! One-loop doors [VAR, Ghidra copy `E:\RE\ghidra_doors2`]: `vt[4]` `0x6B64A0` toggles the
 //! flag (`SetEventFlag(f, !f)`) on every local start, `vt[5]` `0x6B6810` sets it to the value,

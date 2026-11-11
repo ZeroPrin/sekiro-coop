@@ -27,7 +27,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `log_per_run` | DISPLAY | 1 (next start) | Base fixes from 1.0.11 |
 | `send_logs_key` | DISPLAY | 118 (F7; 0 = off) | Base fixes from 1.0.11 |
 | `fix_debug_item_unlocks` | DEBUG | 1 | Co-op items unlocked diving |
-| `sync_objact` | GAMEPLAY | 1 (0 off, 1 doors / gates / chests, 2 + levers, lifts, bells, rotating walls, windows) | ObjAct sync |
+| `sync_objact` | GAMEPLAY | 1 (0 off; 1 every kind: doors, gates, chests, levers / lift, bells, rotating walls, windows; 2 = 1) | ObjAct sync |
 | `objact_debug` | DEBUG | 0 | ObjAct sync |
 | `objact_sender` | DEBUG | hook (or poll) | ObjAct sync |
 | `loadout_sync` | DEBUG | 1 | Loadout sync |
@@ -235,7 +235,7 @@ flag, already applied here, would go off) and sends packet 45 at stage 4.
   replay + kick when idle since the load; **kick only** when it already ran here as a replay
   (`+0x72 = 0`, e.g. the game's type 45 at stage 4) and was not kicked; nothing when doors.rs /
   we replayed it in the last 3 s, it was replayed or kicked since the load, it ran here as a
-  local start, our own player used it, not a door / chest below mode 2, a door toggling closed
+  local start, our own player used it, a door toggling closed
   (a one-loop door's target 0 too), an unknown class. The object check (`doors::object_view`) stays: already at that animation =
   nothing. The kick is skipped when isEventKickSync = 1 (the replay kicked), a kick is pending,
   the info has no ObjActEntityID, `0x6B2AF0` has other bytes, or the event manager is missing.
@@ -269,7 +269,8 @@ are one-state too. So the class says nothing; the ObjActParam row does (`doors::
 the doors.rs header): 999900-999979 and 101050 = Door, 999980-999999 = Chest, everything else
 (levers 205010/205011, bells 2051xx / 252555, rotating walls 9007x, rotating floors 9006x, the
 windows 1100000, hidden tatami, -1) = Other. Mode 1 syncs Door and Chest of any class (send,
-replay, journal); Other only with mode 2.
+replay, journal). Since test3 (user decision: "it should just always work") Other syncs live at
+mode 1 too; only its persistence stays off ("Every kind live" below).
 
 One-loop doors [VAR, Ghidra `E:\RE\ghidra_doors2`]: `vt[4]` `0x6B64A0` toggles the flag on every
 local start, `vt[5]` `0x6B6810` sets it, and the requested animation (`0x6B1DE0` = `vt[8]` +
@@ -294,6 +295,41 @@ Log lines: `doors: our player used one-loop door F whose flag was on already ...
 is on but its door (..., one-loop door, ObjActParam P) was closed here: opened (...); object
 anim A playing B, the open execution plays W`. The `doors.rs's replay ...: EMEVD not kicked: no
 ObjActEntityID` line (windows, after every load) is said once per object and session.
+
+### Every kind live (test3)
+
+`sync_objact = 1` sends and replays the live executions of every kind with a known state class
+(2 is accepted as an alias of 1, 0 stays off). Persistence stays door / chest only: the journal
+and doors.rs's "replay from the flag" (`reopens`) never touch levers, bells, walls, windows.
+Non-doors are `repeatable` (objact.rs): every message is one event (no "once per load"), the
+replay is skipped only while the object plays that animation right now (the game's own
+`0x8777F0` = `anim == want && obj+0x128 & 4` [VAR]) or, for a flag state, when the flag already
+equals the sender's and the object is at that animation; a type 45 replay a moment ago gets only
+the kick, a local start a moment ago (the receiver's own use, a script's `ForceUseObjact(10000)`
+on both sides) nothing. Target = the sender's flag after its execution. Guard 5 and the
+"always open" rule stay door-only.
+
+| kind (ObjActParam, class) | live | how the world state converges | after a reload |
+|---|---|---|---|
+| doors, gates (9999xx, 101050) | yes | replay + kick; one-loop flag ON; journal | yes (flag / journal) |
+| chests (99998x/5/90) | yes | replay + kick (treasure); lot flags | yes |
+| temple lift levers (m20 12000651-654, 205011 / -1, one-state) | yes | the kick drives the receiver's own 20005621; a kick for the other branch is ignored, so one pull makes both lifts agree; 12000656 travels as a flag | both lifts reset to the 20005620 pose (12000655, set only in the invader branch: down). A player who reloads while the other does not has his lift down until the next pull |
+| Bell Demon's bell (m20 12000660, -1, one-state) | yes | the kick runs the receiver's 12005200: if 9830 is off it awards item lot 3400 (Bell Demon's Bell) and sets 9830 (the burden) there too; only when the receiver's 12005200 waits already (12000205 = he inspected the bell) | 9830 is a flag; the item only by the kick |
+| corridor bell (m20 12000825, 205101, one-state) | yes | kick -> 12005826 (transient event) | nothing persistent |
+| m25 bell (252555, one-loop) | yes (script-forced on both: refused as a local start) | its script on each side | flag 62500570 |
+| rotating walls (9007x, one-state, no flag, no EMEVD) | yes | replay plays the same turn (the walls are symmetric) | default pose for both: same |
+| windows (1100000, one-loop, no ObjActEntityID) | yes | target = sender's flag; flags 61110703 / 705 via the flag sync; 11115614 forces them in phase 8302 | from the flag |
+| hidden tatami (m10 1005671, -1, one-loop) | yes | sender's flag | from flag 61000701 |
+| rotating floors (m15 9006x, one-loop) | **no** (`never_live`): they carry the user (player anim 7104xx), a replay with no actor would flip a floor under a player standing on it | flags 61500700 / 710 via the flag sync | from the flags |
+
+Lift statics: our replay is of the lever ObjAct only; the platform moves through the receiver's
+own script (`ForceAnimationPlayback(2001650, 10/11)`), the same path as his own pull. A player
+standing on it rides it; one standing under it is in the situation the vanilla invader branch of
+20005621 (`SetNetworkconnectedEventFlag`) creates too.
+
+Log: `not replayed: the object plays that execution's animation right now`, `already in that
+state here (...)`, `it ran here a moment ago as a local start ...`, `not sent: a rotating floor
+(ObjActParam 9006x) carries its user ...`.
 
 Live check: A opens gate 1113602 (or any bar door, 9999xx one-loop). A: `we used ObjAct ...
 one-loop state ... sending as #N (target state 1)`. B: `peer ... here: ... replayed ... EMEVD
@@ -342,9 +378,8 @@ Live test protocol (both players on this build, `objact_debug = 1`, `native_sess
 6. If nothing is sent: look for `not sent: the actor is not our player` (handle) and retry with
    `objact_sender = poll`.
 
-Open: keyed doors open on the receiver without the key (flags are shared anyway); levers,
-lifts, bells, rotating walls / floors and windows stay off unless both set `sync_objact = 2`
-and are never journaled.
+Open: keyed doors open on the receiver without the key (flags are shared anyway); ringing the
+Bell Demon's bell gives the receiver the burden too (below); rotating floors are not live.
 
 ## Loadout sync (experimental, `[DEBUG] loadout_sync`, default 1; not tested live yet)
 
