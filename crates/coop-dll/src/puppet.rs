@@ -508,6 +508,7 @@ impl Puppet {
                         (None, other) => other,
                     }
                 },
+                wait: self.boss.overlay().map(str::to_owned),
             });
         }
         self.menu_frame(player_now);

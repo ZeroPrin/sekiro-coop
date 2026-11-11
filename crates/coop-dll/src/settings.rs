@@ -438,6 +438,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::RELAY_SNAPSHOT_HZ.store(ini.num("relay_snapshot_hz", 30, 10, 120, warn), Relaxed);
     tuning::SNAPSHOT_HZ_MULTI.store(ini.num("snapshot_hz_multi", 60, 20, 120, warn), Relaxed);
     tuning::DEATH_RESTORE_DELAY_S.store(ini.num("death_restore_delay_s", 8, 2, 60, warn), Relaxed);
+    tuning::BLOCK_CHANGE_GRACE_MS.store(ini.num("block_change_grace_ms", 2500, 0, 3000, warn), Relaxed);
     tuning::RESTORE_LOST_ITEMS.store(ini.flag("restore_lost_items", true, warn), Relaxed);
     items::ENABLED.store(ini.flag("connection_items", true, warn), Relaxed);
     items::FIX_UNLOCKS.store(ini.flag("fix_debug_item_unlocks", true, warn), Relaxed);
@@ -856,6 +857,10 @@ relay_snapshot_hz = 30
 snapshot_hz_multi = 60
 ; Host, after its own death: seconds after the reload before the friend's dead enemies die here.
 death_restore_delay_s = 8
+; Walking along the border of two map blocks: milliseconds (0..3000) a block difference must
+; last before the companion's character is removed and the native session lets go of the
+; enemies (log lines with grace). 0 = at once (the old behaviour).
+block_change_grace_ms = 2500
 ; Test builds: the auditor compares both players' items, skills, item lots and shared flags,
 ; boss HP and the reward hand-over, and writes what differs to audit.txt (it never gives
 ; anything). 0 = off. audit_every_s = seconds between the regular comparisons (30..3600).
