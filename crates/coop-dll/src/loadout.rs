@@ -24,7 +24,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use coop_net::{LOADOUT_SLOTS, Loadout, decode_loadout, encode_loadout};
+use coop_net::{LOADOUT_EXTRA_ACTIVE_PROSTHETIC, LOADOUT_SLOTS, Loadout, decode_loadout, encode_loadout};
 use fromsoftware_shared::FromStatic;
 use sekiro::param::{EQUIP_PARAM_PROTECTOR_ST, EQUIP_PARAM_WEAPON_ST, ParamDef};
 use sekiro::sprj::SoloParamRepository;
@@ -82,6 +82,82 @@ const CHR_HOLDERS: [usize; 2] = [0x2140, 0x2198];
 /// Category bits of a full item id (`id >> 28`).
 const CAT_WEAPON: u32 = 0;
 const CAT_PROTECTOR: u32 = 1;
+
+// --- Active prosthetic (FORK.md "Active prosthetic", static RE 2026-11-12) -----
+// ChrAsm (class vtable `0x2A1EDD0`; PGD+0x310 and the PlayerIns holder `chr+0x2140`):
+// +0x08 arm style, +0x0C + 4*hand the ACTIVE slot index of that hand (getter `0xBF1480`,
+// setter `0xBF1640`, both on ChrAsm+8), +0x24 the 25 gaitem handles. Hand 0 (left) =
+// the prosthetic: its active ChrAsm slot is `2 * index` (`0x9CB210`, `0xE72220`).
+// The game's switch (`0xB57E30` -> `0xA26150(chr, hand, (index + 1) % 3)`, skipping slots
+// that hold bare hands 110000) runs only for the local player. Every PlayerIns update
+// (`0xA37560`, chr types 0 and 1 alike: table `0x143B0A3B0` byte 1 = 0) copies the PGD's
+// ChrAsm INTO the holder (`0x9CC9A0`) and reacts to a changed hand weapon itself
+// (`0x7E3C60`, `0xA23AF0`, then `0x9F6780` / `0x9F6460`). So a replica shows its PGD's
+// index; writing PGD+0x31C lets the game swap the tool.
+const PGD_CHR_ASM: usize = 0x310;
+const CHR_ASM_VTABLE_RVA: usize = 0x2A1EDD0;
+const ASM_ARM_STYLE: usize = 0x08;
+const ASM_ACTIVE_LEFT: usize = 0x0C;
+/// PlayerIns -> its ChrAsm holder (PlayerIns vtable slot 0x2F0 `0xA28AC0` returns it).
+const CHR_ASM_HOLDER: usize = 0x2140;
+/// Prosthetic slots per hand (`(index + 1) % 3` in `0xB57E30`).
+pub const PROSTHETIC_SLOTS: i32 = 3;
+/// "Bare hands" weapon id: the game's switch skips a slot holding it.
+const BARE_HANDS: i32 = 110_000;
+/// A replica whose holder did not follow its PGD this long gets the old refresh (sync_chr +
+/// parts reload).
+const FOLLOW_CHECK_AFTER: Duration = Duration::from_millis(400);
+/// The local ChrAsm holder may lag the PGD a frame; this many ticks in a row disagreeing
+/// means the offsets are wrong.
+const LOCAL_MISMATCH_LIMIT: u32 = 180;
+
+/// The ChrAsm slot of active prosthetic index `active` (0..=2 -> 0 / 2 / 4).
+pub fn prosthetic_slot(active: i32) -> Option<usize> {
+    (0..PROSTHETIC_SLOTS).contains(&active).then(|| 2 * active as usize)
+}
+
+/// Why a received active prosthetic index is not put on the replica.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveSkip {
+    /// -1: an older build, or the sender's own check failed.
+    Unknown,
+    /// Not 0..=2.
+    OutOfRange,
+    /// The sender's slot holds no tool (empty, bare hands, not a weapon id).
+    NotATool,
+    /// The replica's slot does not hold the sender's tool yet (loadout not applied).
+    NotDressed,
+}
+
+/// The ChrAsm slot to make active on the replica, or why not. `sender` = the ids the
+/// sender sent, `replica` = the replica PGD's ids now. Network data reaches the game only
+/// through here.
+pub fn check_active(active: i32, sender: &[i32; LOADOUT_SLOTS], replica: &[i32; LOADOUT_SLOTS]) -> Result<usize, ActiveSkip> {
+    if active == -1 {
+        return Err(ActiveSkip::Unknown);
+    }
+    let slot = prosthetic_slot(active).ok_or(ActiveSkip::OutOfRange)?;
+    let id = sender[slot];
+    if id == BARE_HANDS || !matches!(row_of(slot, id), Ok((SlotKind::Weapon, _))) {
+        return Err(ActiveSkip::NotATool);
+    }
+    if replica[slot] != id {
+        return Err(ActiveSkip::NotDressed);
+    }
+    Ok(slot)
+}
+
+/// The local ChrAsm values look like the layout found statically: the class vtable, an
+/// arm style 0..=3 (ARM_STYLE_* in c0000_define.lua) and an index 0..=2.
+pub fn asm_sane(vtable_ok: bool, arm_style: i32, active: i32) -> bool {
+    vtable_ok && (0..=3).contains(&arm_style) && prosthetic_slot(active).is_some()
+}
+
+/// ChrAsm at `asm`: (arm style, active left index) when its vtable is the ChrAsm class.
+fn asm_read(asm: usize) -> Option<(bool, i32, i32)> {
+    let vt_ok = read_ptr(asm)? == module_base() + CHR_ASM_VTABLE_RVA;
+    Some((vt_ok, read::<i32>(asm + ASM_ARM_STYLE)?, read::<i32>(asm + ASM_ACTIVE_LEFT)?))
+}
 
 /// What a ChrAsm slot holds, as the game fills it (`0x7B7470`: weapon kinds 0..5 through
 /// `0x9CB5D0` = slot k, protector kinds through `0x9CB3E0` = slot 12 + k, accessories through
@@ -273,6 +349,143 @@ pub fn sync_chr(chr: Chr, pgd: usize) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Sender side of the active prosthetic: the runtime check of the static finding.
+struct LocalActive {
+    /// The check failed `LOCAL_MISMATCH_LIMIT` ticks in a row: -1 is sent from then on.
+    disabled: bool,
+    bad_ticks: u32,
+    last: Option<i32>,
+}
+
+static LOCAL_ACTIVE: Mutex<LocalActive> = Mutex::new(LocalActive { disabled: false, bad_ticks: 0, last: None });
+
+/// The local player's active prosthetic index (0..=2) to send, -1 when unknown or disabled.
+fn local_active(pgd: usize) -> i32 {
+    let Ok(mut st) = LOCAL_ACTIVE.lock() else { return -1 };
+    if st.disabled {
+        return -1;
+    }
+    let asm = asm_read(pgd + PGD_CHR_ASM);
+    let holder = crate::game::player()
+        .and_then(|c| read_ptr(c.0 + CHR_ASM_HOLDER))
+        .filter(|&h| h >= 0x10000)
+        .and_then(|h| read::<i32>(h + ASM_ACTIVE_LEFT));
+    let verdict = match asm {
+        Some((vt, arm, active)) if asm_sane(vt, arm, active) => match holder {
+            // The holder is the PGD's copy (0xA37560) or its source (0xA26150).
+            Some(h) if h != active => Err(format!("holder index {h} != PGD index {active}")),
+            _ => Ok(active),
+        },
+        Some((vt, arm, active)) => Err(format!("vtable ok {vt}, arm style {arm}, index {active}")),
+        None => Err("ChrAsm unreadable".into()),
+    };
+    match verdict {
+        Ok(active) => {
+            if st.bad_ticks > 0 && st.last.is_none() {
+                log::line(&format!("loadout: local ChrAsm check passed after {} bad tick(s)", st.bad_ticks));
+            }
+            st.bad_ticks = 0;
+            st.last = Some(active);
+            active
+        }
+        Err(why) => {
+            st.bad_ticks += 1;
+            if st.bad_ticks >= LOCAL_MISMATCH_LIMIT {
+                st.disabled = true;
+                log::line(&format!(
+                    "loadout: active prosthetic DISABLED: the local ChrAsm (PGD+0x310) failed its check {} ticks in a row ({why}); index not sent, peers keep their replica's slot",
+                    st.bad_ticks
+                ));
+            }
+            -1
+        }
+    }
+}
+
+/// Receiver side, per peer.
+#[derive(Clone, Copy)]
+struct Follow {
+    /// The replica this state is about (a respawned replica starts over).
+    chr: usize,
+    /// After writing the index: when to check that the holder followed, and the index.
+    check: Option<(Instant, i32)>,
+    /// The last skip logged (index, reason), so a repeating one is logged once.
+    logged: Option<(i32, ActiveSkip)>,
+}
+
+const FOLLOW_NONE: Follow = Follow { chr: 0, check: None, logged: None };
+static FOLLOW: Mutex<[Follow; MAX_PLAYERS]> = Mutex::new([FOLLOW_NONE; MAX_PLAYERS]);
+/// A replica's ChrAsm failed the layout check: this feature stays off on this machine.
+static REPLICA_ASM_BAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// native.rs (game thread, the replica in the player chr set): put the active prosthetic
+/// `l` carries on `peer`'s replica `chr` (PGD `pgd`). Writes the replica PGD's ChrAsm index
+/// only when it differs; the game's PlayerIns update copies it into the holder and swaps
+/// the tool itself. Checks `FOLLOW_CHECK_AFTER` later that the holder followed; if not,
+/// falls back to the dress refresh (sync_chr + parts reload). Call every tick.
+pub fn follow_active(chr: Chr, pgd: usize, peer: PeerId, l: &Loadout) {
+    use std::sync::atomic::Ordering;
+    if REPLICA_ASM_BAD.load(Ordering::Relaxed) || pgd < 0x10000 || local_pgd() == Some(pgd) {
+        return;
+    }
+    let Ok(mut all) = FOLLOW.lock() else { return };
+    let Some(f) = all.get_mut(peer.index()) else { return };
+    if f.chr != chr.0 {
+        *f = Follow { chr: chr.0, ..FOLLOW_NONE };
+    }
+    let who = format!("peer slot {}", peer.slot());
+    let asm = pgd + PGD_CHR_ASM;
+    // A due check first: did the game copy the index into the holder?
+    if let Some((at, want)) = f.check
+        && Instant::now() >= at
+    {
+        f.check = None;
+        let held = read_ptr(chr.0 + CHR_ASM_HOLDER).filter(|&h| h >= 0x10000).and_then(|h| read::<i32>(h + ASM_ACTIVE_LEFT));
+        if held == Some(want) {
+            log::line(&format!("loadout: {who} active prosthetic {want}: holder of {:#x} followed (game swap)", chr.0));
+        } else {
+            let sync = sync_chr(chr, pgd);
+            let reload = sync.as_ref().map_err(|e| e.clone()).and_then(|_| crate::ghost::reload_parts(chr));
+            log::line(&format!(
+                "loadout: {who} active prosthetic {want}: holder of {:#x} did not follow ({held:?}), fallback sync {:?}, parts reload {:?}",
+                chr.0, sync, reload
+            ));
+        }
+    }
+    let Some((vt, arm, now)) = asm_read(asm) else { return };
+    if !asm_sane(vt, arm, now) {
+        REPLICA_ASM_BAD.store(true, Ordering::Relaxed);
+        log::line(&format!(
+            "loadout: active prosthetic DISABLED on this side: replica {:#x} ChrAsm (PGD {pgd:#x} +0x310) fails the check (vtable ok {vt}, arm style {arm}, index {now})",
+            chr.0
+        ));
+        return;
+    }
+    let want = l.active_prosthetic();
+    let Some(replica) = ids_of(pgd) else { return };
+    match check_active(want, &l.slots, &replica) {
+        Ok(slot) => {
+            f.logged = None;
+            if now == want {
+                return;
+            }
+            if !crate::game::write::<i32>(asm + ASM_ACTIVE_LEFT, want) {
+                log::line(&format!("loadout: {who} active prosthetic {now} -> {want} not written (PGD {pgd:#x})"));
+                return;
+            }
+            f.check = Some((Instant::now() + FOLLOW_CHECK_AFTER, want));
+            log::line(&format!("loadout: {who} active prosthetic {now} -> {want} applied on {:#x} (ChrAsm slot {slot}, id {})", chr.0, l.slots[slot]));
+        }
+        Err(why) => {
+            if f.logged != Some((want, why)) {
+                f.logged = Some((want, why));
+                // Unknown is the normal state for an older peer: said once, quietly.
+                log::line(&format!("loadout: {who} active prosthetic {want} skipped ({why:?}), replica keeps {now}"));
+            }
+        }
+    }
+}
+
 struct Sent {
     last: Option<Loadout>,
     at: Option<Instant>,
@@ -327,21 +540,34 @@ pub fn tick(net: &mut Net, peers: &PeerSet) {
         if let Ok(mut w) = UNREADABLE_LOGGED.lock() {
             w[i] = false;
         }
+        if let Ok(mut f) = FOLLOW.lock() {
+            f[i] = FOLLOW_NONE;
+        }
     }
 
     if !tuning::loadout_sync() || peers.is_empty() {
         return;
     }
-    let Some(ids) = local_pgd().and_then(ids_of) else { return };
-    // The combat art is slot 1; `art` / `extra` stay reserved (-1).
-    let ours = Loadout::new(ids);
+    let Some(pgd) = local_pgd() else { return };
+    let Some(ids) = ids_of(pgd) else { return };
+    // The combat art is slot 1; `art` and `extra[1..]` stay reserved (-1). A changed active
+    // prosthetic makes `changed` true: sent at once, not on the refresh cadence.
+    let mut ours = Loadout::new(ids);
+    ours.extra[LOADOUT_EXTRA_ACTIVE_PROSTHETIC] = local_active(pgd);
     let Ok(mut sent) = SENT.lock() else { return };
     let now = Instant::now();
     let changed = sent.last != Some(ours);
     let due = sent.at.is_none_or(|t| now.duration_since(t) >= REFRESH_EVERY) && net.pending_bulk_chunks() == 0;
     if (changed || due) && net.send_bulk(BULK_LOADOUT, &encode_loadout(&ours)) {
-        if changed {
+        if sent.last.map(|l| l.slots) != Some(ids) {
             log::line(&format!("loadout: sent ids {ids:?}"));
+        }
+        let active = ours.active_prosthetic();
+        if sent.last.map(|l| l.active_prosthetic()) != Some(active) {
+            match prosthetic_slot(active) {
+                Some(slot) => log::line(&format!("loadout: sent active prosthetic {active} (ChrAsm slot {slot}, id {})", ids[slot])),
+                None => log::line(&format!("loadout: sent active prosthetic {active} (unknown)")),
+            }
         }
         sent.last = Some(ours);
         sent.at = Some(now);
@@ -415,5 +641,66 @@ mod tests {
         // Without params (not loaded): nothing reaches the game.
         let (put, _) = plan(&DUMP, &want, |_, _| false);
         assert!(put.is_empty());
+    }
+
+    #[test]
+    fn prosthetic_slots_are_even() {
+        assert_eq!(prosthetic_slot(0), Some(0));
+        assert_eq!(prosthetic_slot(1), Some(2));
+        assert_eq!(prosthetic_slot(2), Some(4));
+        assert_eq!(prosthetic_slot(3), None);
+        assert_eq!(prosthetic_slot(-1), None);
+        assert_eq!(prosthetic_slot(i32::MIN), None);
+    }
+
+    #[test]
+    fn check_active_validates_network_index() {
+        // Dump: index 1 = slot 2 = 73000.
+        assert_eq!(check_active(1, &DUMP, &DUMP), Ok(2));
+        assert_eq!(check_active(0, &DUMP, &DUMP), Ok(0));
+        assert_eq!(check_active(2, &DUMP, &DUMP), Ok(4));
+        assert_eq!(check_active(-1, &DUMP, &DUMP), Err(ActiveSkip::Unknown));
+        assert_eq!(check_active(3, &DUMP, &DUMP), Err(ActiveSkip::OutOfRange));
+        assert_eq!(check_active(-2, &DUMP, &DUMP), Err(ActiveSkip::OutOfRange));
+        assert_eq!(check_active(i32::MAX, &DUMP, &DUMP), Err(ActiveSkip::OutOfRange));
+        let mut sender = DUMP;
+        sender[2] = -1; // empty
+        assert_eq!(check_active(1, &sender, &DUMP), Err(ActiveSkip::NotATool));
+        sender[2] = 110_000; // bare hands: the game's switch skips it too
+        assert_eq!(check_active(1, &sender, &DUMP), Err(ActiveSkip::NotATool));
+        sender[2] = 0x1000_0000 | 100_000; // a protector id
+        assert_eq!(check_active(1, &sender, &DUMP), Err(ActiveSkip::NotATool));
+        // The sender's tool is not on the replica yet.
+        let mut sender = DUMP;
+        sender[4] = 71000;
+        assert_eq!(check_active(2, &sender, &DUMP), Err(ActiveSkip::NotDressed));
+        let mut replica = DUMP;
+        replica[4] = 71000;
+        assert_eq!(check_active(2, &sender, &replica), Ok(4));
+    }
+
+    #[test]
+    fn asm_sanity() {
+        // Dump: arm style 1, left index 1.
+        assert!(asm_sane(true, 1, 1));
+        assert!(asm_sane(true, 0, 0));
+        assert!(asm_sane(true, 3, 2));
+        assert!(!asm_sane(false, 1, 1));
+        assert!(!asm_sane(true, 4, 1));
+        assert!(!asm_sane(true, -1, 1));
+        assert!(!asm_sane(true, 1, 3));
+        assert!(!asm_sane(true, 1, -1));
+    }
+
+    #[test]
+    fn active_prosthetic_round_trips_in_the_loadout_body() {
+        let mut l = Loadout::new(DUMP);
+        l.extra[LOADOUT_EXTRA_ACTIVE_PROSTHETIC] = 1;
+        let d = decode_loadout(&encode_loadout(&l)).unwrap();
+        assert_eq!(d, l);
+        assert_eq!(check_active(d.active_prosthetic(), &d.slots, &DUMP), Ok(2));
+        // An older build's body: -1, the replica keeps its slot.
+        let old = decode_loadout(&encode_loadout(&Loadout::new(DUMP))).unwrap();
+        assert_eq!(check_active(old.active_prosthetic(), &old.slots, &DUMP), Err(ActiveSkip::Unknown));
     }
 }
