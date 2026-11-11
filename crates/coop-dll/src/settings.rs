@@ -365,6 +365,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::quitblock::ENABLED.store(ini.flag("block_quit_in_coop", true, warn), Relaxed);
     crate::ngblock::ENABLED.store(ini.flag("block_ng_in_coop", true, warn), Relaxed);
     crate::doctor::ALLOW_CROSS_CYCLE.store(ini.flag("allow_cross_cycle", false, warn), Relaxed);
+    crate::pvp::FRIENDLY_FIRE.store(ini.flag("friendly_fire", false, warn), Relaxed);
     crate::nopause::ENABLED.store(ini.flag("no_pause_in_coop", true, warn), Relaxed);
     crate::livesync::ENABLED.store(ini.flag("native_lives_sync", true, warn), Relaxed);
     crate::puppetguard::ENABLED.store(ini.flag("puppet_type5_guard", true, warn), Relaxed);
@@ -419,6 +420,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::NATIVE_SPAWN_DELAY_S.store(ini.num("native_spawn_delay_s", 10, 2, 120, warn), Relaxed);
     tuning::NATIVE_DRESS_DELAY_MS.store(ini.num("native_dress_delay_ms", 3000, 0, 60_000, warn), Relaxed);
     tuning::N0_CLONES.store(ini.num("n0_clones", 0, 0, 5, warn), Relaxed);
+    crate::pvp::DRY_RUN.store(ini.flag("pvp_dry_run", false, warn), Relaxed);
     tuning::RELAY_SNAPSHOT_HZ.store(ini.num("relay_snapshot_hz", 30, 10, 120, warn), Relaxed);
     tuning::SNAPSHOT_HZ_MULTI.store(ini.num("snapshot_hz_multi", 60, 20, 120, warn), Relaxed);
     tuning::DEATH_RESTORE_DELAY_S.store(ini.num("death_restore_delay_s", 8, 2, 60, warn), Relaxed);
@@ -615,6 +617,11 @@ block_ng_in_coop = 1
 ;     with a notice and the client leaves (enemy HP would differ). 1 = allowed on both PCs
 ;     (set it on both), with a warning only.
 allow_cross_cycle = 0
+; EXPERIMENTAL, not tested in play yet. 1 = player-vs-player damage with the game's own hit
+;     packet: your hits on the companion are sent to their PC and applied there against their
+;     guard, deflect and dodge. Duels are never lethal: at 1 HP the duel is over and hits are
+;     ignored for 5 s. The host's value is used by both. 0 = off (default).
+friendly_fire = 0
 ; 1 = while a companion is connected, menus, the inventory, item pickup messages and the
 ;     co-op yes/no boxes do not pause the game (as in FromSoft's online play): both worlds
 ;     keep running. Solo the game pauses as usual. 0 = menus pause as in single player.
@@ -758,6 +765,9 @@ native_dress_delay_ms = 3000
 ; One-machine test of a 6-player world: this many local copies of you (0..5) appear,
 ; one every 3 s, after every load (native_spawn_delay_s). 0 = off. The friend stays a ghost meanwhile.
 n0_clones = 0
+; friendly_fire test aid: 1 = the companion's hits on you are only written to the log (pvp:),
+; never applied. 0 = applied (default).
+pvp_dry_run = 0
 ; With 3 or more players: how often per second the host forwards one player's position to
 ; the others, and how often you send your own (with one friend: every frame).
 relay_snapshot_hz = 30

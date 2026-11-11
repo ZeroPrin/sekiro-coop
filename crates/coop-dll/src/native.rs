@@ -98,6 +98,8 @@ const Q_SUBSCRIBERS: usize = 0x420;
 const SESSION_SLOTS: usize = 12;
 const SLOT_SEND: usize = 1;
 const SLOT_SEND_37: usize = 3;
+/// "Send a hit record to this player" (type 20): PlayerDebugSession `0x1061880` forwards to slot 1.
+const SLOT_SEND_HIT: usize = 4;
 const SLOT_RECV: usize = 6;
 const PLAYER_INS_SLOTS: usize = 253;
 const SLOT_INIT_18: usize = 18;
@@ -408,9 +410,42 @@ extern "C" fn recv_slot(this: usize, out: *mut RecvOut, buf: *const RecvBuf, pty
     out
 }
 
-/// Our slot 1 (and 3) on the remote's session: it sends nothing.
-extern "C" fn recv_side_send(_this: usize, _data: usize, _size: u32, _ptype: u32) -> u64 {
+/// Our slot 1 (and 3) on the remote's session: it sends nothing, except that the game's
+/// hit packet (type 20, 0xC0 bytes) goes to pvp.rs. That packet reaches slot 1 through
+/// slot 4: the damage router's action 4 (`0xB6A040` -> `0xB72CC0`, a local hit on this
+/// remote) calls `[[remote+0x2038]]+0x20`, which in PlayerDebugSession is `0x1061880` =
+/// `jmp [vtbl+8](this, record, 0xC0, 20)` [VAR, dump 2026-11-11]. In the game's own
+/// PlayerNetworkSession slot 4 (`0x1061D30`) sends the record to the remote's owner.
+extern "C" fn recv_side_send(this: usize, data: usize, size: u32, ptype: u32) -> u64 {
+    if ptype == crate::pvp::HIT_PACKET_TYPE {
+        let _ = std::panic::catch_unwind(|| {
+            if let Some(i) = RECV_OBJS.iter().position(|a| this != 0 && a.load(Ordering::Acquire) == this) {
+                crate::pvp::capture(i, data, size);
+            }
+        });
+    }
     0
+}
+
+/// pvp.rs (hook-safe, lock-free): the native remote chr standing for `peer`, if any.
+pub fn chr_of_peer(peer: PeerId) -> Option<usize> {
+    PEER_CHR.get(peer.index()).map(|a| a.load(Ordering::Acquire)).filter(|&c| c != 0)
+}
+
+/// pvp.rs: milliseconds since `peer`'s last type-1 frame arrived (None = none yet).
+pub fn frame_age_ms(peer: PeerId) -> Option<u64> {
+    let g = INBOXES.get(peer.index())?.lock().ok()?;
+    g.as_ref()?.last_frame_at.map(|t| t.elapsed().as_millis() as u64)
+}
+
+/// pvp.rs: slot 4 ("send hit") of the remote recv vtable copy, None before the first Net
+/// remote was made.
+pub fn recv_vt_hit_slot() -> Option<usize> {
+    let vt = RECV_VT.load(Ordering::Acquire);
+    if vt == 0 {
+        return None;
+    }
+    read_ptr(vt + 8 * SLOT_SEND_HIT)
 }
 extern "C" fn recv_side_send37(_this: usize, _value: i32) -> u64 {
     0

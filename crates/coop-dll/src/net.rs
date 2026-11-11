@@ -1369,6 +1369,11 @@ impl Net {
                 let Some(id) = peer(from) else { return };
                 crate::nsession::on_bulk(id, &data, self.epoch_of(from))
             }
+            // PvP hit records (pvp.rs): straight to its queue, no log line per hit.
+            Event::Bulk { from, kind, data } if kind == crate::pvp::BULK_PVP => {
+                let Some(id) = peer(from) else { return };
+                crate::pvp::on_bulk(id, &data)
+            }
             Event::Bulk { from, kind, data } => {
                 let Some(id) = peer(from) else { return };
                 // The auditor's boss HP samples come at 2 Hz: audit.rs logs what matters.

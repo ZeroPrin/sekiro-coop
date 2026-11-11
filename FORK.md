@@ -66,6 +66,116 @@ the chest itself stays closed for the receiver (opening it gives nothing). Enemy
   player's death reload is still a wipe. Log line: `persist: ... is back after ... death: it no
   longer counts for a wipe`.
 
+## PvP on the native hit packet (experimental, `[GAMEPLAY] friendly_fire`, default 0)
+
+Not tested in play. Player-vs-player damage with FromSoftware's own protocol: the attacker's
+game detects the hit, the victim's game computes it against the victim's current state
+(guard, deflect, dodge i-frames). 1.0.9 had no PvP at all; 1.0.11's friendly fire applied the
+friend's copy's hits locally (laggy, "hits register half the time") and crashed on death.
+Code: `crates/coop-dll/src/pvp.rs`, plus `native.rs` (`recv_side_send`), `net.rs` (bulk
+dispatch), `scaling.rs` (ScaleCfg 11th byte), `doctor.rs`, `settings.rs`, `puppet.rs`.
+
+Marks: [VAR] read in the Ghidra decompilation / disassembly of the 2026-11-11 process dump
+(`E:\RE\notes-2026-11-11.md`, `E:\RE\work_pvp`), [ARV] inferred. Nothing here ran live.
+
+### What the game does (Sekiro 1.06)
+- [VAR] Damage router `0xB6A040(dmgModule, attacker, hit)`: action = `table[victimClass*7 +
+  attackerClass]`, table `0x2A7C590` (or `0x2A7C660` when `hit+0xFC` != 0); classes
+  `0xB6F4C0`: 1 local player, 2 remote player. Read from memory: `[1][2]` = **0** in both
+  tables (a remote player's hit on us = `0xB6AB40` only: guard direction, hit SFX, no HP /
+  posture), `[2][1]` = 4 / 1. (The earlier note "[1][2] = 1" misread the row: row 1 is
+  `1,1,0,1,1,1,1`.)
+- [VAR] Action 4 = damage module slot 10, `0xB72CC0` for players: `0xB686A0` serialises the
+  hit into a 0xC0-byte record and calls `[[victim+0x2038]]+0x20`; in PlayerNetworkSession
+  that is `0x1061D30` -> `0x8D9D40` -> `0x8E6FA0` (packet type 20 to the victim's owner), in
+  PlayerDebugSession `0x1061880` = `jmp [vtbl+8](this, record, 0xC0, 20)`. Then
+  `0xB68FF0(.., remote = 1)`: reaction only on the copy (`0xB6E6A0` writes HP / posture only
+  for remote = 0).
+- [VAR] Receive: `0xA37560` (PlayerIns update; `PlayerIns+0x2088` exists only for the local
+  player) -> `0xB72A80(dmgModule, rx)`: `0x8D7B10(rx, &record)` returns the next type-20
+  record of any session member and the PlayerIns whose session (`[[chr+0x2038]]+0x58`) is that
+  member; `0xB680C0` rebuilds the hit (AtkParam id at record `+0x48`); a throw whose target
+  (`+0xB0`) is not us is cancelled; `0xB68FF0(dmgModule, attacker, hit, 0)` applies it.
+- [VAR] Teams: `chr+0x74` (`0x9F64D0` derives it from the chr type `+0x70`, set by
+  `0x9F5170`); hostility matrix `0x143B0A680` (34x34, `a*0x22+b`): 1 and 2 are Friend, 29 is
+  Rival with everyone.
+- [VAR] "Cannot die": `0xBD5DF0(data)` is true when `data+0x228 & 1` (among others); the HP
+  setter `0xBD64E0` then keeps HP at 1 when it would go from > 0 to <= 0, before
+  `0xB6E6A0`'s "HP < 1" death call (`chr.vtbl+0x168`).
+
+### What the mod does
+1. Setting `[GAMEPLAY] friendly_fire = 0|1`. The host's value is used by both (ScaleCfg byte
+   11, sent with the scaling percentages; an older host = off). The doctor warns when the two
+   ini values differ.
+2. While on and linked: team 29 on every friend's native remote only (never on our player;
+   restored when off). The remote also gets the "cannot die" bit while its owner's snapshot
+   says alive, so a local-only hit (`0x2A7C660`'s `[2][1]` = 1, `hit+0xFC` = bullets [ARV])
+   can never kill the copy; when the owner is dead the bit goes and the game kills the copy
+   the vanilla way. Boss fights are not special-cased (no cheap "in a boss fight" test).
+3. The laggy path: nothing to patch. Vanilla `[1][2]` is already 0 (reaction only); the hooks
+   refuse to install if either table reads otherwise. A pass-through call-site hook at
+   `0xB6A12A` (`call 0xB6AB40`) only counts these copy-on-us hits for the log.
+4. Transport: native.rs's remote recv session slot 1 now hands type-20 records (0xC0 bytes) to
+   `pvp::capture` (the peer is known from `this`). They go to the remote's owner as bulk kind
+   `0xA9` (reliable, chunked): `{magic, version, kind, nonce, seq, held ms, record}`; the
+   receiver drops duplicates per (nonce, seq). While on, each side sends a Hello every 10 s;
+   hits go only to a peer whose Hello came within 35 s (an older build would keep our unknown
+   bulk kind in its 24-entry inbox). nsession's packet routing is not used: its
+   member-vector fakes do not cover `0x8D7B10`, and the game's attacker lookup by session
+   member cannot find our remote (its session object answers slot 11 with an empty member).
+5. Receiver: call-site patches inside `0xB72A80`, written with every other thread suspended,
+   all or nothing, after checking each `call rel32` target: `0xB72B1D` / `0xB72BC7`
+   (`call 0x8D7B10`) -> our queued records first (copied into the game's own buffer
+   `0x143D85AE0`, attacker = the sender's native remote), then the original; `0xB72BB8`
+   (`call 0xB68FF0`) -> for our records only: the "cannot die" bit on our data module for
+   that one call, HP / posture logged before and after.
+6. Non-lethal duels: a hit that leaves us at 1 HP (or would have killed) ends the duel:
+   `pvp: duel over, <name> wins`, a DuelOver message to the winner (`pvp: duel over, we
+   win`), and for 5 s both sides drop player hits. A deathblow (hit type 5, `hit+0x28`) is
+   not applied at all and ends the duel. **Lethal PvP is intentionally not supported**: the
+   kill handler `0xB53BA0` reads the killer's session member / PGD (`0xA29DD0`, `+0x1B8`,
+   `+0x6E0`) and was never run with a remote PlayerIns killer.
+7. `[DEBUG] pvp_dry_run = 1`: received hits are logged and not applied.
+
+Install checks (all or nothing; `pvp: hooks NOT installed: ...` otherwise): the four call
+targets, `[1][2]` = 0 in both tables and `[2][1]` = 4, the 19 bytes of `0x1061880` and
+PlayerDebugSession vtable (`0x2B86048`) slot 4 = `0x1061880`; at the first remote, its recv
+vtable copy's slot 4 is logged (`pvp: remote session slot 4 = ...`).
+
+Not covered: prosthetic / bullet hits (through `0x2A7C660` [ARV]: local copy only, no type 20),
+throws (the game cancels them: the record's target handle is the sender's), lethal PvP.
+
+Risks [ARV]: the copy's swing still plays the vanilla reaction-only path on us (hit SFX,
+maybe a guard spark) before the real hit arrives; a later death from an enemy or a fall while
+the copy is still our "last attacker" could reach the kill handler with a remote killer (the
+1.0.11 crash class); the HP damage field `hit+0x1E0` is logged as int or float (Ghidra typed
+it float).
+
+### Log lines (`pvp:`)
+- Attacker: `pvp: hit #N (local K) sent to <name> (peer P, ok true): atk param A, record dmg
+  [...], held H ms; us [x,y,z], replica [x,y,z] (D m); last type 1 of the victim T ms ago;
+  ping R ms`.
+- Victim: `pvp: hit #N from <name> received (+~L ms sender->here incl. H ms held there, Q ms
+  queued here) -> applied hp a->b posture c->d (hit hp X posture Y, type T, result R)[,
+  CLAMPED at 1 HP (duel lost)]`, or `... dropped: <why>` / `DRY RUN`.
+- Every 10 s while on: `pvp: 10 s: our hits captured .. sent ..; friend's received ..
+  applied ..; local-vs-replica hit dropped (laggy path, reaction only) ..; dropped: ...`.
+- On / off with the reason, team changes, install result.
+
+### Live test protocol (the first test is diagnostic)
+1. Same build on both PCs; the HOST sets `friendly_fire = 1` (the client's value does not
+   matter; the doctor notes a difference). Optional first round: both `pvp_dry_run = 1`.
+2. Connect, meet in one block, wait until both logs show `pvp: player-vs-player damage ON`
+   and `pvp: peer ...: team 2 -> 29`.
+3. Duel for 5 minutes: single slashes, combos, block, deflect, dodge through a slash, a
+   prosthetic, a combat art, one duel to the end (1 HP). Note the time of anything odd (F11
+   writes a marker).
+4. Exchange `%LOCALAPPDATA%\sekiro-coop\log.txt` from both sides; match `hit #N` lines
+   attacker -> victim (sent vs applied, latency, HP before / after, results of blocked /
+   deflected / dodged hits), the 10 s counters, any crash.rs breadcrumb.
+5. End the session (Severed Thread): `pvp: player-vs-player damage off (no link)`; a remote
+   that is still there gets `team ... restored`.
+
 ## Working on this fork
 
 - Repository: https://github.com/ZeroPrin/sekiro-coop, branch `share-pickups` (the fork's

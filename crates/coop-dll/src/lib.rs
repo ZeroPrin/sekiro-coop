@@ -59,6 +59,7 @@ mod optmenu;
 mod optmenu_model;
 mod puppet;
 mod puppetguard;
+mod pvp;
 mod ngblock;
 mod optprobe;
 mod quitblock;
@@ -313,6 +314,7 @@ fn init(hmodule: usize) {
                         log::line("coop: too many panics, co-op disabled until restart");
                         let _ = panic::catch_unwind(artfx::shutdown);
                         let _ = panic::catch_unwind(nsession::shutdown);
+                        let _ = panic::catch_unwind(pvp::shutdown);
                     }
                     // Dropping the puppet drops BossRules, but the statics its detours
                     // read (held death reload, phase B, free cam) would stay set:
