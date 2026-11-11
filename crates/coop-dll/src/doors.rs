@@ -23,7 +23,11 @@
 //! 3. guard (receiver): a friend's OFF for a known door flag that is ON here is ignored
 //!    (vanilla doors never close again; world.rs `apply_flag`);
 //! 4. after every rest and every loading screen all loaded doors whose flag is on are
-//!    checked (twice each).
+//!    checked (twice each);
+//! 5. guard (one-loop doors, the MSB flags 61xxxxxx/62xxxxxx that 1-3 never see): our own
+//!    player's start of a one-loop door whose flag was ON toggled it OFF (objact.rs's detour
+//!    notes it): put back ON at once without telling the friend. The flag of a friend's
+//!    one-loop door that switched ON is replayed as in 1 (objact.rs usually did it already).
 //!
 //! "Known door flag": the flag of a flag-bearing ObjAct state found by the walker, or,
 //! as a fallback for ObjActs whose state keeps no flag (`SprjObjActOneState`, flag
@@ -54,6 +58,44 @@
 //! It found 0 doors in 32/32 live checks, so the doors seen live are most likely
 //! `OneState` ObjActs (no flag in the state) [ARV]: the first scan now logs a count per
 //! state class to settle it.
+//! Live 2026-11-12 (m11_00..m13_00): one-state 22, door 0, one-loop 10, one-dir 0. The ten
+//! one-loop flags are the bar doors, gates and windows of the MSB table below.
+//!
+//! ## What an ObjAct is: `kind` (by ObjActParam id), 2026-11-12
+//!
+//! Data: `E:\RE\sekiro-data\objacts.md` (ObjActParam csv + every MSB ObjAct event, 81, with
+//! its stateType and EMEVD users). In Sekiro the state class says nothing about door vs
+//! lever: every bar door and gate is a ONE-LOOP state (stateType 2), the sliding / HUB doors
+//! and chests are one-state, and so are the temple lift levers. The ObjActParam row does:
+//!
+//! | ObjActParam | rows (name) | MSB stateType | kind |
+//! |---|---|---|---|
+//! | 999900-999976 | "扉を開く" open the door (gates 9999 00/01, small 10/11, large 20-22, 1st 40-46, kido 50, middle 60, sliding 70/71, prison 75, loophole 76) | 2 or 0 | Door |
+//! | 101050 | お堂の扉, temple door | 2 | Door |
+//! | 999980 / 999985 / 999990 | 宝箱を開く, chests | 0 | Chest |
+//! | 205010 / 205011, -1 | 寺 エレベーター レバー, the temple lift levers | 0 | Other |
+//! | 205100 / 205101 / 252555, -1 | bells | 0 / 2 | Other |
+//! | 90070-90076 | どんでん返し, rotating walls | 0 | Other |
+//! | 90060-90066 | どんでん床, rotating floors | 2 | Other |
+//! | 1100000 | 窓, the meditation room windows (61110703 / 61110705, EMEVD 11115614 shuts them) | 2 | Other |
+//! | 109950 / -1 | hidden tatami | 2 | Other |
+//!
+//! The door rows all use a door player animation (700200-700330) and, where an EMEVD uses
+//! them, the door templates 20005615 / 20005616 (or a plot `ForceUseObjact`); levers, bells,
+//! walls, floors and windows have their own animations (7104xx-7108xx, 7110xx) and no door
+//! template. `sync_objact = 1` syncs Door and Chest of any state class; Other only with 2.
+//!
+//! One-loop doors [VAR, Ghidra copy `E:\RE\ghidra_doors2`]: `vt[4]` `0x6B64A0` toggles the
+//! flag (`SetEventFlag(f, !f)`) on every local start, `vt[5]` `0x6B6810` sets it to the value,
+//! and the animation the request asks for, `0x6B1DE0` = `vt[8]` + `row.objAnimId`, has
+//! `vt[8]` = `0x6B6B40` = 0: EVERY execution plays the same opening animation, there is no
+//! "close" animation. The flag is a use parity; vanilla never uses one twice because
+//! 20005616 disables the ObjAct after its `ObjActEventFlag` and the load restores the object
+//! from the flag (20005616 does not `ReproduceObjectAnimation`, 20005615 for flagless
+//! one-state doors does) [ARV]. So for a one-loop door "open" = flag ON, and a player who
+//! uses a door whose flag is already on (the friend's flag arrived, the object did not move)
+//! switches it OFF: after the next load the door is closed and its ObjAct disabled (live
+//! 2026-11-12, flag 61110602). Guard 5 below undoes that toggle.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -77,6 +119,8 @@ pub(crate) const INFO_HANDLE: usize = 0x50;
 pub(crate) const INFO_RUN_STATE: usize = 0x54;
 pub(crate) const INFO_STATE: usize = 0x88;
 pub(crate) const INFO_SUB: usize = 0xAC;
+/// ObjActParam id of the info [VAR, objact.rs header].
+pub(crate) const INFO_PARAM_ID: usize = 0x78;
 pub(crate) const STATE_FLAG: usize = 0x10;
 /// State vtables (RVA) and their class.
 pub(crate) const STATE_VTS: [(usize, Class); 4] = [
@@ -133,6 +177,28 @@ impl Class {
     }
 }
 
+/// What an ObjAct is, by its ObjActParam id (table in the header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Door,
+    Chest,
+    /// Levers, lifts, bells, rotating walls / floors, windows, hidden tatami, unknown rows.
+    Other,
+}
+
+pub(crate) fn kind(param: i32) -> Kind {
+    match param {
+        999_900..=999_979 | 101_050 => Kind::Door,
+        999_980..=999_999 => Kind::Chest,
+        _ => Kind::Other,
+    }
+}
+
+/// A one-loop door: every execution opens it, its flag ON = open (header).
+pub(crate) fn loop_door(class: Option<Class>, param: i32) -> bool {
+    class == Some(Class::OneLoop) && kind(param) == Kind::Door
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Door {
     block: usize,
@@ -141,6 +207,14 @@ struct Door {
     flag: u32,
     handle: u32,
     running: bool,
+    class: Class,
+    param: i32,
+}
+
+impl Door {
+    fn loop_door(&self) -> bool {
+        loop_door(Some(self.class), self.param)
+    }
 }
 
 /// What one walk saw (diagnostics).
@@ -256,9 +330,9 @@ fn scan(mem: &impl Mem, base: usize) -> (Vec<Door>, Report) {
                 Some(Class::OneLoop) => r.one_loop += 1,
                 Some(Class::OneDirDoor) => r.one_dir += 1,
             }
-            if !class.is_some_and(Class::has_flag) {
+            let Some(class) = class.filter(|c| c.has_flag()) else {
                 continue;
-            }
+            };
             if le_u32(&info, INFO_SUB) != 0 {
                 r.subs += 1;
                 continue;
@@ -276,6 +350,8 @@ fn scan(mem: &impl Mem, base: usize) -> (Vec<Door>, Report) {
                 flag,
                 handle: le_u32(&info, INFO_HANDLE),
                 running: le_u32(&info, INFO_RUN_STATE) == RUN_EXECUTING,
+                class,
+                param: le_u32(&info, INFO_PARAM_ID) as i32,
             });
         }
     }
@@ -309,6 +385,12 @@ fn ignore_off_decision(on: bool, here_on: Option<bool>, known_door: bool, rest_q
     !on && here_on == Some(true) && known_door && !rest_quiet
 }
 
+/// Guard 5: our own write switched `id` OFF; put it back on? Only a one-loop door's flag that
+/// our own player's start toggled off (it was on: the door opened, nothing closed).
+pub(crate) fn keep_open_loop_decision(loop_door: bool, own_toggle_off: bool) -> bool {
+    loop_door && own_toggle_off
+}
+
 /// Door flags are map flags (group 1 / 2) [ARV from the live ids].
 pub(crate) fn map_flag(id: u32) -> bool {
     matches!(id / 10_000_000 % 10, 1 | 2)
@@ -328,6 +410,10 @@ struct State {
     friend_on: HashSet<u32>,
     /// Flags of flag-bearing ObjAct states seen by any walk (static game data).
     door_flags: HashSet<u32>,
+    /// The subset that belongs to one-loop doors (`loop_door`).
+    loop_doors: HashSet<u32>,
+    /// Guard 5 writes so far.
+    loop_kept_on: u32,
     /// Fallback door flags: friend ON right after its ObjAct animation.
     candidates: HashSet<u32>,
     /// Friend door flags waiting for the replay (flag, applied at).
@@ -358,6 +444,31 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(State::default))
+}
+
+/// Guard 5: one-loop door flags our own player's start toggled from ON to OFF (objact.rs's
+/// `0x6BA7B0` detour, game thread), and when. Its own lock: the detour may run while `STATE`
+/// is held further up the stack.
+static OWN_LOOP_OFF: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
+/// world.rs sees the write in the same or the next frames (ring) or at its next flag diff.
+const OWN_LOOP_OFF_FOR: Duration = Duration::from_secs(30);
+
+/// objact.rs's detour: our player started one-loop door `flag` and it went ON -> OFF.
+pub(crate) fn note_own_loop_toggle(flag: u32) {
+    let now = Instant::now();
+    let mut v = OWN_LOOP_OFF.lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|&(f, t)| f != flag && now.duration_since(t) < OWN_LOOP_OFF_FOR);
+    if v.len() < 32 {
+        v.push((flag, now));
+    }
+}
+
+/// Takes `flag`'s note (one write back per toggle).
+fn take_own_loop_toggle(flag: u32, now: Instant) -> bool {
+    let mut v = OWN_LOOP_OFF.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = v.iter().any(|&(f, t)| f == flag && now.duration_since(t) < OWN_LOOP_OFF_FOR);
+    v.retain(|&(f, t)| f != flag && now.duration_since(t) < OWN_LOOP_OFF_FOR);
+    hit
 }
 
 fn note_log(s: &mut State, line: impl FnOnce() -> String) {
@@ -402,6 +513,7 @@ fn doors() -> Vec<Door> {
     let (all, r) = scan(&GameMem, game::module_base());
     with(|s| {
         s.door_flags.extend(all.iter().map(|d| d.flag));
+        s.loop_doors.extend(all.iter().filter(|d| d.loop_door()).map(|d| d.flag));
         if let Some(step) = r.fail {
             if !s.fails_logged.contains(&step) && s.fails_logged.len() < 8 {
                 s.fails_logged.push(step);
@@ -480,9 +592,12 @@ pub(crate) fn object_view(block: usize, slot: i32, index: i32, handle: u32, stat
     Some(ObjView { obj, anim, playing: flags & 4 != 0, want: req[6] })
 }
 
-/// The object of `d` already shows the animation the "opened" execution would play.
-fn looks_open(d: &Door) -> Option<bool> {
-    object_view(d.block, d.slot, d.index, d.handle, 1).map(|v| v.done())
+/// The object of `d` already shows the animation the "opened" execution would play. A
+/// one-loop door counts once it is at that animation, playing or ended (`reached`: every
+/// execution plays it, a door loaded open from its flag keeps it) [ARV]; the others need it
+/// playing (`done`, the game's own check), as before.
+fn open_decision(loop_door: bool, v: &ObjView) -> bool {
+    if loop_door { v.reached() } else { v.done() }
 }
 
 /// Opens `d` like the game replays a friend's ObjAct, unless it is open or running.
@@ -490,7 +605,8 @@ fn open_if_closed(s: &mut State, d: &Door, why: &str) -> bool {
     if d.running || !crate::game::event_flag(d.flag).unwrap_or(false) {
         return false;
     }
-    match looks_open(d) {
+    let view = object_view(d.block, d.slot, d.index, d.handle, 1);
+    match view.map(|v| open_decision(d.loop_door(), &v)) {
         Some(false) => {}
         Some(true) => return false,
         None => {
@@ -498,6 +614,7 @@ fn open_if_closed(s: &mut State, d: &Door, why: &str) -> bool {
             return false;
         }
     }
+    let seen = view.map_or(String::new(), |v| format!("; object anim {} playing {}, the open execution plays {}", v.anim, v.playing, v.want));
     // objact.rs replayed this ObjAct a moment ago (the friend's 0xA7): no second 0x6BA910.
     if crate::objact::replayed_recently(d.block, d.index) {
         return false;
@@ -512,8 +629,14 @@ fn open_if_closed(s: &mut State, d: &Door, why: &str) -> bool {
     let n = s.replays;
     note_log(s, || {
         format!(
-            "doors: {why}: door flag {} is on but its door (handle {:#x}, block slot {}, index {}) was closed here: opened (0x6BA910 ok = {ok}, {} so far)",
-            d.flag, d.handle, d.slot, d.index, n
+            "doors: {why}: door flag {} is on but its door (handle {:#x}, block slot {}, index {}, {}ObjActParam {}) was closed here: opened (0x6BA910 ok = {ok}, {} so far){seen}",
+            d.flag,
+            d.handle,
+            d.slot,
+            d.index,
+            if d.loop_door() { "one-loop door, " } else { "" },
+            d.param,
+            n
         )
     });
     ok
@@ -529,11 +652,19 @@ fn add_candidate(s: &mut State, id: u32, why: &str) {
 
 /// world.rs: a friend's flag was applied here.
 pub fn friend_flag(id: u32, on: bool) {
-    if !on || !map_flag(id) {
+    if !on {
         return;
     }
     let now = Instant::now();
     with(|s| {
+        // A one-loop door's MSB flag (guard 5): replayed like a map door flag when its door is
+        // loaded and closed here; no candidates, no guard 2 / 3 for it.
+        if !map_flag(id) {
+            if s.loop_doors.contains(&id) && s.pending.len() < 256 && !s.pending.iter().any(|(f, _)| *f == id) {
+                s.pending.push((id, now));
+            }
+            return;
+        }
         if s.door_flags.contains(&id) {
             s.friend_on.insert(id);
         }
@@ -556,7 +687,25 @@ pub fn friend_flag(id: u32, on: bool) {
 pub fn keep_open(id: u32) -> bool {
     let now = Instant::now();
     let quiet = rest_quiet(now);
+    let own_toggle = take_own_loop_toggle(id, now);
     with(|s| {
+        // Guard 5 (no rest window: a rest never resets these MSB flags; a script's OFF, e.g.
+        // m11_00 11100600 closing gate 61100610, is no start of ours and is not noted).
+        if keep_open_loop_decision(s.loop_doors.contains(&id), own_toggle) {
+            s.loop_kept_on += 1;
+            log::line(&format!(
+                "doors: our player used one-loop door {id} whose flag was on already (the friend opened it, our object had not moved): its toggle switched the flag off, kept on ({} so far)",
+                s.loop_kept_on
+            ));
+            return true;
+        }
+        if own_toggle {
+            log::line(&format!("doors: our start toggled one-loop door flag {id} off, but no walk has seen that door yet: not kept on"));
+        }
+        // Guard 2 never for one-loop doors: their OFF without a start of ours is a script's.
+        if s.loop_doors.contains(&id) {
+            return false;
+        }
         if !keep_open_decision(s.friend_on.contains(&id), known_door(s, id), quiet) {
             return false;
         }
@@ -760,6 +909,9 @@ mod tests {
             arr[at + INFO_INDEX..at + INFO_INDEX + 4].copy_from_slice(&idx.unwrap_or(i as u32).to_le_bytes());
             arr[at + INFO_HANDLE..at + INFO_HANDLE + 4].copy_from_slice(&(0x100 + i as u32).to_le_bytes());
             arr[at + INFO_SUB..at + INFO_SUB + 4].copy_from_slice(&sub.to_le_bytes());
+            // ObjActParam: a gate row for the one-loop info, a lever row for the others.
+            let param: i32 = if vt == 0x298B6E0 { 999_900 } else { 205_011 };
+            arr[at + INFO_PARAM_ID..at + INFO_PARAM_ID + 4].copy_from_slice(&param.to_le_bytes());
             if vt != 0 {
                 let st = STATES + 0x100 * i;
                 arr[at + INFO_STATE..at + INFO_STATE + 8].copy_from_slice(&(st as u64).to_le_bytes());
@@ -794,10 +946,66 @@ mod tests {
         let (doors, r) = scan(&m, BASE);
         let flags: Vec<u32> = doors.iter().map(|d| d.flag).collect();
         assert_eq!(flags, vec![21005024, 11000670, 11000671]);
-        assert_eq!(doors[0], Door { block: BLOCKS + BLOCK_STRIDE, slot: 7, index: 1, flag: 21005024, handle: 0x101, running: false });
+        assert_eq!(
+            doors[0],
+            Door { block: BLOCKS + BLOCK_STRIDE, slot: 7, index: 1, flag: 21005024, handle: 0x101, running: false, class: Class::Door, param: 205_011 }
+        );
+        // The one-loop gate (ObjActParam 999900) is the only one-loop door.
+        assert_eq!((doors[1].class, doors[1].param, doors[1].loop_door()), (Class::OneLoop, 999_900, true));
+        assert!(!doors[0].loop_door() && !doors[2].loop_door());
         assert_eq!((r.man, r.blocks, r.loaded, r.infos), (MAN, 2, 1, 11));
         assert_eq!((r.one, r.door, r.one_loop, r.one_dir, r.no_state, r.other), (1, 4, 1, 3, 1, 1));
         assert_eq!((r.subs, r.bad, r.fail), (3, 2, None));
+    }
+
+    /// Every ObjActParam id placed in a Sekiro MSB (objacts.md section 2) and its kind.
+    #[test]
+    fn kind_of_every_msb_objact_param() {
+        let doors = [
+            999_900, 999_901, 999_910, 999_911, 999_920, 999_921, 999_922, 999_940, 999_941, 999_945, 999_946, 999_950, 999_960, 999_970, 999_971,
+            999_975, 999_976, 101_050,
+        ];
+        for p in doors {
+            assert_eq!(kind(p), Kind::Door, "{p}");
+        }
+        for p in [999_980, 999_985, 999_990] {
+            assert_eq!(kind(p), Kind::Chest, "{p}");
+        }
+        // Levers, bells, rotating walls / floors, windows, hidden tatami (-1), garbage.
+        for p in [205_010, 205_011, 205_100, 205_101, 252_555, 90_060, 90_061, 90_071, 90_075, 90_076, 1_100_000, 109_950, -1, 0, 10_000] {
+            assert_eq!(kind(p), Kind::Other, "{p}");
+        }
+        // One-loop + door row = one-loop door; the same row in another class is not.
+        assert!(loop_door(Some(Class::OneLoop), 999_900));
+        assert!(loop_door(Some(Class::OneLoop), 999_975));
+        assert!(!loop_door(Some(Class::OneLoop), 1_100_000));
+        assert!(!loop_door(Some(Class::OneLoop), 252_555));
+        assert!(!loop_door(Some(Class::One), 999_941));
+        assert!(!loop_door(None, 999_900));
+    }
+
+    #[test]
+    fn guard_5_only_after_our_own_toggle_of_a_loop_door() {
+        assert!(keep_open_loop_decision(true, true));
+        // A script's OFF (no start of ours), or not a one-loop door.
+        assert!(!keep_open_loop_decision(true, false));
+        assert!(!keep_open_loop_decision(false, true));
+        let now = Instant::now();
+        note_own_loop_toggle(61_110_602);
+        assert!(!take_own_loop_toggle(61_110_603, now));
+        assert!(take_own_loop_toggle(61_110_602, Instant::now()));
+        // Used up: one write back per toggle.
+        assert!(!take_own_loop_toggle(61_110_602, Instant::now()));
+    }
+
+    #[test]
+    fn a_loop_door_at_its_animation_counts_as_open() {
+        let v = |anim, playing| ObjView { obj: 0x1000, anim, playing, want: 1 };
+        assert!(open_decision(true, &v(1, false)) && open_decision(true, &v(1, true)));
+        assert!(!open_decision(true, &v(0, false)));
+        // Other classes as before: playing that animation.
+        assert!(open_decision(false, &v(1, true)));
+        assert!(!open_decision(false, &v(1, false)));
     }
 
     #[test]

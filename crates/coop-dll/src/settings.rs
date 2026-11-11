@@ -627,10 +627,11 @@ share_pickups = 1
 ;     buys does not use up your stock. 0 = the stock count is shared (the old behaviour).
 ;     Takes effect at the next start.
 shop_stock_per_player = 1
-; 1 = a door, gate or lever one of you opens is opened in the other's game too (the object
+; 1 = a door, gate or chest one of you opens is opened in the other's game too (the object
 ;     itself, not only its event flag), when that part of the map is loaded there. Both
-;     players need 1. Experimental. 2 = also one-loop objects (possibly lifts: a lift may
-;     move under a player standing on it). 0 = off (objects follow the flags after a reload).
+;     players need 1. Experimental. 2 = also levers, lifts, bells, rotating walls / floors
+;     and windows (a lift may move under a player standing on it). 0 = off (objects follow
+;     the flags after a reload).
 sync_objact = 1
 ; 1 = a boss fight the friend starts far from you (other area or over 60 m) does not
 ;     start in your world until you come near it; the kill still counts for you. 0 = off.

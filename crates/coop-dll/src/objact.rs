@@ -51,6 +51,28 @@
 //!   `MAX_JOURNAL`, never on disk). An info of a journaled ObjAct that is loaded, idle and
 //!   watched for `JOURNAL_SETTLE`, has not run since the load and whose object is not at that
 //!   animation is replayed and kicked once ("doors close again after a reload", issue #3).
+//!
+//! **What is synced** (2026-11-12, after the first live test): by `doors::kind` of the
+//! ObjActParam id, not by the state class (table in doors.rs: every Sekiro bar door and gate
+//! is a one-loop state, the temple lift levers are one-state). `sync_objact = 1`: Door and
+//! Chest of any class; 2: everything with a known class.
+//!
+//! **One-loop doors** (doors.rs header, [VAR] Ghidra): every execution plays the same
+//! opening animation and toggles the MSB flag, so "open" = flag ON and there is no closing
+//! execution (the door templates disable the ObjAct after it opened). Hence:
+//! - the target state of a one-loop door is always 1 (open), whatever the flag did; a
+//!   message with target 0 for one is refused;
+//! - receiver: replay `0x6BA910(.., 1)` (`vt[5]` SETS the flag to 1, no toggle) unless the
+//!   object is already at the opening animation (`reached`); whichever comes first, the
+//!   friend's flag (world.rs) or this message, the result is flag ON + door open, and the
+//!   other one is a no-op (flag already 1 / doors.rs `replayed_recently` / object reached);
+//! - sender: our player using a door whose flag is already ON (the friend's flag came, the
+//!   object did not move yet) toggles it OFF; the detour notes it and doors.rs guard 5 writes
+//!   it back ON without sending the OFF (live 2026-11-12: 61110602 ended OFF on both and the
+//!   gate would load closed with its ObjAct disabled);
+//! - never journaled: the engine sets the door up from its flag at every load (20005616 has
+//!   no `ReproduceObjectAnimation`) [ARV], so a reload converges by itself and a journal
+//!   replay could only fight a script (m11_00 11100600 closes gate 61100610 in phase 8301).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -59,8 +81,8 @@ use std::time::{Duration, Instant};
 
 use crate::doors::{
     self, BLOCK_DESC_SLOT, BLOCK_INFO_COUNT, BLOCK_INFOS, BLOCK_LOADED, BLOCK_STRIDE, Class, GameMem, INFO_HANDLE, INFO_INDEX,
-    INFO_RUN_STATE, INFO_STATE, INFO_STRIDE, INFO_SUB, MAN_BLOCK_COUNT, MAN_BLOCKS, MAX_BLOCKS, Mem, REPLAY_RVA, RUN_EXECUTING,
-    STATE_FLAG, STATE_VTS, WORLD_OBJACT_MAN, le_ptr, le_u32,
+    INFO_PARAM_ID, INFO_RUN_STATE, INFO_STATE, INFO_STRIDE, INFO_SUB, Kind, MAN_BLOCK_COUNT, MAN_BLOCKS, MAX_BLOCKS, Mem, REPLAY_RVA,
+    RUN_EXECUTING, STATE_FLAG, STATE_VTS, WORLD_OBJACT_MAN, kind, le_ptr, le_u32, loop_door,
 };
 use crate::game;
 use crate::hook;
@@ -68,7 +90,8 @@ use crate::log;
 use crate::net::{Dest, Net};
 use crate::peers::PeerId;
 
-/// `[GAMEPLAY] sync_objact`: 0 off, 1 doors / gates / chests (default), 2 also one-loop states.
+/// `[GAMEPLAY] sync_objact`: 0 off, 1 doors / gates / chests of any state class (default; by
+/// ObjActParam, `doors::kind`), 2 also levers, lifts, bells, rotating walls / floors, windows.
 pub static MODE: AtomicU8 = AtomicU8::new(1);
 /// `[DEBUG] objact_debug`: log every execution, every map flag, raw infos and prologues.
 pub static DEBUG: AtomicBool = AtomicBool::new(false);
@@ -107,7 +130,6 @@ const INFO_KICK: usize = 0x70;
 const INFO_B113: usize = 0x71;
 const INFO_B114: usize = 0x72;
 const INFO_ENTITY: usize = 0x0C;
-const INFO_PARAM_ID: usize = 0x78;
 const INFO_PARAM_ROW: usize = 0x80;
 /// Primary info of a door's sub infos [VAR, §37].
 const INFO_PRIMARY: usize = 0xB0;
@@ -158,6 +180,8 @@ const MAX_INFO_DUMPS: u32 = 8;
 const MAX_FLAGS: usize = 256;
 /// `0x6BA7B0` calls by another actor logged per load without `objact_debug`.
 const MAX_FOREIGN_LOGS: u32 = 5;
+/// Objects whose "no ObjActEntityID" line was logged (beyond: silent).
+const MAX_NO_ENTITY_LOGGED: usize = 256;
 
 /// One execution on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -433,16 +457,24 @@ struct Evidence {
     own_anim: bool,
 }
 
+/// Does `sync_objact = mode` sync an ObjAct of state `class` and ObjActParam `param` (Ok) or
+/// not (Err, why)? Mode 1: doors and chests of any class (`doors::kind`); 2: every known class.
+fn syncs(class: Option<Class>, param: i32, mode: u8) -> Result<(), &'static str> {
+    if class.is_none() {
+        return Err("unknown state class");
+    }
+    if mode >= 2 || kind(param) != Kind::Other {
+        return Ok(());
+    }
+    Err("not a door or chest by its ObjActParam (a lever, lift, bell, rotating wall / floor or window): synced only with sync_objact = 2")
+}
+
 /// Poll sender: send this execution (Ok, why) or not (Err, why).
-fn send_decision(e: Evidence, class: Option<Class>, mode: u8) -> Result<&'static str, &'static str> {
+fn send_decision(e: Evidence, class: Option<Class>, param: i32, mode: u8) -> Result<&'static str, &'static str> {
     if e.our_replay {
         return Err("our own replay of a friend's ObjAct (doors.rs / objact.rs)");
     }
-    match class {
-        None => return Err("unknown state class"),
-        Some(Class::OneLoop) if mode < 2 => return Err("one-loop state (a lift or a lever loop?): sent only with sync_objact = 2"),
-        _ => {}
-    }
+    syncs(class, param, mode)?;
     if e.b114_rose {
         return Ok("info+0x72 went 0 -> 1");
     }
@@ -456,7 +488,7 @@ fn send_decision(e: Evidence, class: Option<Class>, mode: u8) -> Result<&'static
 
 /// Hook sender: send our `0x6BA7B0` execution (Ok, why) or not (Err, why). `own` = our
 /// player's handle, `started` = the info's run state is 3 right after the call.
-fn hook_decision(class: Option<Class>, mode: u8, actor: i32, own: Option<i32>, started: bool) -> Result<&'static str, &'static str> {
+fn hook_decision(class: Option<Class>, param: i32, mode: u8, actor: i32, own: Option<i32>, started: bool) -> Result<&'static str, &'static str> {
     if mode == 0 {
         return Err("sync_objact = 0");
     }
@@ -468,16 +500,17 @@ fn hook_decision(class: Option<Class>, mode: u8, actor: i32, own: Option<i32>, s
     if !started {
         return Err("it did not start (request refused, or the object already plays that animation)");
     }
-    match class {
-        None => Err("unknown state class"),
-        Some(Class::OneLoop) if mode < 2 => Err("one-loop state (a lift or a lever loop?): sent only with sync_objact = 2"),
-        _ => Ok("our player started it (0x6BA7B0)"),
-    }
+    syncs(class, param, mode)?;
+    Ok("our player started it (0x6BA7B0)")
 }
 
-/// Value for the receiver's `0x6BA910`: a flag state toggles (the opposite of the flag before),
-/// a one-state takes 1 (its `vt[5]` ignores it).
-fn target_state(class: Option<Class>, flag_before: Option<bool>) -> u8 {
+/// Value for the receiver's `0x6BA910`: a one-loop door 1 (every execution opens it, the
+/// flag's toggle is a use parity: header), another flag state toggles (the opposite of the
+/// flag before), a one-state takes 1 (its `vt[5]` ignores it).
+fn target_state(class: Option<Class>, param: i32, flag_before: Option<bool>) -> u8 {
+    if loop_door(class, param) {
+        return 1;
+    }
     match (class.is_some_and(Class::has_flag), flag_before) {
         (true, Some(v)) => u8::from(!v),
         _ => 1,
@@ -519,17 +552,19 @@ enum Plan {
 }
 
 /// Receiver, before the object is looked at (`0x6BCBC0` is only called for `Replay`).
-fn receive_plan(class: Option<Class>, state: u8, mode: u8, h: Here) -> Result<Plan, &'static str> {
+fn receive_plan(class: Option<Class>, param: i32, state: u8, mode: u8, h: Here) -> Result<Plan, &'static str> {
     if mode == 0 {
         return Err("sync_objact = 0 here");
     }
     if state > 1 {
         return Err("target state is not 0 / 1 (bad message)");
     }
+    syncs(class, param, mode)?;
     match class {
-        None => return Err("unknown state class"),
         Some(Class::One) if state != 1 => return Err("one-state with target state 0 (bad message)"),
-        Some(Class::OneLoop) if mode < 2 => return Err("one-loop state (a lift or a lever loop?): replayed only with sync_objact = 2"),
+        Some(Class::OneLoop) if state == 0 && loop_door(class, param) => {
+            return Err("a one-loop door with target state 0: it has no closing execution (a flag toggle of a door that was open already)");
+        }
         Some(Class::Door | Class::OneDirDoor) if state == 0 => {
             return Err("a door's toggle back to closed: never replayed (doors.rs keeps door flags on)");
         }
@@ -629,14 +664,17 @@ impl Journal {
             return Err("no ObjActEntityID");
         }
         let pos = self.entries.iter().position(|x| x.map == e.map && x.entity == e.entity);
-        let keep = matches!(e.class, 0 | 1 | 4) && e.state == 1;
+        let other = kind(e.param) == Kind::Other;
+        let keep = matches!(e.class, 0 | 1 | 4) && e.state == 1 && !other;
         if !keep {
             if let Some(p) = pos {
                 self.entries.remove(p);
                 return Err("closed again: taken out of the journal");
             }
             return Err(match e.class {
+                2 if !other => "one-loop door (never journaled: the load sets it up from its flag)",
                 2 => "one-loop state (never journaled: a lift must not move after a reload)",
+                0 | 1 | 4 if other => "not a door or chest (never journaled: a lever or a rotating wall must not move after a reload)",
                 0 | 1 | 4 => "a door closing",
                 _ => "unknown state class",
             });
@@ -754,6 +792,8 @@ struct State {
     logged_sender: bool,
     /// `0x6BA7B0` calls with another actor logged since the load (without `objact_debug`).
     foreign_logged: u32,
+    /// doors.rs replays of infos without an ObjActEntityID already logged (flag or address).
+    no_entity_logged: HashSet<usize>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -804,18 +844,35 @@ pub fn kick_after_replay(block: usize, index: i32, who: &str) {
     }
     let Some((addr, key)) = info_in_game(block, index) else { return };
     let run = game::read::<u32>(addr + INFO_RUN_STATE);
-    let text = if run == Some(RUN_EXECUTING) {
-        with(|s| kick_text(s, addr, key))
-    } else {
-        format!("EMEVD not kicked: run state {run:?} after the replay (it did not start)")
-    };
-    log::line(&format!("objact: {who}'s replay (block {block:#x}, info index {index}): {text}"));
+    let entity = game::read::<i32>(addr + INFO_ENTITY);
+    let debug = DEBUG.load(Ordering::Relaxed);
+    let text = with(|s| {
+        // No ObjActEntityID (the meditation room windows, replayed by doors.rs after every
+        // load and rest): nothing to kick, said once per object (by its flag) and session.
+        if entity == Some(0) && !debug {
+            let flag = game::read_ptr(addr + INFO_STATE).and_then(|st| game::read::<u32>(st + STATE_FLAG));
+            let id = flag.filter(|&f| f != 0 && f != u32::MAX).map_or(addr, |f| f as usize);
+            if s.no_entity_logged.len() >= MAX_NO_ENTITY_LOGGED || !s.no_entity_logged.insert(id) {
+                return None;
+            }
+            return Some("EMEVD not kicked: no ObjActEntityID (no EMEVD can wait for it; said once per object)".to_owned());
+        }
+        Some(if run == Some(RUN_EXECUTING) {
+            kick_text(s, addr, key)
+        } else {
+            format!("EMEVD not kicked: run state {run:?} after the replay (it did not start)")
+        })
+    });
+    if let Some(text) = text {
+        log::line(&format!("objact: {who}'s replay (block {block:#x}, info index {index}): {text}"));
+    }
 }
 
 /// world.rs, a new session: the journal of the last one no longer counts.
 pub fn new_session() {
     let n = with(|s| {
         s.incoming.clear();
+        s.no_entity_logged.clear();
         s.journal.dropped = 0;
         s.journal.clear()
     });
@@ -883,8 +940,15 @@ pub fn install() {
     }
 }
 
-/// The run state and the flag (flag classes) of info `index` before the local start.
-fn pre_start(block: usize, index: i32) -> Option<(u32, Option<bool>)> {
+/// Info `index` before the local start: run state, the flag value (flag classes) and, for a
+/// one-loop door, its flag id.
+struct PreStart {
+    run: u32,
+    flag_before: Option<bool>,
+    loop_door_flag: Option<u32>,
+}
+
+fn pre_start(block: usize, index: i32) -> Option<PreStart> {
     let mem = GameMem;
     let n = mem.i32(block + BLOCK_INFO_COUNT)?;
     if index < 0 || index >= n {
@@ -892,8 +956,16 @@ fn pre_start(block: usize, index: i32) -> Option<(u32, Option<bool>)> {
     }
     let addr = mem.ptr(block + BLOCK_INFOS)? + INFO_STRIDE * index as usize;
     let run = mem.u32(addr + INFO_RUN_STATE)?;
-    let flag = mem.ptr(addr + INFO_STATE).and_then(|st| class_of(&mem, game::module_base(), st).and_then(|c| flag_of(&mem, st, c)));
-    Some((run, flag.and_then(game::event_flag)))
+    let state = mem.ptr(addr + INFO_STATE);
+    let class = state.and_then(|st| class_of(&mem, game::module_base(), st));
+    let flag = state.zip(class).and_then(|(st, c)| flag_of(&mem, st, c));
+    let param = mem.i32(addr + INFO_PARAM_ID).unwrap_or(-1);
+    Some(PreStart { run, flag_before: flag.and_then(game::event_flag), loop_door_flag: flag.filter(|_| loop_door(class, param)) })
+}
+
+/// Guard 5 (doors.rs): our player's start switched a one-loop door's flag from ON to OFF.
+fn own_loop_toggle_off(actor: i32, own: Option<i32>, before: Option<bool>, after: Option<bool>) -> bool {
+    own == Some(actor) && before == Some(true) && after == Some(false)
 }
 
 /// `0x6BA7B0(block, index, actor)`: the original runs unchanged; what it was called on goes
@@ -908,7 +980,14 @@ extern "C" fn own_start_detour(block: usize, index: i32, actor: i32) -> u64 {
     let pre = pre_start(block, index);
     let original: extern "C" fn(usize, i32, i32) -> u64 = unsafe { std::mem::transmute(t) };
     let ret = original(block, index, actor);
-    if let Some((run_before, flag_before)) = pre {
+    if let Some(PreStart { run: run_before, flag_before, loop_door_flag }) = pre {
+        // Noted here, before world.rs's flag ring sees the toggle's write (same frame).
+        if let Some(f) = loop_door_flag {
+            let own = game::player().and_then(|p| game::read::<i32>(p.0 + CHR_HANDLE));
+            if own_loop_toggle_off(actor, own, flag_before, game::event_flag(f)) {
+                doors::note_own_loop_toggle(f);
+            }
+        }
         let mut q = HOOK_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         if q.events.len() < MAX_HOOK_EVENTS {
             q.events.push(OwnStart { block, index, actor, run_before, flag_before, caller, at: Instant::now() });
@@ -1229,7 +1308,7 @@ fn own_start(s: &mut State, base: usize, ev: OwnStart, mode: u8, debug: bool, no
     let own = game::player().and_then(|p| game::read::<i32>(p.0 + CHR_HANDLE));
     let started = i.run == RUN_EXECUTING;
     let key = i.objact_key();
-    let verdict = hook_decision(class, mode, ev.actor, own, started);
+    let verdict = hook_decision(class, i.param, mode, ev.actor, own, started);
     // Another character's execution (NPC, script): the first few lines per load show whether
     // our handle (chr+0x08) is read right; the rest only when debugging.
     if !debug && own != Some(ev.actor) {
@@ -1238,7 +1317,7 @@ fn own_start(s: &mut State, base: usize, ev: OwnStart, mode: u8, debug: bool, no
         }
         s.foreign_logged += 1;
     }
-    let state = target_state(class, ev.flag_before);
+    let state = target_state(class, i.param, ev.flag_before);
     let mut msg = None;
     let decision: Result<u32, &str> = match verdict {
         Err(why) => Err(why),
@@ -1269,8 +1348,13 @@ fn own_start(s: &mut State, base: usize, ev: OwnStart, mode: u8, debug: bool, no
     };
     let flag = class.and_then(|c| flag_of(&mem, i.state, c));
     let fmt_flag = |v: Option<bool>| v.map_or("?".to_owned(), |b| b.to_string());
+    let door_note = match (loop_door(class, i.param), ev.flag_before) {
+        (true, Some(true)) => "; one-loop door whose flag was on already (the friend's flag came, our object had not moved): doors.rs guard 5 puts the toggled flag back on",
+        (true, _) => "; one-loop door",
+        _ => "",
+    };
     log::line(&format!(
-        "objact: we used ObjAct: map {} (block slot {}, info index {}, sub {}), ObjActEntityID {}, ObjActParam {}, {} state, flag {} before {} now {}, run state {} -> {}, actor {} (our player {}), caller {}; {}; {journaled}",
+        "objact: we used ObjAct: map {} (block slot {}, info index {}, sub {}), ObjActEntityID {}, ObjActParam {}, {} state, flag {} before {} now {}, run state {} -> {}, actor {} (our player {}), caller {}; {}; {journaled}{door_note}",
         map_name(b.map),
         b.slot,
         i.index,
@@ -1339,7 +1423,7 @@ fn decide(s: &mut State, now: Instant, mode: u8, debug: bool, by_hook: bool) -> 
         }
         let own = s.own_objact.filter(|&(_, t)| near(t, e.at, OWN_ANIM_NEAR));
         let ev = Evidence { our_replay: e.replay, b114_rose: e.prev_b114 != 1 && b114_now == 1, b114_now: b114_now == 1, own_anim: own.is_some() };
-        let verdict = send_decision(ev, e.class, mode);
+        let verdict = send_decision(ev, e.class, e.info.param, mode);
         if !debug && !ev.our_replay && !ev.b114_now && !ev.own_anim {
             continue;
         }
@@ -1353,7 +1437,7 @@ fn decide(s: &mut State, now: Instant, mode: u8, debug: bool, by_hook: bool) -> 
             .flag
             .and_then(|f| s.flags.iter().rev().find(|&&(t, id, _)| id == f && t + Duration::from_millis(500) >= e.at).map(|&(_, _, on)| !on))
             .or(e.flag_at_edge);
-        let state = target_state(e.class, flag_before);
+        let state = target_state(e.class, e.info.param, flag_before);
         let key = e.info.objact_key();
         let decision: Result<u32, &str> = match verdict {
             Err(why) => Err(why),
@@ -1531,7 +1615,7 @@ fn apply(s: &mut State, base: usize, now: Instant, mode: u8) {
         let key = i.objact_key();
         let here = here_of(s, &i, now);
         let state = u32::from(m.state);
-        let plan = receive_plan(class, m.state, mode, here);
+        let plan = receive_plan(class, i.param, m.state, mode, here);
         // 0x6BCBC0 only for a known class and a valid state (the plan checks both).
         let view = if plan == Ok(Plan::Replay) { doors::object_view(b.addr, b.slot, i.index, i.handle, state) } else { None };
         let what = match plan {
@@ -1599,7 +1683,7 @@ fn journal_check(s: &mut State, base: usize, now: Instant, mode: u8, debug: bool
         let class = class_of(&mem, base, i.state);
         let here = here_of(s, &i, now);
         let who = if e.ours { "our" } else { "a peer's" };
-        let what = match receive_plan(class, e.state, mode, here) {
+        let what = match receive_plan(class, i.param, e.state, mode, here) {
             Ok(Plan::Replay) => {
                 let view = doors::object_view(b.addr, b.slot, i.index, i.handle, u32::from(e.state));
                 match object_decision(view.map(|v| v.reached())) {
@@ -1693,6 +1777,13 @@ mod tests {
             true
         }
     }
+
+    /// ObjActParam rows: a HUB door (one-state in the MSB), the m11_01 gate 1113602 (one-loop),
+    /// the temple lift lever (one-state), the meditation room window (one-loop).
+    const DOOR: i32 = 999_941;
+    const GATE: i32 = 999_900;
+    const LEVER: i32 = 205_011;
+    const WINDOW: i32 = 1_100_000;
 
     const BASE: usize = 0x1_4000_0000;
     const MAN: usize = 0x10_0000;
@@ -1856,7 +1947,7 @@ mod tests {
     #[test]
     fn echo_of_our_replay_is_never_sent() {
         let e = Evidence { our_replay: true, b114_rose: true, b114_now: true, own_anim: true };
-        assert!(send_decision(e, Some(Class::One), 1).is_err());
+        assert!(send_decision(e, Some(Class::One), DOOR, 1).is_err());
         let mut s = State::default();
         let now = Instant::now();
         let sub = info(0x2000_0130, 0x2000_0000);
@@ -1882,74 +1973,74 @@ mod tests {
     #[test]
     fn poll_send_needs_more_than_our_animation() {
         let ev = |b114_rose, b114_now, own_anim| Evidence { our_replay: false, b114_rose, b114_now, own_anim };
-        assert!(send_decision(ev(false, false, true), Some(Class::One), 1).is_err());
-        assert!(send_decision(ev(false, true, false), Some(Class::One), 1).is_err());
-        assert!(send_decision(ev(false, true, true), Some(Class::One), 1).is_ok());
-        assert!(send_decision(ev(true, true, false), Some(Class::Door), 1).is_ok());
-        assert!(send_decision(ev(false, false, false), Some(Class::One), 1).is_err());
-        assert!(send_decision(ev(true, true, true), Some(Class::OneLoop), 1).is_err());
-        assert!(send_decision(ev(true, true, true), Some(Class::OneLoop), 2).is_ok());
-        assert!(send_decision(ev(true, true, true), None, 2).is_err());
+        assert!(send_decision(ev(false, false, true), Some(Class::One), DOOR, 1).is_err());
+        assert!(send_decision(ev(false, true, false), Some(Class::One), DOOR, 1).is_err());
+        assert!(send_decision(ev(false, true, true), Some(Class::One), DOOR, 1).is_ok());
+        assert!(send_decision(ev(true, true, false), Some(Class::Door), DOOR, 1).is_ok());
+        assert!(send_decision(ev(false, false, false), Some(Class::One), DOOR, 1).is_err());
+        assert!(send_decision(ev(true, true, true), Some(Class::OneLoop), LEVER, 1).is_err());
+        assert!(send_decision(ev(true, true, true), Some(Class::OneLoop), LEVER, 2).is_ok());
+        assert!(send_decision(ev(true, true, true), None, DOOR, 2).is_err());
     }
 
     #[test]
     fn hook_sends_only_our_players_started_execution() {
         let me = Some(0x1000_0001);
-        assert!(hook_decision(Some(Class::One), 1, 0x1000_0001, me, true).is_ok());
-        assert!(hook_decision(Some(Class::Door), 1, 0x1000_0001, me, true).is_ok());
+        assert!(hook_decision(Some(Class::One), DOOR, 1, 0x1000_0001, me, true).is_ok());
+        assert!(hook_decision(Some(Class::Door), DOOR, 1, 0x1000_0001, me, true).is_ok());
         // An NPC / script chr, an unknown own handle, a refused start.
-        assert!(hook_decision(Some(Class::One), 1, 0x1000_0002, me, true).is_err());
-        assert!(hook_decision(Some(Class::One), 1, -1, me, true).is_err());
-        assert!(hook_decision(Some(Class::One), 1, 0x1000_0001, None, true).is_err());
-        assert!(hook_decision(Some(Class::One), 1, 0x1000_0001, me, false).is_err());
+        assert!(hook_decision(Some(Class::One), DOOR, 1, 0x1000_0002, me, true).is_err());
+        assert!(hook_decision(Some(Class::One), DOOR, 1, -1, me, true).is_err());
+        assert!(hook_decision(Some(Class::One), DOOR, 1, 0x1000_0001, None, true).is_err());
+        assert!(hook_decision(Some(Class::One), DOOR, 1, 0x1000_0001, me, false).is_err());
         // Off, one-loop below mode 2, unknown class.
-        assert!(hook_decision(Some(Class::One), 0, 0x1000_0001, me, true).is_err());
-        assert!(hook_decision(Some(Class::OneLoop), 1, 0x1000_0001, me, true).is_err());
-        assert!(hook_decision(Some(Class::OneLoop), 2, 0x1000_0001, me, true).is_ok());
-        assert!(hook_decision(None, 2, 0x1000_0001, me, true).is_err());
+        assert!(hook_decision(Some(Class::One), DOOR, 0, 0x1000_0001, me, true).is_err());
+        assert!(hook_decision(Some(Class::OneLoop), LEVER, 1, 0x1000_0001, me, true).is_err());
+        assert!(hook_decision(Some(Class::OneLoop), LEVER, 2, 0x1000_0001, me, true).is_ok());
+        assert!(hook_decision(None, DOOR, 2, 0x1000_0001, me, true).is_err());
     }
 
     #[test]
     fn target_state_toggles_flag_states_only() {
-        assert_eq!(target_state(Some(Class::Door), Some(false)), 1);
-        assert_eq!(target_state(Some(Class::Door), Some(true)), 0);
-        assert_eq!(target_state(Some(Class::OneLoop), Some(false)), 1);
-        assert_eq!(target_state(Some(Class::Door), None), 1);
-        assert_eq!(target_state(Some(Class::One), Some(true)), 1);
-        assert_eq!(target_state(None, Some(true)), 1);
+        assert_eq!(target_state(Some(Class::Door), DOOR, Some(false)), 1);
+        assert_eq!(target_state(Some(Class::Door), DOOR, Some(true)), 0);
+        assert_eq!(target_state(Some(Class::OneLoop), LEVER, Some(false)), 1);
+        assert_eq!(target_state(Some(Class::Door), DOOR, None), 1);
+        assert_eq!(target_state(Some(Class::One), DOOR, Some(true)), 1);
+        assert_eq!(target_state(None, DOOR, Some(true)), 1);
     }
 
     #[test]
     fn plan_replays_kicks_or_refuses() {
-        assert_eq!(receive_plan(Some(Class::One), 1, 1, here()), Ok(Plan::Replay));
-        assert_eq!(receive_plan(Some(Class::Door), 1, 1, here()), Ok(Plan::Replay));
+        assert_eq!(receive_plan(Some(Class::One), DOOR, 1, 1, here()), Ok(Plan::Replay));
+        assert_eq!(receive_plan(Some(Class::Door), DOOR, 1, 1, here()), Ok(Plan::Replay));
         // Already ran here as a replay (type 45): only the kick.
-        assert_eq!(receive_plan(Some(Class::One), 1, 1, Here { executing: true, ..here() }), Ok(Plan::KickOnly));
-        assert_eq!(receive_plan(Some(Class::One), 1, 1, Here { executed: true, idle: Some(false), ..here() }), Ok(Plan::KickOnly));
+        assert_eq!(receive_plan(Some(Class::One), DOOR, 1, 1, Here { executing: true, ..here() }), Ok(Plan::KickOnly));
+        assert_eq!(receive_plan(Some(Class::One), DOOR, 1, 1, Here { executed: true, idle: Some(false), ..here() }), Ok(Plan::KickOnly));
         // Ran as a local start (kicked by the game), by our own player, or kicked already.
-        assert!(receive_plan(Some(Class::One), 1, 1, Here { executed: true, local_start: true, ..here() }).is_err());
-        assert!(receive_plan(Some(Class::One), 1, 1, Here { executed: true, ours: true, ..here() }).is_err());
-        assert!(receive_plan(Some(Class::One), 1, 1, Here { executed: true, kicked: true, ..here() }).is_err());
-        assert!(receive_plan(Some(Class::One), 1, 1, Here { kicked: true, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 1, 1, Here { executed: true, local_start: true, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 1, 1, Here { executed: true, ours: true, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 1, 1, Here { executed: true, kicked: true, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 1, 1, Here { kicked: true, ..here() }).is_err());
         // Marks and one replay per load.
-        assert!(receive_plan(Some(Class::Door), 1, 1, Here { marked: true, ..here() }).is_err());
-        assert!(receive_plan(Some(Class::One), 1, 1, Here { replayed: true, executed: true, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::Door), DOOR, 1, 1, Here { marked: true, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 1, 1, Here { replayed: true, executed: true, ..here() }).is_err());
         // Idle facts.
-        assert!(receive_plan(Some(Class::One), 1, 1, Here { idle: Some(false), ..here() }).is_err());
-        assert!(receive_plan(Some(Class::One), 1, 1, Here { idle: None, ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 1, 1, Here { idle: Some(false), ..here() }).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 1, 1, Here { idle: None, ..here() }).is_err());
     }
 
     #[test]
     fn plan_validates_state_class_and_mode() {
-        assert!(receive_plan(Some(Class::One), 1, 0, here()).is_err());
-        assert!(receive_plan(Some(Class::One), 2, 1, here()).is_err());
-        assert!(receive_plan(Some(Class::One), 255, 2, here()).is_err());
-        assert!(receive_plan(Some(Class::One), 0, 1, here()).is_err());
-        assert!(receive_plan(Some(Class::Door), 0, 2, here()).is_err());
-        assert!(receive_plan(Some(Class::OneDirDoor), 0, 2, here()).is_err());
-        assert!(receive_plan(None, 1, 2, here()).is_err());
-        assert!(receive_plan(Some(Class::OneLoop), 1, 1, here()).is_err());
-        assert_eq!(receive_plan(Some(Class::OneLoop), 0, 2, here()), Ok(Plan::Replay));
+        assert!(receive_plan(Some(Class::One), DOOR, 1, 0, here()).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 2, 1, here()).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 255, 2, here()).is_err());
+        assert!(receive_plan(Some(Class::One), DOOR, 0, 1, here()).is_err());
+        assert!(receive_plan(Some(Class::Door), DOOR, 0, 2, here()).is_err());
+        assert!(receive_plan(Some(Class::OneDirDoor), DOOR, 0, 2, here()).is_err());
+        assert!(receive_plan(None, DOOR, 1, 2, here()).is_err());
+        assert!(receive_plan(Some(Class::OneLoop), LEVER, 1, 1, here()).is_err());
+        assert_eq!(receive_plan(Some(Class::OneLoop), LEVER, 0, 2, here()), Ok(Plan::Replay));
         assert_eq!(object_decision(Some(false)), Ok(()));
         assert!(object_decision(Some(true)).is_err() && object_decision(None).is_err());
     }
@@ -2008,7 +2099,182 @@ mod tests {
         assert_eq!(journal_gate(Some(JOURNAL_SETTLE), false), Ok(()));
         assert!(journal_gate(Some(JOURNAL_SETTLE * 10), true).is_err());
         // What follows is the receiver's plan: replay only an idle info that did not run.
-        assert_eq!(receive_plan(Some(Class::One), 1, 1, here()), Ok(Plan::Replay));
+        assert_eq!(receive_plan(Some(Class::One), DOOR, 1, 1, here()), Ok(Plan::Replay));
+    }
+
+    #[test]
+    fn mode_1_syncs_doors_and_chests_of_any_class() {
+        // The live case: gate 1113602 (one-loop, ObjActParam 999900) goes out at mode 1.
+        assert!(syncs(Some(Class::OneLoop), GATE, 1).is_ok());
+        assert!(syncs(Some(Class::One), DOOR, 1).is_ok());
+        assert!(syncs(Some(Class::One), 999_980, 1).is_ok());
+        // Levers (one-state!), windows, bells, rotating walls / floors: only at mode 2.
+        for (c, p) in [(Class::One, LEVER), (Class::OneLoop, WINDOW), (Class::OneLoop, 252_555), (Class::One, 90_075), (Class::OneLoop, 90_061), (Class::One, -1)] {
+            assert!(syncs(Some(c), p, 1).is_err(), "{p}");
+            assert!(syncs(Some(c), p, 2).is_ok(), "{p}");
+        }
+        assert!(syncs(None, GATE, 2).is_err());
+        let me = Some(0x1000_0001);
+        assert!(hook_decision(Some(Class::OneLoop), GATE, 1, 0x1000_0001, me, true).is_ok());
+        assert!(hook_decision(Some(Class::One), LEVER, 1, 0x1000_0001, me, true).is_err());
+        let ev = Evidence { our_replay: false, b114_rose: true, b114_now: true, own_anim: true };
+        assert!(send_decision(ev, Some(Class::OneLoop), GATE, 1).is_ok());
+        assert!(send_decision(ev, Some(Class::OneLoop), WINDOW, 1).is_err());
+        assert_eq!(receive_plan(Some(Class::OneLoop), GATE, 1, 1, here()), Ok(Plan::Replay));
+        assert!(receive_plan(Some(Class::One), LEVER, 1, 1, here()).is_err());
+    }
+
+    #[test]
+    fn a_loop_door_always_targets_open() {
+        // The live case: the host used the gate whose flag (from the client) was on already.
+        assert_eq!(target_state(Some(Class::OneLoop), GATE, Some(true)), 1);
+        assert_eq!(target_state(Some(Class::OneLoop), GATE, Some(false)), 1);
+        assert_eq!(target_state(Some(Class::OneLoop), GATE, None), 1);
+        // A window (one-loop, not a door) keeps the toggle.
+        assert_eq!(target_state(Some(Class::OneLoop), WINDOW, Some(true)), 0);
+        // Target 0 for a one-loop door is refused at every mode; for a window at mode 2 it is not.
+        assert!(receive_plan(Some(Class::OneLoop), GATE, 0, 1, here()).is_err());
+        assert!(receive_plan(Some(Class::OneLoop), GATE, 0, 2, here()).is_err());
+        assert_eq!(receive_plan(Some(Class::OneLoop), WINDOW, 0, 2, here()), Ok(Plan::Replay));
+    }
+
+    #[test]
+    fn loop_doors_levers_and_walls_are_never_journaled() {
+        let mut j = Journal::default();
+        let e = |class, param| Entry { map: 0x0B01_0000, entity: 1_113_602, index: 9, sub: 0, param, class, state: 1, ours: true };
+        assert_eq!(j.note(e(2, GATE)), Err("one-loop door (never journaled: the load sets it up from its flag)"));
+        assert!(j.note(e(0, LEVER)).unwrap_err().starts_with("not a door or chest"));
+        assert!(j.note(e(0, 90_075)).is_err());
+        assert!(j.note(e(2, WINDOW)).unwrap_err().starts_with("one-loop state"));
+        assert!(j.entries.is_empty());
+        assert!(j.note(e(0, 999_980)).is_ok());
+        assert!(j.note(Entry { entity: 1_113_712, ..e(0, DOOR) }).is_ok());
+        assert_eq!(j.entries.len(), 2);
+    }
+
+    /// One player's view of a one-loop door: its MSB flag and whether the object is open.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Side {
+        flag: bool,
+        open: bool,
+        /// The world flag sync's last known value (world.rs `known`).
+        known: bool,
+    }
+
+    impl Side {
+        /// Our player's local start (`0x6BA7B0`): refused when the object is at the
+        /// animation; else it opens and toggles the flag; guard 5 (doors.rs) puts an OFF back
+        /// ON. Returns the message and the flag write the sync sends (None: none or quiet).
+        fn use_it(&mut self) -> Option<(u8, Option<bool>)> {
+            if self.open {
+                return None;
+            }
+            let before = self.flag;
+            self.open = true;
+            self.flag = !self.flag;
+            let mut sent = Some(self.flag);
+            // doors.rs guard 5: the detour noted ON -> OFF; world.rs asks keep_open (known ON).
+            if before && !self.flag && self.known && doors::keep_open_loop_decision(true, true) {
+                self.flag = true;
+                sent = None;
+            }
+            if let Some(v) = sent {
+                self.known = v;
+            }
+            Some((target_state(Some(Class::OneLoop), GATE, Some(before)), sent))
+        }
+
+        /// world.rs applies the friend's flag (no guard for one-loop door flags).
+        fn flag_arrives(&mut self, v: bool) {
+            self.flag = v;
+            self.known = v;
+        }
+
+        /// objact.rs receives the friend's execution (target `state`).
+        fn msg_arrives(&mut self, state: u8) {
+            let plan = receive_plan(Some(Class::OneLoop), GATE, state, 1, here());
+            if plan == Ok(Plan::Replay) && object_decision(Some(self.open)).is_ok() {
+                // 0x6BA910: vt[5] SETS the flag, the opening animation plays.
+                self.flag = state != 0;
+                self.open = true;
+            }
+        }
+
+        /// A reload: the engine sets the object up from the flag [ARV].
+        fn reload(&mut self) {
+            self.open = self.flag;
+        }
+    }
+
+    fn closed() -> Side {
+        Side { flag: false, open: false, known: false }
+    }
+
+    fn converged(a: Side, b: Side) {
+        assert!(a.flag && a.open && b.flag && b.open, "a {a:?} b {b:?}");
+        let (mut a, mut b) = (a, b);
+        a.reload();
+        b.reload();
+        assert!(a.open && b.open, "after a reload: a {a:?} b {b:?}");
+    }
+
+    #[test]
+    fn loop_door_converges_in_every_order() {
+        // 1. Flag first, then the message (the usual order: the flag is in the snapshot).
+        let (mut a, mut b) = (closed(), closed());
+        let (msg, flag) = a.use_it().unwrap();
+        assert_eq!((msg, flag), (1, Some(true)));
+        b.flag_arrives(true);
+        b.msg_arrives(msg);
+        converged(a, b);
+        // 2. Message first, then the flag.
+        let (mut a, mut b) = (closed(), closed());
+        let (msg, _) = a.use_it().unwrap();
+        b.msg_arrives(msg);
+        b.flag_arrives(true);
+        converged(a, b);
+        // 3. The live failure: B gets the flag, uses its still closed door before the replay.
+        let (mut a, mut b) = (closed(), closed());
+        let (msg_a, _) = a.use_it().unwrap();
+        b.flag_arrives(true);
+        let (msg_b, flag_b) = b.use_it().unwrap();
+        // B's toggle OFF is put back ON quietly, B sends "open" (1), no OFF goes out.
+        assert_eq!((msg_b, flag_b), (1, None));
+        assert!(b.flag && b.open);
+        b.msg_arrives(msg_a); // already open: nothing
+        a.msg_arrives(msg_b); // already open: nothing
+        converged(a, b);
+        // 4. Both use it at the same time (each before the other's anything).
+        let (mut a, mut b) = (closed(), closed());
+        let (ma, fa) = a.use_it().unwrap();
+        let (mb, fb) = b.use_it().unwrap();
+        a.flag_arrives(fb.unwrap());
+        b.flag_arrives(fa.unwrap());
+        a.msg_arrives(mb);
+        b.msg_arrives(ma);
+        converged(a, b);
+        // 5. B's block is not loaded: only the flag; B loads the area later.
+        let (mut a, mut b) = (closed(), closed());
+        a.use_it().unwrap();
+        b.flag_arrives(true);
+        b.reload();
+        converged(a, b);
+        // 6. A message of the old build (target 0 after a toggle of an open flag) is refused.
+        let mut b = Side { flag: true, open: true, known: true };
+        b.msg_arrives(0);
+        assert!(b.flag && b.open);
+    }
+
+    #[test]
+    fn guard_5_note_needs_our_player_and_an_on_to_off_toggle() {
+        let me = Some(0x1000_0001);
+        assert!(own_loop_toggle_off(0x1000_0001, me, Some(true), Some(false)));
+        // An NPC / script actor, an unknown own handle, a normal first opening, no toggle.
+        assert!(!own_loop_toggle_off(0x1000_0002, me, Some(true), Some(false)));
+        assert!(!own_loop_toggle_off(0x1000_0001, None, Some(true), Some(false)));
+        assert!(!own_loop_toggle_off(0x1000_0001, me, Some(false), Some(true)));
+        assert!(!own_loop_toggle_off(0x1000_0001, me, Some(true), Some(true)));
+        assert!(!own_loop_toggle_off(0x1000_0001, me, None, Some(false)));
     }
 
     #[test]
