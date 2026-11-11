@@ -38,6 +38,7 @@ mod leave;
 mod livesync;
 mod log;
 mod logzip;
+mod me3scan;
 mod mode4;
 mod motion;
 mod msfunc;
@@ -194,6 +195,8 @@ fn init(hmodule: usize) {
         // A clean exit, or no log to read: nothing to report.
         log::PrevEnd::Clean | log::PrevEnd::NoLog => {}
     }
+    // me3 file mods next to ours, for the doctor (a thread of its own).
+    me3scan::start();
     // Launcher scripts next to the DLL kept current (a friend's old update.ps1 only fetches the DLL).
     #[cfg(feature = "testsync")]
     shipfiles::start();
