@@ -383,6 +383,9 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     PARTY_SCALE.store(ini.num("party_hp_scale", 100, 50, 200, warn), Relaxed);
     tuning::CUSTOM_ICONS.store(ini.flag("custom_icons", true, warn), Relaxed);
     crate::dialog::NATIVE_NOTICES.store(ini.flag("native_notices", false, warn), Relaxed);
+    crate::logzip::SEND_LOGS_KEY.store(ini.num("send_logs_key", 118, 0, 255, warn), Relaxed);
+    // Read again by log.rs at the next start (the per-run file opens before this reader runs).
+    let _ = ini.flag("log_per_run", true, warn);
 
     // [ADVANCED], live (no reconnect): the native session (nsession.rs).
     tuning::NATIVE_SESSION.store(ini.flag("native_session", true, warn), Relaxed);
@@ -667,6 +670,14 @@ custom_icons = 1
 ;     companion entered your world, the host closed their world, back in your own world)
 ;     are always in the top left, whatever this says.
 native_notices = 0
+; Key that packs the logs into one zip for a bug report (the path is shown on screen):
+; the last 3 game runs, audit.txt and this file without the password. 118 = F7, 0 = off.
+; Windows virtual-key code (F1..F12 = 112..123).
+send_logs_key = 118
+; 1 = every game run also gets its own log file in sekiro-coop\\logs (the last 20 are kept;
+;     log.txt stays as before). A run that crashed is packed into a crash_*.zip there at the
+;     next start. 0 = log.txt only. Takes effect at the next start.
+log_per_run = 1
 
 [ADVANCED]
 ; Changing anything here (or the password / name) restarts the connection.

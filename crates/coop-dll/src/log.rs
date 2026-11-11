@@ -8,13 +8,99 @@ use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn path() -> PathBuf {
+/// `%LOCALAPPDATA%\sekiro-coop`: log.txt, audit.txt, the per-run logs.
+pub fn data_dir() -> PathBuf {
     // Unit tests log to temp: in the real log their lines read as live spectate/warp events.
     #[cfg(test)]
     let base = std::env::temp_dir();
     #[cfg(not(test))]
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("sekiro-coop").join("log.txt")
+    base.join("sekiro-coop")
+}
+
+fn path() -> PathBuf {
+    data_dir().join("log.txt")
+}
+
+/// `logs\`: one file per game run (`YYYY-MM-DD_HH-MM-SS.log`, local start time) and the zips of logzip.rs.
+pub fn runs_dir() -> PathBuf {
+    data_dir().join("logs")
+}
+
+/// Per-run logs kept in `logs\` (the oldest go first).
+pub const KEEP_RUNS: usize = 20;
+
+/// This run's own file in `logs\` (the same lines as log.txt). log.txt stays as it was
+/// (append-only, moved to log.old.txt at 8 MB), so every tool and instruction reading it still works.
+/// `log_per_run = 0` (settings, read straight from the file at start) = no such file.
+static RUN_FILE: Mutex<Option<File>> = Mutex::new(None);
+static RUN_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Proleptic Gregorian date of a day count since 1970-01-01 (Howard Hinnant's civil_from_days).
+fn civil(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+/// `YYYY-MM-DD_HH-MM-SS` of a unix time in a zone `offset` seconds east of UTC (file names sort by time).
+pub fn file_stamp(epoch: u64, offset: i64) -> String {
+    let t = epoch as i64 + offset;
+    let (y, m, d) = civil(t.div_euclid(86_400));
+    let s = t.rem_euclid(86_400);
+    format!("{y:04}-{m:02}-{d:02}_{:02}-{:02}-{:02}", s / 3600, s / 60 % 60, s % 60)
+}
+
+/// `2026-11-09_02-00-31.log`: the per-run log name (nothing else in `logs\` is pruned as a run log).
+pub fn is_run_log_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    name.len() == 23
+        && name.ends_with(".log")
+        && b[..19].iter().enumerate().all(|(i, c)| match i {
+            4 | 7 | 13 | 16 => *c == b'-',
+            10 => *c == b'_',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// The run logs to delete so that `keep` stay: the oldest by name (names sort by start time).
+pub fn runs_to_delete(names: &[String], keep: usize) -> Vec<String> {
+    let mut runs: Vec<&String> = names.iter().filter(|n| is_run_log_name(n)).collect();
+    runs.sort();
+    let extra = runs.len().saturating_sub(keep);
+    runs[..extra].iter().map(|s| (*s).clone()).collect()
+}
+
+/// Run logs in `logs\`, oldest first.
+pub fn run_logs() -> Vec<PathBuf> {
+    let dir = runs_dir();
+    let Ok(rd) = fs::read_dir(&dir) else { return Vec::new() };
+    let mut names: Vec<String> = rd.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| is_run_log_name(n)).collect();
+    names.sort();
+    names.into_iter().map(|n| dir.join(n)).collect()
+}
+
+/// Opens this run's file in `logs\` and prunes the oldest beyond `KEEP_RUNS` (once, at start).
+fn open_run_file(secs: u64, offset: i64) -> Option<PathBuf> {
+    let dir = runs_dir();
+    fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{}.log", file_stamp(secs, offset)));
+    let f = OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    *RUN_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    let _ = RUN_PATH.set(path.clone());
+    let names: Vec<String> = fs::read_dir(&dir)
+        .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+        .unwrap_or_default();
+    for old in runs_to_delete(&names, KEEP_RUNS) {
+        let _ = fs::remove_file(dir.join(old));
+    }
+    Some(path)
 }
 
 /// Above this the log is moved to log.old.txt (checked once per game start),
@@ -62,6 +148,10 @@ fn write_raw(secs: u64, msg: &str) {
         // Deleted or moved under us: open it again on the next line.
         *g = None;
     }
+    // Under the log.txt lock, so both files get the lines in the same order.
+    if let Some(f) = RUN_FILE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        let _ = f.write_all(buf.as_bytes());
+    }
 }
 
 /// One line that never waits for the log lock (v8.52): at process exit (loader lock held,
@@ -70,6 +160,15 @@ fn write_raw(secs: u64, msg: &str) {
 pub fn line_nowait(msg: &str) {
     let mut buf = String::with_capacity(msg.len() + 24);
     let _ = writeln!(buf, "[{}] {msg}", now_secs());
+    if let Ok(mut g) = RUN_FILE.try_lock() {
+        if let Some(f) = g.as_mut() {
+            let _ = f.write_all(buf.as_bytes());
+        }
+    } else if let Some(p) = RUN_PATH.get()
+        && let Ok(mut f) = OpenOptions::new().append(true).open(p)
+    {
+        let _ = f.write_all(buf.as_bytes());
+    }
     if let Ok(mut g) = FILE.try_lock()
         && let Some(f) = g.as_mut()
     {
@@ -186,8 +285,12 @@ pub fn previous_end() -> PrevEnd {
 
 /// The last 64 KB of the log as text (empty when there is no log).
 fn read_tail() -> String {
+    read_tail_of(&path())
+}
+
+fn read_tail_of(p: &std::path::Path) -> String {
     const TAIL_BYTES: u64 = 64 << 10;
-    let Ok(mut f) = File::open(path()) else {
+    let Ok(mut f) = File::open(p) else {
         return String::new();
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -200,6 +303,18 @@ fn read_tail() -> String {
         return String::new();
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The last non-empty line of a log tail.
+fn last_line(tail: &str) -> &str {
+    tail.lines().rev().map(str::trim_end).find(|l| !l.is_empty()).unwrap_or("")
+}
+
+/// The newest run log is the previous run's own file only when it ends with the same line as
+/// log.txt (a run with `log_per_run = 0` wrote log.txt alone, and an older run file is not it).
+fn same_run(log_tail: &str, run_tail: &str) -> bool {
+    let a = last_line(log_tail);
+    !a.is_empty() && a == last_line(run_tail)
 }
 
 /// Classifies the tail of the previous log: only the last session counts (an older SESSION_END
@@ -225,8 +340,13 @@ pub fn session_header() {
     let built: u64 = env!("COOP_BUILD_EPOCH").parse().unwrap_or(0);
     let off = local_utc_offset_secs();
     // Before the first write: it opens the file and may move it to log.old.txt.
-    let prev = classify_previous(&read_tail());
+    let tail = read_tail();
+    let prev = classify_previous(&tail);
     let _ = PREV_END.set(prev);
+    // The previous run's own file, found before this run makes the newest one.
+    let prev_run = run_logs().pop().filter(|p| same_run(&tail, &read_tail_of(p)));
+    let per_run = crate::settings::early_flag("log_per_run", true);
+    let run = if per_run { open_run_file(secs, off) } else { None };
     write_raw(secs, "==== sekiro-coop session start ====");
     write_raw(
         secs,
@@ -246,11 +366,54 @@ pub fn session_header() {
         PrevEnd::NoLog => "no earlier log",
     };
     write_raw(secs, &format!("log: previous run: {ended}"));
+    match (&run, per_run) {
+        (Some(p), _) => write_raw(secs, &format!("log: this run also goes to {} (log_per_run, the last {KEEP_RUNS} runs are kept)", p.display())),
+        (None, true) => write_raw(secs, "log: could not open a per-run file in logs\\, log.txt only"),
+        (None, false) => write_raw(secs, "log: per-run files off (log_per_run = 0), log.txt only"),
+    }
+    if matches!(prev, PrevEnd::Crash | PrevEnd::NoExitLine) {
+        crate::logzip::pack_after_crash(prev, prev_run);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_stamps_sort_by_time() {
+        // 2026-11-09 02:00:31 UTC.
+        assert_eq!(file_stamp(1_794_189_631, 0), "2026-11-09_02-00-31");
+        assert_eq!(file_stamp(1_794_189_631, 3 * 3600), "2026-11-09_05-00-31");
+        // Back across midnight and a month end.
+        assert_eq!(file_stamp(1_793_491_200, -3600), "2026-10-31_23-00-00");
+        assert_eq!(file_stamp(0, 0), "1970-01-01_00-00-00");
+        assert_eq!(file_stamp(1_709_164_800, 0), "2024-02-29_00-00-00");
+        assert!(is_run_log_name(&format!("{}.log", file_stamp(1_794_189_631, 0))));
+    }
+
+    #[test]
+    fn previous_run_file_must_end_like_log_txt() {
+        let log = "[1] ==== sekiro-coop session start ====\n[5] world: x\n[9] coop: last line\r\n\n";
+        assert!(same_run(log, "[5] world: x\n[9] coop: last line\n"));
+        assert!(!same_run(log, "[3] coop: an older run\n"));
+        assert!(!same_run("", ""));
+    }
+
+    #[test]
+    fn run_log_names_and_pruning() {
+        assert!(is_run_log_name("2026-11-09_02-00-31.log"));
+        assert!(!is_run_log_name("2026-11-09_02-00-31.zip"));
+        assert!(!is_run_log_name("crash_2026-11-09_02-00-31.zip"));
+        assert!(!is_run_log_name("log.txt"));
+        assert!(!is_run_log_name("2026-11-09 02-00-31.log"));
+        let mut names: Vec<String> = (0..25).rev().map(|i| format!("2026-11-{:02}_10-00-00.log", i + 1)).collect();
+        names.push("crash_2026-11-01_09-00-00.zip".into());
+        names.push("notes.txt".into());
+        let gone = runs_to_delete(&names, 20);
+        assert_eq!(gone, (1..=5).map(|d| format!("2026-11-{d:02}_10-00-00.log")).collect::<Vec<_>>());
+        assert!(runs_to_delete(&names[..3], 20).is_empty());
+    }
 
     #[test]
     fn hms_formats_with_offset() {
