@@ -216,6 +216,10 @@ pub fn row_of(slot: usize, id: i32) -> Result<(SlotKind, u32), Skip> {
     }
 }
 
+/// The only slot whose unequip (-1) is replayed: the fifth protector kind (hair). The game
+/// empties slots 17..21 the same way (`0x79D100`: handle 0, inventory index -1).
+pub const SLOT_EMPTIABLE: usize = 16;
+
 /// The slots of `wanted` that differ from `current` and are safe to put on (their row exists:
 /// `exists(kind, row)`), and the differing slots that are skipped. Network data never reaches
 /// a game call unless it passes here.
@@ -234,6 +238,9 @@ pub fn plan(
         match row_of(slot, to) {
             Ok((kind, row)) if exists(kind, row) => put.push(Change { slot, from, to }),
             Ok(_) => skip.push((slot, to, Skip::NoRow)),
+            // The fifth protector slot (Shura's hair, wardrobe.rs) is emptied when the sender
+            // takes another head: replayed, or the replica keeps the hair.
+            Err(Skip::Empty) if slot == SLOT_EMPTIABLE && to == -1 => put.push(Change { slot, from, to }),
             Err(why) => skip.push((slot, to, why)),
         }
     }
@@ -242,7 +249,7 @@ pub fn plan(
 
 /// Whether `row` exists in the param of `kind` (game thread; false while params are not
 /// loaded).
-fn row_exists(kind: SlotKind, row: u32) -> bool {
+pub(crate) fn row_exists(kind: SlotKind, row: u32) -> bool {
     let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else { return false };
     let name = match kind {
         SlotKind::Weapon => EQUIP_PARAM_WEAPON_ST::NAME,
@@ -261,7 +268,7 @@ pub fn ids_of(pgd: usize) -> Option<[i32; LOADOUT_SLOTS]> {
     Some(ids)
 }
 
-fn local_pgd() -> Option<usize> {
+pub(crate) fn local_pgd() -> Option<usize> {
     read_ptr(module_base() + GAME_DATA_MAN_RVA).and_then(|g| read_ptr(g + GDM_LOCAL_PGD))
 }
 
@@ -289,6 +296,15 @@ pub fn apply(pgd: usize, wanted: &[i32; LOADOUT_SLOTS], who: &str) -> Result<usi
     let mut done = 0;
     for c in put {
         let full = c.to;
+        if full < 0 {
+            // Only SLOT_EMPTIABLE gets here (plan).
+            let h = 0u32;
+            equip(egd, c.slot as u32, &h, -1, 0, 1, 0);
+            let now = read::<i32>(egd + EGD_IDS + 4 * c.slot);
+            log::line(&format!("loadout: {who} slot {} {} -> emptied (slot now {now:?})", c.slot, c.from));
+            done += 1;
+            continue;
+        }
         // Already in this PGD's inventory: equip its own entry (the menu's way).
         let found = find(egd, &full);
         let (idx, how) = if found >= 0 {
@@ -654,6 +670,33 @@ mod tests {
         // Without params (not loaded): nothing reaches the game.
         let (put, _) = plan(&DUMP, &want, |_, _| false);
         assert!(put.is_empty());
+    }
+
+    #[test]
+    fn wardrobe_mix_and_the_hair_slot() {
+        let rows = [100_000u32, 131_000, 102_000, 103_000, 300_000, 304_000, 401_000, 153_000, 201_000, 200_000];
+        let exists = |k: SlotKind, r: u32| k == SlotKind::Protector && rows.contains(&r);
+        let p = |r: i32| 0x1000_0000 | r;
+        // Shura head + hair (slot 16), Ashina torso, Wolf arm, tabi legs.
+        let mut mixed = DUMP;
+        mixed[12] = p(300_000);
+        mixed[13] = p(401_000);
+        mixed[15] = p(153_000);
+        mixed[16] = p(304_000);
+        let (put, skip) = plan(&DUMP, &mixed, exists);
+        assert!(skip.is_empty(), "{skip:?}");
+        assert_eq!(put.iter().map(|c| c.slot).collect::<Vec<_>>(), vec![12, 13, 15, 16]);
+        // Another head: the hair slot is emptied on the replica too.
+        let mut back = mixed;
+        back[12] = p(200_000);
+        back[16] = -1;
+        let (put, skip) = plan(&mixed, &back, exists);
+        assert!(skip.is_empty(), "{skip:?}");
+        assert_eq!(put, vec![Change { slot: 12, from: p(300_000), to: p(200_000) }, Change { slot: 16, from: p(304_000), to: -1 }]);
+        // -1 elsewhere is still not replayed.
+        let mut bare = DUMP;
+        bare[15] = -1;
+        assert_eq!(plan(&DUMP, &bare, exists).1, vec![(15, -1, Skip::Empty)]);
     }
 
     #[test]

@@ -172,6 +172,7 @@ const SHOW_DIST_FROM_M: f32 = 40.0;
 #[derive(Default)]
 struct Overlay {
     panel: Panel,
+    wardrobe: crate::wardrobe::Panel,
 }
 
 /// The 'Mod settings' panel is on screen right now (render thread writes, `message_filter`
@@ -663,11 +664,13 @@ impl ImguiRenderLoop for Overlay {
     /// Mouse messages are kept from the game only while the panel is up and the pointer is
     /// over it (`want_capture_mouse`); the keyboard is never filtered.
     fn message_filter(&self, io: &Io) -> MessageFilter {
-        if PANEL_VISIBLE.load(Ordering::Relaxed) && io.want_capture_mouse {
-            MessageFilter::InputMouse
-        } else {
-            MessageFilter::empty()
+        let mut f = if PANEL_VISIBLE.load(Ordering::Relaxed) && io.want_capture_mouse { MessageFilter::InputMouse } else { MessageFilter::empty() };
+        // The wardrobe panel (in the world): its keys should not also move the character.
+        // Only window messages are held back; input the game reads another way still gets in.
+        if crate::wardrobe::panel_open() {
+            f |= MessageFilter::InputKeyboard;
         }
+        f
     }
 
     fn render(&mut self, ui: &mut Ui) {
@@ -695,6 +698,8 @@ impl ImguiRenderLoop for Overlay {
         self.draw_page_hint(ui);
         draw_wait_banner(ui, &status);
         self.panel.draw(ui);
+        let wk = crate::wardrobe::KEY.load(Ordering::Relaxed);
+        self.wardrobe.draw(ui, vk_to_key(wk), &vk_name(wk));
 
         if !settings::show_status_overlay() {
             return;

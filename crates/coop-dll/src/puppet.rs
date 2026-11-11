@@ -188,6 +188,7 @@ impl Puppet {
         // Native session (nsession.rs): every patch out before the world goes (no-op when off).
         crate::nsession::on_world_reset(why);
         crate::restsync::on_world_reset();
+        crate::wardrobe::on_world_reset();
         self.friend_tags.clear();
         ui::publish_tags(Vec::new());
         self.ghost_died = false;
@@ -229,7 +230,7 @@ impl Puppet {
             in_world_for,
             press,
             mask,
-            excluded: talking || crate::cutscene::active() || ui::panel_visible() || game::load_pending(),
+            excluded: talking || crate::cutscene::active() || ui::panel_visible() || crate::wardrobe::panel_open() || game::load_pending(),
         });
         let state = || {
             format!(
@@ -607,6 +608,11 @@ impl Puppet {
         }
         if !linked {
             self.scale_remote = None;
+        }
+        // Outfit parts chosen in the wardrobe panel (wardrobe.rs; solo too).
+        if !hands_off {
+            crash::breadcrumb("wardrobe");
+            crate::wardrobe::tick(player, in_world_since.elapsed());
         }
         if !hands_off && self.scale_at.is_none_or(|t| t.elapsed().as_secs() >= 1) {
             crash::breadcrumb("scaling");
