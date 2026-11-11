@@ -133,6 +133,8 @@ pub struct Puppet {
     follow: bool,
     follow_frames: u64,
     net: Option<Option<net::Net>>,
+    /// PvP on the game's hit packet (pvp.rs, `friendly_fire`).
+    pvp: crate::pvp::Pvp,
     fps_frames: u32,
     fps_since: Option<std::time::Instant>,
     fps: f32,
@@ -881,6 +883,16 @@ impl Puppet {
                 here,
             });
         }
+        // PvP on the game's own hit packet (pvp.rs): nothing while friendly_fire is off (the
+        // host's value on a client).
+        crash::breadcrumb("pvp");
+        let host_ff = self.scale_remote.and_then(|c| c.friendly_fire);
+        if let Some(Some(n)) = self.net.as_mut() {
+            self.pvp.tick(crate::pvp::Frame { net: n, player, peers: &self.peers, host_ff });
+        } else {
+            // No Net (offline, or being rebuilt after a settings change): nothing may stay on.
+            self.pvp.off("no network session");
+        }
         // The ghost is the fallback for at most one peer, the friend (`peers.first()`, whose
         // snapshots `Net::remote()` reads): only while no native remote stands for it and
         // the native path is off or failing for it.
@@ -1548,6 +1560,7 @@ fn own_scale_cfg(players: u32) -> crate::scaling::ScaleCfg {
         boss_posture: p(&crate::tuning::BOSS_POSTURE_SCALING),
         players: players.clamp(1, crate::peers::MAX_PLAYERS as u32) as u8,
         debuffs: Some(crate::tuning::DEATH_DEBUFFS.load(Relaxed)),
+        friendly_fire: Some(crate::pvp::FRIENDLY_FIRE.load(Relaxed)),
     }
 }
 

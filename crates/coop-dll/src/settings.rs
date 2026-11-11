@@ -367,6 +367,8 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::quitblock::ENABLED.store(ini.flag("block_quit_in_coop", true, warn), Relaxed);
     crate::ngblock::ENABLED.store(ini.flag("block_ng_in_coop", true, warn), Relaxed);
     crate::doctor::ALLOW_CROSS_CYCLE.store(ini.flag("allow_cross_cycle", false, warn), Relaxed);
+    crate::pvp::FRIENDLY_FIRE.store(ini.flag("friendly_fire", false, warn), Relaxed);
+    crate::pvp::IN_BOSS_FIGHTS.store(ini.flag("friendly_fire_in_boss_fights", false, warn), Relaxed);
     crate::nopause::ENABLED.store(ini.flag("no_pause_in_coop", true, warn), Relaxed);
     crate::livesync::ENABLED.store(ini.flag("native_lives_sync", true, warn), Relaxed);
     crate::nsession::dblock::FRESH_LIFE_VETO.store(ini.flag("getup_deathblow_veto", true, warn), Relaxed);
@@ -431,6 +433,8 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::LOADOUT_SYNC.store(ini.flag("loadout_sync", true, warn), Relaxed);
     tuning::N0_CLONES.store(ini.num("n0_clones", 0, 0, 5, warn), Relaxed);
     tuning::NATIVE_PIN_DELAY_MS.store(pin_delay_setting(ini, warn), Relaxed);
+    crate::pvp::DRY_RUN.store(ini.flag("pvp_dry_run", false, warn), Relaxed);
+    crate::pvp::DEATH_GUARD.store(ini.flag("pvp_death_guard", true, warn), Relaxed);
     tuning::RELAY_SNAPSHOT_HZ.store(ini.num("relay_snapshot_hz", 30, 10, 120, warn), Relaxed);
     tuning::SNAPSHOT_HZ_MULTI.store(ini.num("snapshot_hz_multi", 60, 20, 120, warn), Relaxed);
     tuning::DEATH_RESTORE_DELAY_S.store(ini.num("death_restore_delay_s", 8, 2, 60, warn), Relaxed);
@@ -653,6 +657,14 @@ block_ng_in_coop = 1
 ;     with a notice and the client leaves (enemy HP would differ). 1 = allowed on both PCs
 ;     (set it on both), with a warning only.
 allow_cross_cycle = 0
+; EXPERIMENTAL, not tested in play yet. 1 = player-vs-player damage with the game's own hit
+;     packet: your hits on the companion are sent to their PC and applied there against their
+;     guard, deflect and dodge. Duels are never lethal: at 1 HP the duel is over and hits are
+;     ignored for 5 s. The host's value is used by both. 0 = off (default).
+friendly_fire = 0
+; With friendly_fire: 0 = while a boss health bar is shown, your hits do not reach each other
+;     (the companion is a friend again for lock-on and allied characters). 1 = PvP also there.
+friendly_fire_in_boss_fights = 0
 ; 1 = while a companion is connected, menus, the inventory, item pickup messages and the
 ;     co-op yes/no boxes do not pause the game (as in FromSoft's online play): both worlds
 ;     keep running. Solo the game pauses as usual. 0 = menus pause as in single player.
@@ -832,6 +844,12 @@ loadout_sync = 1
 ; One-machine test of a 6-player world: this many local copies of you (0..5) appear,
 ; one every 3 s, after every load (native_spawn_delay_s). 0 = off. The friend stays a ghost meanwhile.
 n0_clones = 0
+; friendly_fire test aid: 1 = the companion's hits on you are only written to the log (pvp:),
+; never applied. 0 = applied (default).
+pvp_dry_run = 0
+; 1 = if you die in the same moment as a companion's hit, the game's death event is told there
+; was no killer (the 1.0.11 PvP crash at sekiro.exe+0x66CE96). Works without friendly_fire. 0 = off.
+pvp_death_guard = 1
 ; With 3 or more players: how often per second the host forwards one player's position to
 ; the others, and how often you send your own (with one friend: every frame).
 relay_snapshot_hz = 30

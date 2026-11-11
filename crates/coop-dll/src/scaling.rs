@@ -43,16 +43,23 @@ pub struct ScaleCfg {
     /// The host's `death_debuffs` (v8.31: the host decides it for everyone). `None` = an old
     /// body without it: the receiver keeps its own setting.
     pub debuffs: Option<bool>,
+    /// The host's `friendly_fire` (pvp.rs, 11th byte, sent only after the debuff byte). `None` =
+    /// a body without it (older host): PvP stays off on the client.
+    pub friendly_fire: Option<bool>,
 }
 
 impl ScaleCfg {
-    /// 8 bytes of percentages, the player count, then the death-debuff flag (10th byte).
+    /// 8 bytes of percentages, the player count, the death-debuff flag (10th byte), then the
+    /// friendly-fire flag (11th byte, only after a debuff byte).
     pub fn encode(&self) -> Vec<u8> {
         let mut out: Vec<u8> =
             [self.enemy_hp, self.enemy_posture, self.boss_hp, self.boss_posture].iter().flat_map(|v| v.to_le_bytes()).collect();
         out.push(self.players);
         if let Some(d) = self.debuffs {
             out.push(d as u8);
+            if let Some(f) = self.friendly_fire {
+                out.push(f as u8);
+            }
         }
         out
     }
@@ -63,7 +70,8 @@ impl ScaleCfg {
         let v = |i: usize| b.get(i * 2..i * 2 + 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
         let players = b.get(8).copied().unwrap_or(2).clamp(1, crate::peers::MAX_PLAYERS as u8);
         let debuffs = b.get(9).map(|&x| x != 0);
-        Some(Self { enemy_hp: v(0)?, enemy_posture: v(1)?, boss_hp: v(2)?, boss_posture: v(3)?, players, debuffs })
+        let friendly_fire = b.get(10).map(|&x| x != 0);
+        Some(Self { enemy_hp: v(0)?, enemy_posture: v(1)?, boss_hp: v(2)?, boss_posture: v(3)?, players, debuffs, friendly_fire })
     }
 }
 
@@ -379,7 +387,7 @@ mod tests {
 
     #[test]
     fn config_round_trip_with_the_player_count() {
-        let c = ScaleCfg { enemy_hp: 60, enemy_posture: 150, boss_hp: 60, boss_posture: 80, players: 4, debuffs: None };
+        let c = ScaleCfg { enemy_hp: 60, enemy_posture: 150, boss_hp: 60, boss_posture: 80, players: 4, debuffs: None, friendly_fire: None };
         assert_eq!(ScaleCfg::decode(&c.encode()), Some(c));
         assert_eq!(c.encode().len(), 9);
         // 10 bytes: the host's death-debuff flag rides along; an old decoder ignores the byte.
@@ -390,6 +398,16 @@ mod tests {
             assert_eq!(ScaleCfg::decode(&body), Some(c10));
             assert_eq!(ScaleCfg::decode(&body[..9]).map(|d| d.debuffs), Some(None));
         }
+        // 11 bytes: the host's friendly_fire after the debuff flag; a 10-byte body = None (PvP off).
+        for ff in [true, false] {
+            let c11 = ScaleCfg { debuffs: Some(true), friendly_fire: Some(ff), ..c };
+            let body = c11.encode();
+            assert_eq!(body.len(), 11);
+            assert_eq!(ScaleCfg::decode(&body), Some(c11));
+            assert_eq!(ScaleCfg::decode(&body[..10]).map(|d| d.friendly_fire), Some(None));
+        }
+        // No debuff byte: the friendly-fire byte is not sent either (the byte positions are fixed).
+        assert_eq!(ScaleCfg { friendly_fire: Some(true), ..c }.encode().len(), 9);
         // An 8-byte body (no count) means two players.
         let old = &c.encode()[..8];
         assert_eq!(ScaleCfg::decode(old).map(|d| d.players), Some(2));

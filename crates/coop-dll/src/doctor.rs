@@ -181,6 +181,12 @@ pub fn compare(ours: &Info, theirs: &Info) -> Vec<Finding> {
     if differs("enemy_mode") {
         out.push(Finding { log: format!("enemy_mode differs: {}", pair("enemy_mode")), notice: Some("enemy_mode differs: use the same value on both PCs.".into()) });
     }
+    if differs("friendly_fire") {
+        out.push(Finding {
+            log: format!("friendly_fire differs: {} (the host's is used on both)", pair("friendly_fire")),
+            notice: Some("friendly_fire differs between you: the host's setting is used.".into()),
+        });
+    }
     for k in ["sync_art", "death_debuffs"] {
         if differs(k) {
             out.push(Finding { log: format!("{k} differs: {} (each side uses its own)", pair(k)), notice: None });
@@ -245,6 +251,7 @@ fn gather(is_host: bool) -> Info {
     put("sync_posture", (tuning::sync_posture() as u8).to_string());
     put("sync_art", (tuning::sync_art_effects() as u8).to_string());
     put("enemy_mode", tuning::enemy_mode().to_string());
+    put("friendly_fire", (crate::pvp::FRIENDLY_FIRE.load(std::sync::atomic::Ordering::Relaxed) as u8).to_string());
     put("merge_quests", tuning::merge_quests().to_string());
     put("own_world_mode", crate::ownworld::mode_name().into());
     match crate::me3scan::result() {
@@ -554,6 +561,17 @@ mod tests {
         let f = compare(&host, &info(&[("pkgs", "none"), ("natives", "fps.dll")]));
         assert_eq!(f.len(), 1);
         assert!(f[0].notice.is_none());
+    }
+
+    #[test]
+    fn friendly_fire_difference_is_a_notice() {
+        let f = compare(&info(&[("friendly_fire", "1")]), &info(&[("friendly_fire", "0")]));
+        assert_eq!(f.len(), 1);
+        assert!(f[0].log.contains("the host's is used on both"));
+        assert!(f[0].notice.is_some());
+        assert!(compare(&info(&[("friendly_fire", "1")]), &info(&[("friendly_fire", "1")])).is_empty());
+        // An older companion build does not send it: nothing to say.
+        assert!(compare(&info(&[("friendly_fire", "1")]), &info(&[])).is_empty());
     }
 
     #[test]
