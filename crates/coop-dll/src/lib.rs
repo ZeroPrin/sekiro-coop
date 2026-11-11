@@ -51,6 +51,7 @@ mod netai;
 mod nopause;
 mod npcintro;
 mod nsession;
+mod objact;
 mod ownworld;
 mod peers;
 mod persist;
@@ -209,6 +210,7 @@ fn init(hmodule: usize) {
     bossrules::install();
     items::install();
     dialog::install();
+    objact::install();
     quitblock::install();
     optprobe::install();
     optmenu::install();
