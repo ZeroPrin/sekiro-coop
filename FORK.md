@@ -66,6 +66,36 @@ the chest itself stays closed for the receiver (opening it gives nothing). Enemy
   player's death reload is still a wipe. Log line: `persist: ... is back after ... death: it no
   longer counts for a wipe`.
 
+## Base fixes ported from 1.0.11
+
+The 1.0.11-beta source is not public. These were rebuilt from its release notes, its ini
+comments, the log lines in its DLL and our players' 1.0.11 logs (catalogue:
+`docs/FIXES-1.0.11-vs-FORK.md`, Top-10). Branch `base-fixes`. Every item is a unit-tested
+rule plus game-side wiring; **none of them is verified live yet**: the oracle is a playtest
+with the log lines below.
+
+| Item | Setting (default) | Log lines to look for | Status |
+|---|---|---|---|
+| Per-run log files, F7 bug-report zip, crash zip (`log.rs`, `logzip.rs`) | `log_per_run` (1, next start), `send_logs_key` (118 = F7, 0 = off) | `log: this run also goes to ...logs\<date_time>.log`, `logzip: wrote N files ...`, `logzip: the previous run crashed / had no exit line: wrote ...` | unit tests (zip layout, CRC, names, pruning, password hidden); not run in game |
+| Fresh-life deathblow veto, 10 s (`nsession.rs dblock`, `livesync.rs`) | `getup_deathblow_veto` (1) | `deathblow: enemy E netId N lost a life (seen here / the friend's deathblow): no new deathblow on it here for 10 s ...`, `deathblow: our attempt on N refused: ... (fresh-life veto)`, `fresh-life vetoes` in the 10 s stats | unit tests; uses the existing gate detour `0xBE3810` (live since 1.0.9) |
+| Boss lives desync line (`livesync.rs`) | none (log only) | `livesync: DESYNC enemy ... for 15 s ...`, `... lives agree with the other players again after N s` | unit tests |
+| Limited shop stock per player (`world.rs shop_counter_bits`) | `shop_stock_per_player` (1, next start) | `world: ... per player (... shop rows, 75 shop counter bits, ...)` | unit test with the real 1.06 rows; width fitted to 1.0.11's own count (75) [ARV] |
+| Restores wait for a down peer (`persist.rs`) | `persist_wait_for_down` (1) | `persist: our death reload while peer(s) [..] are down: ...`, `persist: the down peer(s) settled N ms after our death reload: ...` | unit test for the end rule; builds on the false-wipe fix |
+| Ledge-hang / wall-hug stealth (`enemies.rs`) | `stealth_hang_cover` (1) | `stealth: our throw state ... (hang/cover): enemies within 12 m run on our AI ...`, `throw: handoff ... reason hang/cover`, `stealth: claiming enemy ... (..., hang/cover, ...)` | unit tests; reads ThrowModule `+0x79` (HKS act 160, RE-BACKSTAB.md) [VAR in IDA, not read live by the fork yet] |
+| Co-op items when the temple idol is lit (`items.rs`) | under `connection_items` | `items: the temple idol was just lit: giving the co-op items` | unit test for the edge |
+| me3 file mod warning (`me3scan.rs`, `doctor.rs`) | none (log + notice only) | `doctor: me3 profile ...: N package(s) ...`, `doctor: WARNING me3 file mods differ: ...` | unit tests (parser, fingerprint, warnings) |
+
+Notes:
+
+- The per-run file is a second copy of every line; log.txt is unchanged (append-only, moved
+  to log.old.txt at 8 MB), so `upload-log.ps1`, testsync and the existing instructions still
+  work. Zips and run logs live in `%LOCALAPPDATA%\sekiro-coop\logs\` (20 runs, 10 zips kept).
+- The veto refuses every throw of our player on that enemy at the gate, as the peer lock
+  does; 1.0.11 used the same gate (its stats line counts both).
+- The shop counter width (`eventFlag + 1 ..= eventFlag + floor(log2 sellQuantity)`) is
+  inferred, not read in the game's shop code: it is the only simple width that reproduces
+  1.0.11's "75 shop counter bits" with the same 1084 other per-player flags.
+
 ## Working on this fork
 
 - Repository: https://github.com/ZeroPrin/sekiro-coop, branch `share-pickups` (the fork's

@@ -44,7 +44,8 @@ STOPPING
 Quit Game is greyed out while you're still in co-op, that's on purpose.
 Don't close the game from Task Manager unless it's frozen. Then the log
 can't tell me if it crashed or not. If it froze or crashed, say so in your
-report and send log.txt and log.old.txt.
+report and send the newest crash_*.zip from %LOCALAPPDATA%\sekiro-coop\logs
+(made at the next start), or log.txt and log.old.txt.
 
 CONNECTION
 Steam by default, falls back to direct UDP after 15 s. Steam lobbies only work
@@ -87,6 +88,8 @@ Backups: %LOCALAPPDATA%\sekiro-coop\save-backups\
 
 BUGS
 Log: %LOCALAPPDATA%\sekiro-coop\log.txt
+Every game run also has its own log in %LOCALAPPDATA%\sekiro-coop\logs.
+F7 packs the last 3 runs' logs into one zip there for a bug report.
 Press F11 (or Back/Share on a pad) when a bug happens, it marks the log.
 Report on GitHub with the logs from everyone.
 
