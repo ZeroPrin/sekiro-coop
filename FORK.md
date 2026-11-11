@@ -2,7 +2,45 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test2`. Everybody in a session needs the same build.
+
+> **Test build `1.0.9-pickups.3-test2`: nothing in the sections below marked experimental or
+> "not verified live" has been verified in a live game.** This build merges the branches
+> `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
+> onto `share-pickups` (branch `test2`). Each feature was written and unit-tested on its own;
+> they have never run together in the game. The oracle is a playtest with both logs.
+
+## New settings in this build
+
+A fresh `sekiro_coop_settings.ini` is written with these defaults; a key missing from an
+existing ini takes the same built-in default. PvP is off unless the host turns it on.
+
+| Setting | Section | Default | Feature (section below) |
+|---|---|---|---|
+| `share_pickups` | GAMEPLAY | 1 | Shared map pickups (pickups.1-.3) |
+| `shop_stock_per_player` | GAMEPLAY | 1 (next start) | Base fixes from 1.0.11 |
+| `getup_deathblow_veto` | GAMEPLAY | 1 | Base fixes from 1.0.11 |
+| `persist_wait_for_down` | GAMEPLAY | 1 | Base fixes from 1.0.11 |
+| `stealth_hang_cover` | GAMEPLAY | 1 | Base fixes from 1.0.11 |
+| `log_per_run` | DISPLAY | 1 (next start) | Base fixes from 1.0.11 |
+| `send_logs_key` | DISPLAY | 118 (F7; 0 = off) | Base fixes from 1.0.11 |
+| `fix_debug_item_unlocks` | DEBUG | 1 | Co-op items unlocked diving |
+| `sync_objact` | GAMEPLAY | 1 (0 off, 2 + one-loop objects) | ObjAct sync |
+| `objact_debug` | DEBUG | 0 | ObjAct sync |
+| `objact_sender` | DEBUG | hook (or poll) | ObjAct sync |
+| `loadout_sync` | DEBUG | 1 | Loadout sync |
+| `player_packet_hz` | ADVANCED | 30 (12 = the game's own, nothing patched) | Player packet rate |
+| `native_pin_delay_ms` | DEBUG | 0 (auto) | Player packet rate |
+| `friendly_fire` | GAMEPLAY | **0** (the host's value is used) | PvP |
+| `friendly_fire_in_boss_fights` | GAMEPLAY | 0 | PvP |
+| `pvp_dry_run` | DEBUG | 0 | PvP |
+| `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | PvP |
+
+Reliable bulk kinds added by the fork: 46 (pickups), 0xA7 (ObjAct), 0xA8 (loadout), 0xA9
+(PvP); `net::tests::bulk_kinds_are_unique` checks them against the upstream kinds. The doctor
+compares `friendly_fire` (notice), the me3 packages (notice) and, log only, `sync_objact`,
+`loadout_sync`, `player_packet_hz`, `shop_stock_per_player`, `fix_debug_item_unlocks`; an older
+build that does not send a key is not compared.
 
 ## What it adds: shared map pickups (`[GAMEPLAY] share_pickups`, default 1)
 
@@ -53,6 +91,90 @@ off the map, no GrantItems). Log lines: `pickup: lot L taken off the map here (h
 Still open: chests. If a chest is an ObjAct whose item node only spawns when it is opened,
 the chest itself stays closed for the receiver (opening it gives nothing). Enemy drops
 (kind 5, no lot flag) are not shared.
+
+## Fixes to the 1.0.9 base
+
+- **False wipe** (1.0.9-pickups.3, `persist.rs`). A wipe was "every player's committed death
+  within 90 s", even when the first player had already reloaded and was alive again. Live
+  2026-11-09: the host died, reloaded and played on for 79 s, the friend then died, and both
+  sides cleared the dead set, the paid kills and the boss records (killed enemies and damaged
+  minibosses would come back on the next load). Now a death stops counting once that player
+  loaded after it and is alive (`death_over`: ours after our death reload, a peer's after its
+  last hidden snapshot); checked after the wipe test, so a death that comes in during the other
+  player's death reload is still a wipe. Log line: `persist: ... is back after ... death: it no
+  longer counts for a wipe`.
+
+## Base fixes ported from 1.0.11
+
+The 1.0.11-beta source is not public. These were rebuilt from its release notes, its ini
+comments, the log lines in its DLL and our players' 1.0.11 logs (catalogue:
+`docs/FIXES-1.0.11-vs-FORK.md`, Top-10). Branch `base-fixes`. Every item is a unit-tested
+rule plus game-side wiring; **none of them is verified live yet**: the oracle is a playtest
+with the log lines below.
+
+| Item | Setting (default) | Log lines to look for | Status |
+|---|---|---|---|
+| Per-run log files, F7 bug-report zip, crash zip (`log.rs`, `logzip.rs`) | `log_per_run` (1, next start), `send_logs_key` (118 = F7, 0 = off) | `log: this run also goes to ...logs\<date_time>.log`, `logzip: wrote N files ...`, `logzip: the previous run crashed / had no exit line: wrote ...` | unit tests (zip layout, CRC, names, pruning, password hidden); not run in game |
+| Fresh-life deathblow veto, 10 s (`nsession.rs dblock`, `livesync.rs`) | `getup_deathblow_veto` (1) | `deathblow: enemy E netId N lost a life (seen here / the friend's deathblow): no new deathblow on it here for 10 s ...`, `deathblow: our attempt on N refused: ... (fresh-life veto)`, `fresh-life vetoes` in the 10 s stats | unit tests; uses the existing gate detour `0xBE3810` (live since 1.0.9) |
+| Boss lives desync line (`livesync.rs`) | none (log only) | `livesync: DESYNC enemy ... for 15 s ...`, `... lives agree with the other players again after N s` | unit tests |
+| Limited shop stock per player (`world.rs shop_counter_bits`) | `shop_stock_per_player` (1, next start) | `world: ... per player (... shop rows, 75 shop counter bits, ...)` | unit test with the real 1.06 rows; width fitted to 1.0.11's own count (75) [ARV] |
+| Restores wait for a down peer (`persist.rs`) | `persist_wait_for_down` (1) | `persist: our death reload while peer(s) [..] are down: ...`, `persist: the down peer(s) settled N ms after our death reload: ...` | unit test for the end rule; builds on the false-wipe fix |
+| Ledge-hang / wall-hug stealth (`enemies.rs`) | `stealth_hang_cover` (1) | `stealth: our throw state ... (hang/cover): enemies within 12 m run on our AI ...`, `throw: handoff ... reason hang/cover`, `stealth: claiming enemy ... (..., hang/cover, ...)` | unit tests; reads ThrowModule `+0x79` (HKS act 160, RE-BACKSTAB.md) [VAR in IDA, not read live by the fork yet] |
+| Co-op items when the temple idol is lit (`items.rs`) | under `connection_items` | `items: the temple idol was just lit: giving the co-op items` | unit test for the edge |
+| me3 file mod warning (`me3scan.rs`, `doctor.rs`) | none (log + notice only) | `doctor: me3 profile ...: N package(s) ...`, `doctor: WARNING me3 file mods differ: ...` | unit tests (parser, fingerprint, warnings) |
+
+Notes:
+
+- The per-run file is a second copy of every line; log.txt is unchanged (append-only, moved
+  to log.old.txt at 8 MB), so `upload-log.ps1`, testsync and the existing instructions still
+  work. Zips and run logs live in `%LOCALAPPDATA%\sekiro-coop\logs\` (20 runs, 10 zips kept).
+- The veto refuses every throw of our player on that enemy at the gate, as the peer lock
+  does; 1.0.11 used the same gate (its stats line counts both).
+- The shop counter width (`eventFlag + 1 ..= eventFlag + floor(log2 sellQuantity)`) is
+  inferred, not read in the game's shop code: it is the only simple width that reproduces
+  1.0.11's "75 shop counter bits" with the same 1084 other per-player flags.
+
+## Co-op items unlocked diving and every skill (`[DEBUG] fix_debug_item_unlocks`, default 1)
+
+The co-op items sit on EquipParamGoods rows 999997 (Kindred Bell), 999998 (Kindred Charm) and
+999999 (Severed Thread); 1.0.11 also uses 999996 (Rival's Charm). In vanilla these rows are
+FromSoftware debug items: their `actionUnlockParamId` (+0x28) is their own id, and
+ActionUnlockParam 999999 unlocks every action, 999998 all but action03 (Mortal Blade), 999997 all
+but 03 and 06, 999996 all but 20-23. The owner of the items could dive without Mibu Breathing
+(HKS `env(3033, 0)`), use the Mortal Blade, ninjutsu and the skill actions without having them.
+
+How the game handles it (RE 2026-11-11, dump + Ghidra, details in `docs/RE-NOTES.md`):
+EquipInventoryData (EquipGameData+0x168 = PlayerGameData+0x3E0) keeps 30 counters at +0x90, one
+per action. `0x7A9A80` adds the item's quantity to every action of its unlock set when it is
+added or removed (goods: +0x28, weapons/skills: EquipParamWeapon+0x24C), with the params of that
+moment. `0x7A8200` zeroes the counters and adds the whole inventory again; the save loader
+(`0x7A8140`, [ARV]) and the debug param reload (`0x10B2AB0`) call it. `0x7A7FE0` = "counter > 0 or bit in
++0x118" answers HKS `env(3033, n)` (case 0xBD9 of `0xB36410`). The mod rewrote our rows only
+seconds after the save had loaded, so the counters already held the debug sets and kept them.
+In the 2026-11-11 dump the counters matched "inventory x vanilla rows" exactly (action00 = 4: one
+from each of 999996-999999, no Mibu Breathing owned).
+
+Fix (`items.rs`): the ids stay (saves, the 1.0.11 Rival's Charm and upstream builds use them).
+- +0x28 of rows 999996-999999 (and of the rows this run chose) is set to 0 as soon as
+  EquipParamGoods is loaded, at the title before any save load; checked again every second.
+  Log: `items: debug unlock rows, vanilla actionUnlockParamId: 999996=999996, ... -> 0 (zeroed,
+  before the save load)`.
+- After every save load (and whenever a row had to be zeroed again in the world) the game's own
+  `0x7A8200` rebuilds the counters once (prologue bytes checked first). Owned items such as Mibu
+  Breathing (2420), Mortal Blade (2400) or ninjutsu (2100/2110/2120 -> 2301) count as before;
+  only the debug sets drop out. Log: `items: action unlocks rebuilt (debug unlocks removed):
+  before [...] after [...]; locked again: [a00 dive (Mibu Breathing), a03 Mortal Blade, ...]`,
+  or `items: action unlocks rebuilt, unchanged [...]` once the fix is in place.
+- The row writer sets `actionUnlockParamId = 0` explicitly; `items: chosen rows, vanilla
+  actionUnlockParamId: ...` lists the vanilla values.
+- `fix_debug_item_unlocks = 0` turns the zeroing and the rebuild off (the old behaviour).
+
+Existing saves need nothing: the save holds items, not counters. A player who learned to dive
+only through this bug cannot dive any more after the fix until they get Mibu Breathing.
+
+Note for upstream (Tihvert): 1.0.11 has the same bug on 999996-999999. The fix is the two parts
+above: zero `actionUnlockParamId` of those rows before the save loads, then call
+`0x7A8200(PlayerGameData + 0x278 + 0x168)` once in the world.
 
 ## ObjAct sync (experimental, `[GAMEPLAY] sync_objact`, default 1; NOT verified live)
 
@@ -170,6 +292,7 @@ Live test protocol (both players on this build, `objact_debug = 1`, `native_sess
 
 Open: keyed doors open on the receiver without the key (flags are shared anyway); lifts and
 levers (one-loop) stay off unless both set `sync_objact = 2` and are not journaled.
+
 ## Loadout sync (experimental, `[DEBUG] loadout_sync`, default 1; not tested live yet)
 
 **Bug.** The friend's native replica (`native.rs`, a PlayerIns with its own PlayerGameData)
@@ -249,6 +372,7 @@ friend played as Whirlwind Slash (the template's default art).
   must show `loadout: peer N ids` matching the friend's `loadout: sent ids`, `slot 1 ... ->
   <art> applied`, the holder sync and the reload; the friend's art must play as itself on the
   replica, the friend's prosthetics must be visible.
+
 ## Player packet rate (experimental)
 
 `[ADVANCED] player_packet_hz` (12..60, default 30; 12 = the game's own rate, nothing patched).
@@ -297,88 +421,6 @@ Live checks: the sender's tee stats `type 1: ~300 (30.0/s ...)`; the receiver's 
 is closer to their real position. If walking reads as running, set `native_pin_delay_ms` by hand
 (try 90-130) and report the value.
 
-## Fixes to the 1.0.9 base
-
-- **False wipe** (1.0.9-pickups.3, `persist.rs`). A wipe was "every player's committed death
-  within 90 s", even when the first player had already reloaded and was alive again. Live
-  2026-11-09: the host died, reloaded and played on for 79 s, the friend then died, and both
-  sides cleared the dead set, the paid kills and the boss records (killed enemies and damaged
-  minibosses would come back on the next load). Now a death stops counting once that player
-  loaded after it and is alive (`death_over`: ours after our death reload, a peer's after its
-  last hidden snapshot); checked after the wipe test, so a death that comes in during the other
-  player's death reload is still a wipe. Log line: `persist: ... is back after ... death: it no
-  longer counts for a wipe`.
-
-## Base fixes ported from 1.0.11
-
-The 1.0.11-beta source is not public. These were rebuilt from its release notes, its ini
-comments, the log lines in its DLL and our players' 1.0.11 logs (catalogue:
-`docs/FIXES-1.0.11-vs-FORK.md`, Top-10). Branch `base-fixes`. Every item is a unit-tested
-rule plus game-side wiring; **none of them is verified live yet**: the oracle is a playtest
-with the log lines below.
-
-| Item | Setting (default) | Log lines to look for | Status |
-|---|---|---|---|
-| Per-run log files, F7 bug-report zip, crash zip (`log.rs`, `logzip.rs`) | `log_per_run` (1, next start), `send_logs_key` (118 = F7, 0 = off) | `log: this run also goes to ...logs\<date_time>.log`, `logzip: wrote N files ...`, `logzip: the previous run crashed / had no exit line: wrote ...` | unit tests (zip layout, CRC, names, pruning, password hidden); not run in game |
-| Fresh-life deathblow veto, 10 s (`nsession.rs dblock`, `livesync.rs`) | `getup_deathblow_veto` (1) | `deathblow: enemy E netId N lost a life (seen here / the friend's deathblow): no new deathblow on it here for 10 s ...`, `deathblow: our attempt on N refused: ... (fresh-life veto)`, `fresh-life vetoes` in the 10 s stats | unit tests; uses the existing gate detour `0xBE3810` (live since 1.0.9) |
-| Boss lives desync line (`livesync.rs`) | none (log only) | `livesync: DESYNC enemy ... for 15 s ...`, `... lives agree with the other players again after N s` | unit tests |
-| Limited shop stock per player (`world.rs shop_counter_bits`) | `shop_stock_per_player` (1, next start) | `world: ... per player (... shop rows, 75 shop counter bits, ...)` | unit test with the real 1.06 rows; width fitted to 1.0.11's own count (75) [ARV] |
-| Restores wait for a down peer (`persist.rs`) | `persist_wait_for_down` (1) | `persist: our death reload while peer(s) [..] are down: ...`, `persist: the down peer(s) settled N ms after our death reload: ...` | unit test for the end rule; builds on the false-wipe fix |
-| Ledge-hang / wall-hug stealth (`enemies.rs`) | `stealth_hang_cover` (1) | `stealth: our throw state ... (hang/cover): enemies within 12 m run on our AI ...`, `throw: handoff ... reason hang/cover`, `stealth: claiming enemy ... (..., hang/cover, ...)` | unit tests; reads ThrowModule `+0x79` (HKS act 160, RE-BACKSTAB.md) [VAR in IDA, not read live by the fork yet] |
-| Co-op items when the temple idol is lit (`items.rs`) | under `connection_items` | `items: the temple idol was just lit: giving the co-op items` | unit test for the edge |
-| me3 file mod warning (`me3scan.rs`, `doctor.rs`) | none (log + notice only) | `doctor: me3 profile ...: N package(s) ...`, `doctor: WARNING me3 file mods differ: ...` | unit tests (parser, fingerprint, warnings) |
-
-Notes:
-
-- The per-run file is a second copy of every line; log.txt is unchanged (append-only, moved
-  to log.old.txt at 8 MB), so `upload-log.ps1`, testsync and the existing instructions still
-  work. Zips and run logs live in `%LOCALAPPDATA%\sekiro-coop\logs\` (20 runs, 10 zips kept).
-- The veto refuses every throw of our player on that enemy at the gate, as the peer lock
-  does; 1.0.11 used the same gate (its stats line counts both).
-- The shop counter width (`eventFlag + 1 ..= eventFlag + floor(log2 sellQuantity)`) is
-  inferred, not read in the game's shop code: it is the only simple width that reproduces
-  1.0.11's "75 shop counter bits" with the same 1084 other per-player flags.
-## Co-op items unlocked diving and every skill (`[DEBUG] fix_debug_item_unlocks`, default 1)
-
-The co-op items sit on EquipParamGoods rows 999997 (Kindred Bell), 999998 (Kindred Charm) and
-999999 (Severed Thread); 1.0.11 also uses 999996 (Rival's Charm). In vanilla these rows are
-FromSoftware debug items: their `actionUnlockParamId` (+0x28) is their own id, and
-ActionUnlockParam 999999 unlocks every action, 999998 all but action03 (Mortal Blade), 999997 all
-but 03 and 06, 999996 all but 20-23. The owner of the items could dive without Mibu Breathing
-(HKS `env(3033, 0)`), use the Mortal Blade, ninjutsu and the skill actions without having them.
-
-How the game handles it (RE 2026-11-11, dump + Ghidra, details in `docs/RE-NOTES.md`):
-EquipInventoryData (EquipGameData+0x168 = PlayerGameData+0x3E0) keeps 30 counters at +0x90, one
-per action. `0x7A9A80` adds the item's quantity to every action of its unlock set when it is
-added or removed (goods: +0x28, weapons/skills: EquipParamWeapon+0x24C), with the params of that
-moment. `0x7A8200` zeroes the counters and adds the whole inventory again; the save loader
-(`0x7A8140`, [ARV]) and the debug param reload (`0x10B2AB0`) call it. `0x7A7FE0` = "counter > 0 or bit in
-+0x118" answers HKS `env(3033, n)` (case 0xBD9 of `0xB36410`). The mod rewrote our rows only
-seconds after the save had loaded, so the counters already held the debug sets and kept them.
-In the 2026-11-11 dump the counters matched "inventory x vanilla rows" exactly (action00 = 4: one
-from each of 999996-999999, no Mibu Breathing owned).
-
-Fix (`items.rs`): the ids stay (saves, the 1.0.11 Rival's Charm and upstream builds use them).
-- +0x28 of rows 999996-999999 (and of the rows this run chose) is set to 0 as soon as
-  EquipParamGoods is loaded, at the title before any save load; checked again every second.
-  Log: `items: debug unlock rows, vanilla actionUnlockParamId: 999996=999996, ... -> 0 (zeroed,
-  before the save load)`.
-- After every save load (and whenever a row had to be zeroed again in the world) the game's own
-  `0x7A8200` rebuilds the counters once (prologue bytes checked first). Owned items such as Mibu
-  Breathing (2420), Mortal Blade (2400) or ninjutsu (2100/2110/2120 -> 2301) count as before;
-  only the debug sets drop out. Log: `items: action unlocks rebuilt (debug unlocks removed):
-  before [...] after [...]; locked again: [a00 dive (Mibu Breathing), a03 Mortal Blade, ...]`,
-  or `items: action unlocks rebuilt, unchanged [...]` once the fix is in place.
-- The row writer sets `actionUnlockParamId = 0` explicitly; `items: chosen rows, vanilla
-  actionUnlockParamId: ...` lists the vanilla values.
-- `fix_debug_item_unlocks = 0` turns the zeroing and the rebuild off (the old behaviour).
-
-Existing saves need nothing: the save holds items, not counters. A player who learned to dive
-only through this bug cannot dive any more after the fix until they get Mibu Breathing.
-
-Note for upstream (Tihvert): 1.0.11 has the same bug on 999996-999999. The fix is the two parts
-above: zero `actionUnlockParamId` of those rows before the save loads, then call
-`0x7A8200(PlayerGameData + 0x278 + 0x168)` once in the world.
 ## PvP on the native hit packet (experimental, `[GAMEPLAY] friendly_fire`, default 0)
 
 Not tested in play. Player-vs-player damage with FromSoftware's own protocol: the attacker's
