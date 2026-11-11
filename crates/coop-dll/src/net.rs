@@ -1122,6 +1122,10 @@ impl Net {
         for data in crate::artfx::take_outbound(forward) {
             self.send_raw_masked(mask, crate::artfx::PTYPE, &data, now);
         }
+        // Our art-gate SpEffects for those remotes (remotefx.rs).
+        for data in crate::remotefx::take_outbound(forward) {
+            self.send_raw_masked(mask, crate::remotefx::PTYPE, &data, now);
+        }
         // Native session (nsession.rs): sends nothing unless native_session = 1 queued something.
         crate::nsession::pump(&mut self.session, now);
 
@@ -1396,7 +1400,10 @@ impl Net {
             Event::PlayerRaw { from, ptype, data } => {
                 let Some(id) = peer(from) else { return };
                 let epoch = self.epoch_of(from);
-                if !crate::nsession::on_raw(id, ptype, &data, epoch) && !crate::artfx::on_raw(id, ptype, &data) {
+                if !crate::nsession::on_raw(id, ptype, &data, epoch)
+                    && !crate::artfx::on_raw(id, ptype, &data)
+                    && !crate::remotefx::on_raw(id, ptype, &data)
+                {
                     crate::native::push_inbound(id, ptype, data)
                 }
             }

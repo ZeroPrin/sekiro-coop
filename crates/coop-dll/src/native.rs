@@ -805,7 +805,10 @@ fn create(player: Chr) -> Result<Remote, String> {
         return Err(format!("player init mismatch: {:x?} (pgd {pgd:#x})", &init[..5]));
     }
     let create: extern "C" fn(usize, u32, *const u64) -> usize = unsafe { std::mem::transmute(base + CREATE_PLAYER_RVA) };
+    // remotefx.rs: the model this factory builds is a friend's (full-detail parts).
+    crate::remotefx::creating(true);
     let p = create(wcm, CHR_TYPE_REMOTE, init.as_ptr());
+    crate::remotefx::creating(false);
     if p < 0x10000 {
         release_pgd(idx);
         return Err("create returned null (player chr set full?)".into());
