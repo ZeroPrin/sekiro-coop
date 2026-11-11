@@ -393,6 +393,25 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::logzip::SEND_LOGS_KEY.store(ini.num("send_logs_key", 118, 0, 255, warn), Relaxed);
     // Read again by log.rs at the next start (the per-run file opens before this reader runs).
     let _ = ini.flag("log_per_run", true, warn);
+    // Wardrobe (wardrobe.rs, per player).
+    crate::wardrobe::KEY.store(ini.num("wardrobe_key", 113, 0, 255, warn), Relaxed);
+    crate::wardrobe::PAD.store(ini.flag("wardrobe_pad", true, warn), Relaxed);
+    {
+        let i = ini.choice("wardrobe_pad_button", &["none", "back", "start", "l3", "r3"], 0, warn);
+        crate::wardrobe::PAD_BUTTON.store([0u16, 0x0020, 0x0010, 0x0040, 0x0080][i as usize], Relaxed);
+    }
+    crate::wardrobe::RELOAD.store(ini.flag("wardrobe_reload", true, warn), Relaxed);
+    crate::wardrobe::load_ini(
+        crate::wardrobe::IniValues {
+            enabled: ini.flag("wardrobe", true, warn),
+            skin: &ini.text("wardrobe_skin"),
+            head: &ini.text("wardrobe_head"),
+            legs: &ini.text("wardrobe_legs"),
+            original: &ini.text("wardrobe_original"),
+            added: &ini.text("wardrobe_added"),
+        },
+        warn,
+    );
 
     // [ADVANCED], live (no reconnect): the native session (nsession.rs).
     tuning::NATIVE_SESSION.store(ini.flag("native_session", true, warn), Relaxed);
@@ -743,6 +762,36 @@ send_logs_key = 118
 ;     log.txt stays as before). A run that crashed is packed into a crash_*.zip there at the
 ;     next start. 0 = log.txt only. Takes effect at the next start.
 log_per_run = 1
+
+; Wardrobe: mix outfit parts (skin = torso and arm, head, legs) on your own character, live.
+; 1 = the wardrobe panel opens with wardrobe_key. Nothing is changed until you pick something
+;     in it. 0 = off (the panel does not open, nothing is applied).
+wardrobe = 1
+; Windows virtual-key code that opens / closes the panel. 113 = F2 (F1..F12 = 112..123).
+; In the panel: Up/Down = row, Left/Right = change (applied after a short pause), Enter = now,
+; Esc = close.
+wardrobe_key = 113
+; 1 = while the panel is open the controller's right stick also drives it (up/down = row,
+;     left/right = change, right trigger = now). The camera turns with it. 0 = keyboard only.
+wardrobe_pad = 1
+; Controller button that opens / closes the panel: none, back, start, l3, r3. Each of them
+; also does its own thing in the game.
+wardrobe_pad_button = none
+; Written by the panel (you may edit them with the game closed):
+; skin: game (= as in game; restores what you wore before the wardrobe), wolf, shura, ashina,
+; tengu, sculptor. head: skin (= as the skin), wolf, shura, ashina, tengu, sculptor.
+; legs: skin, wolf, wolf_tabi, shura, ashina, tengu, sculptor (Shura / Tengu skins take only
+; shura / tengu legs, the others only wolf / wolf_tabi / ashina / sculptor).
+wardrobe_skin = game
+wardrobe_head = skin
+wardrobe_legs = skin
+; The outfit before the wardrobe's first change (head,torso,arm,legs,hair row ids) and the
+; rows it had to add to your inventory; both are cleared when skin = game restored them.
+wardrobe_original =
+wardrobe_added =
+; 1 = reload your character's parts right after a change (shows it at once). 0 = only change
+;     the equipment; the look may then update only after the next load screen.
+wardrobe_reload = 1
 
 [ADVANCED]
 ; Changing anything here (or the password / name) restarts the connection.

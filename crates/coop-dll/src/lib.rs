@@ -90,6 +90,7 @@ mod stuck;
 mod testsync;
 mod tuning;
 mod ui;
+mod wardrobe;
 mod world;
 
 use std::panic;
