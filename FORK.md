@@ -25,7 +25,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `log_per_run` | DISPLAY | 1 (next start) | Base fixes from 1.0.11 |
 | `send_logs_key` | DISPLAY | 118 (F7; 0 = off) | Base fixes from 1.0.11 |
 | `fix_debug_item_unlocks` | DEBUG | 1 | Co-op items unlocked diving |
-| `sync_objact` | GAMEPLAY | 1 (0 off, 2 + one-loop objects) | ObjAct sync |
+| `sync_objact` | GAMEPLAY | 1 (0 off, 1 doors / gates / chests, 2 + levers, lifts, bells, rotating walls, windows) | ObjAct sync |
 | `objact_debug` | DEBUG | 0 | ObjAct sync |
 | `objact_sender` | DEBUG | hook (or poll) | ObjAct sync |
 | `loadout_sync` | DEBUG | 1 | Loadout sync |
@@ -220,8 +220,8 @@ flag, already applied here, would go off) and sends packet 45 at stage 4.
   only notes the call (block, index, actor, run state and flag before, caller); the frame task
   sends it when the actor is our player's handle (`chr+0x08`) and the info started (run state
   3). `poll`: the 50 ms run-state walk of the first version (fallback; `+0x72` evidence). The
-  walk runs in both modes, the receiver needs its facts. One-loop states only with
-  `sync_objact = 2`; a door's sub infos go out once per 2 s.
+  walk runs in both modes, the receiver needs its facts. What goes out: "What is synced"
+  below; a door's sub infos go out once per 2 s.
 - **Message v2**: bulk kind `0xA7`, 29 bytes: magic `0x4F`, version 2, reason 1, state class,
   target value, map id, ObjActEntityID, info index, sub index, ObjActParam id, sequence number.
   A version 1 message (first objact build) is refused with a log line: both players need this
@@ -232,14 +232,15 @@ flag, already applied here, would go off) and sends packet 45 at stage 4.
   replay + kick when idle since the load; **kick only** when it already ran here as a replay
   (`+0x72 = 0`, e.g. the game's type 45 at stage 4) and was not kicked; nothing when doors.rs /
   we replayed it in the last 3 s, it was replayed or kicked since the load, it ran here as a
-  local start, our own player used it, a one-loop below mode 2, a door toggling closed, an
-  unknown class. The object check (`doors::object_view`) stays: already at that animation =
+  local start, our own player used it, not a door / chest below mode 2, a door toggling closed
+  (a one-loop door's target 0 too), an unknown class. The object check (`doors::object_view`) stays: already at that animation =
   nothing. The kick is skipped when isEventKickSync = 1 (the replay kicked), a kick is pending,
   the info has no ObjActEntityID, `0x6B2AF0` has other bytes, or the event manager is missing.
   doors.rs kicks after its own `0x6BA910` too (only with `sync_objact` on).
 - **Journal** (reload persistence): every executed ObjAct of the session, ours and the peers',
   by (map id, ObjActEntityID), at most 256 (oldest dropped), only one-state / door states that
-  opened (a door closing leaves it; one-loop never: a lift must not move on a reload). Cleared
+  opened, doors and chests only (a door closing leaves it; one-loop never: a one-loop door
+  loads from its flag, a lift must not move on a reload; levers / rotating walls never). Cleared
   on a new session, never written to disk. Once per second, an info of a journaled ObjAct that
   has been loaded and watched for 3 s, has not run since its load and whose object is not at
   that animation is replayed and kicked once per load (`journal:` line). This is the fix for
@@ -249,6 +250,54 @@ flag, already applied here, would go off) and sends packet 45 at stage 4.
   here and share_pickups sees it. A chest the friend already looted: its lot flag came with the
   pickup, the `0x91FCF0` refusal of the pickups section still applies.
 - Nothing runs in a Remnant memory.
+
+### What is synced, and one-loop doors (2026-11-12, after the first live test)
+
+Live test 2026-11-12: host -> client worked (one-state HUB door 1113712, ObjActParam 999941).
+Client -> host failed: the m11_01 gate 1113602 (ObjActParam 999900, flag 61110602) is a
+**one-loop** state and was cut off at mode 1 ("a lift or a lever?"). Only its flag reached the
+host; the host then used its still closed gate, the toggle switched 61110602 off, that went
+back to the client: both ended with the flag off, so the gate loads closed with its ObjAct
+disabled (20005616 set 11110602).
+
+Data (`E:\RE\sekiro-data\objacts.md`, every MSB ObjAct): EVERY bar door and gate in Sekiro is
+one-loop (stateType 2), sliding / HUB doors and chests are one-state, and the temple lift levers
+are one-state too. So the class says nothing; the ObjActParam row does (`doors::kind`, table in
+the doors.rs header): 999900-999979 and 101050 = Door, 999980-999999 = Chest, everything else
+(levers 205010/205011, bells 2051xx / 252555, rotating walls 9007x, rotating floors 9006x, the
+windows 1100000, hidden tatami, -1) = Other. Mode 1 syncs Door and Chest of any class (send,
+replay, journal); Other only with mode 2.
+
+One-loop doors [VAR, Ghidra `E:\RE\ghidra_doors2`]: `vt[4]` `0x6B64A0` toggles the flag on every
+local start, `vt[5]` `0x6B6810` sets it, and the requested animation (`0x6B1DE0` = `vt[8]` +
+objAnimId, one-loop `vt[8]` = `0x6B6B40` returns 0) is the same opening animation every time:
+there is no closing execution, the flag is a use parity, "open" = flag ON (the load restores
+the object from it [ARV]: 20005616 has no `ReproduceObjectAnimation`). Hence:
+- target state of a one-loop door is always 1; a target 0 is refused;
+- receiver: `0x6BA910(.., 1)` sets the flag to 1 (no toggle) and plays the animation, unless
+  the object is already at it (`reached`); flag first or message first, both end at flag ON +
+  open, the second is a no-op; doors.rs also replays a friend's ON for a one-loop door flag
+  (61xxxxxx, never seen by its map-flag path before) when its door is loaded and closed, and
+  counts a one-loop door at its animation as open (not only while it plays);
+- sender: our player using a one-loop door whose flag is on already (the case above) toggles
+  it off; the `0x6BA7B0` detour notes ON -> OFF of our own player and doors.rs **guard 5**
+  (`keep_open`) writes it back on without sending the OFF. A script's OFF (m11_00 11100600
+  closes gate 61100610 in phase 8301) is no start of ours: untouched, and guard 2/3 never apply
+  to one-loop door flags;
+- not journaled: a reload sets the door up from its flag.
+
+Log lines: `doors: our player used one-loop door F whose flag was on already ...: kept on`,
+`objact: we used ObjAct ... one-loop door whose flag was on already ...`, `doors: ... door flag F
+is on but its door (..., one-loop door, ObjActParam P) was closed here: opened (...); object
+anim A playing B, the open execution plays W`. The `doors.rs's replay ...: EMEVD not kicked: no
+ObjActEntityID` line (windows, after every load) is said once per object and session.
+
+Live check: A opens gate 1113602 (or any bar door, 9999xx one-loop). A: `we used ObjAct ...
+one-loop state ... sending as #N (target state 1)`. B: `peer ... here: ... replayed ... EMEVD
+kicked` (or `already at that execution's animation` when doors.rs opened it from the flag a
+moment earlier), B can pass, `61110602` and `11110602` on for both. B must NOT be able to use
+the gate any more; if B does use it (replay late), B's log has `kept on` and neither log shows
+`61110602 = false`. Both reload: the gate is open for both.
 
 Log lines (prefix `objact:`):
 - `0x6BA7B0 hooked ...` / `NOT hooked ...` at start; `sender: hook | poll ...; journal: N` once.
@@ -290,8 +339,9 @@ Live test protocol (both players on this build, `objact_debug = 1`, `native_sess
 6. If nothing is sent: look for `not sent: the actor is not our player` (handle) and retry with
    `objact_sender = poll`.
 
-Open: keyed doors open on the receiver without the key (flags are shared anyway); lifts and
-levers (one-loop) stay off unless both set `sync_objact = 2` and are not journaled.
+Open: keyed doors open on the receiver without the key (flags are shared anyway); levers,
+lifts, bells, rotating walls / floors and windows stay off unless both set `sync_objact = 2`
+and are never journaled.
 
 ## Loadout sync (experimental, `[DEBUG] loadout_sync`, default 1; not tested live yet)
 
