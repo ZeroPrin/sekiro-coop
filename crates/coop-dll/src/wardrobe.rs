@@ -454,6 +454,83 @@ pub fn external(applied: &Outfit, now: &Outfit) -> External {
     if applied.head == now.head && applied.legs == now.legs && applied.hair == now.hair { External::Story } else { External::Yield }
 }
 
+/// The torso of costume family `base` (100000, 300000, ...) for a sword state (the game's
+/// own `(cur / 100000) * 100000 + 1000 / 31000` family rule; only the Wolf has x41000).
+fn family_torso(base: i32, class: TorsoClass) -> i32 {
+    match class {
+        TorsoClass::MortalBlade => base + 1000,
+        TorsoClass::Sword => base + 31_000,
+        TorsoClass::NoSword if base == 100_000 => 141_000,
+        TorsoClass::NoSword => base + 31_000,
+    }
+}
+
+/// What "As in game" puts back: the remembered original, brought up to the story state the
+/// character is in NOW. The story changes torso / arm while a skin is worn (Mortal Blade, the
+/// prosthetic), also in sessions without this build, so a plain copy of the original could
+/// take the Mortal Blade off the back or the prosthetic off the arm in the save.
+/// - torso: the original's family with the sword state the worn torso tells (kept when the
+///   worn torso tells nothing, e.g. the Sculptor's);
+/// - arm: a bare / missing original arm becomes its family's prosthetic arm once the worn arm
+///   has a prosthetic (the Wolf's 102000 when the family has none).
+pub fn restore_target(orig: &Outfit, current: &Outfit) -> Outfit {
+    let mut o = *orig;
+    if let (Some(now), Some(_)) = (classify_torso(current.torso), classify_torso(orig.torso)) {
+        o.torso = family_torso(orig.torso / 100_000 * 100_000, now);
+    }
+    if prosthetic_arm(current.arm) && !prosthetic_arm(orig.arm) {
+        let fam = orig.arm / 100_000 * 100_000 + 2000;
+        o.arm = if prosthetic_arm(fam) { fam } else { 102_000 };
+    }
+    o
+}
+
+/// The character the wardrobe's records (`wardrobe_original`, `wardrobe_added`) belong to:
+/// the save slot (GameMan+0xAE4, 0..9) and its `total_sen_earned` then (ownworld.rs
+/// fingerprint: only grows for one character). One ini serves every character of the save
+/// file, so another character must never get this one's original outfit or lose items to
+/// this one's list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owner {
+    pub slot: i32,
+    pub sen: Option<u64>,
+}
+
+impl Owner {
+    /// Same slot, and (when both are known) not fewer sen than when it was recorded.
+    pub fn matches(&self, slot: Option<i32>, sen: Option<u64>) -> bool {
+        slot == Some(self.slot) && match (self.sen, sen) {
+            (Some(then), Some(now)) => now >= then,
+            _ => true,
+        }
+    }
+}
+
+pub fn owner_ini(o: Option<Owner>) -> String {
+    match o {
+        None => String::new(),
+        Some(Owner { slot, sen: None }) => slot.to_string(),
+        Some(Owner { slot, sen: Some(s) }) => format!("{slot},{s}"),
+    }
+}
+
+pub fn parse_owner(v: &str) -> Result<Option<Owner>, ()> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    let mut it = v.split(',').map(str::trim);
+    let slot: i32 = it.next().ok_or(())?.parse().map_err(|_| ())?;
+    let sen = match it.next() {
+        Some(s) => Some(s.parse::<u64>().map_err(|_| ())?),
+        None => None,
+    };
+    if it.next().is_some() || !(0..=9).contains(&slot) {
+        return Err(());
+    }
+    Ok(Some(Owner { slot, sen }))
+}
+
 // ---------------------------------------------------------------------------------------
 // Shared state (game task + overlay render thread).
 // ---------------------------------------------------------------------------------------
@@ -488,9 +565,13 @@ struct State {
     choices: Choices,
     /// What the ini said last time (read or written): a reload with the same text keeps
     /// panel edits not yet written.
-    ini_seen: (String, String, String, String, String),
+    ini_seen: [String; 6],
     original: Option<Outfit>,
     added: Vec<i32>,
+    /// The character `original` / `added` belong to (`wardrobe_owner`).
+    owner: Option<Owner>,
+    /// Logged once: the records belong to another character.
+    foreign_logged: bool,
     /// Sword state, kept while a torso that does not tell it is worn.
     class: TorsoClass,
     /// What we last put on (or found matching the choices).
@@ -517,9 +598,11 @@ static STATE: Mutex<State> = Mutex::new(State {
     disabled: None,
     checked: false,
     choices: Choices { skin: None, head: None, legs: None },
-    ini_seen: (String::new(), String::new(), String::new(), String::new(), String::new()),
+    ini_seen: [const { String::new() }; 6],
     original: None,
     added: Vec::new(),
+    owner: None,
+    foreign_logged: false,
     class: TorsoClass::Sword,
     applied: None,
     open: false,
@@ -541,8 +624,17 @@ pub static KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new
 pub static PAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// `wardrobe_pad_button`: XInput mask that opens / closes the panel (0 = none).
 pub static PAD_BUTTON: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-/// `wardrobe_reload`: reload the parts after a change (PlayerIns vtable slot 21).
-pub static RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// `wardrobe_reload`: reload the parts after a change (PlayerIns vtable slot 21). Off by
+/// default: never run on the local player live; with 0 the wardrobe does exactly what the
+/// game's own EMEVD ForcePlayerArmorEquip does (no reload either).
+pub static RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The panel is open (read without the lock: `message_filter` runs on the window thread).
+static OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn set_open(st: &mut State, open: bool) {
+    st.open = open;
+    OPEN.store(open && st.enabled, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// The ini values (settings.rs reads, this parses). Returns warnings.
 pub struct IniValues<'a> {
@@ -552,6 +644,7 @@ pub struct IniValues<'a> {
     pub legs: &'a str,
     pub original: &'a str,
     pub added: &'a str,
+    pub owner: &'a str,
 }
 
 /// settings.rs `apply`, every (re)load of the ini.
@@ -559,14 +652,18 @@ pub fn load_ini(v: IniValues<'_>, warn: &mut Vec<String>) {
     let Ok(mut st) = STATE.lock() else { return };
     st.enabled = v.enabled;
     if !v.enabled {
-        st.open = false;
+        set_open(&mut st, false);
     }
-    let seen = (v.skin.to_owned(), v.head.to_owned(), v.legs.to_owned(), v.original.to_owned(), v.added.to_owned());
+    let seen = [v.skin, v.head, v.legs, v.original, v.added, v.owner].map(str::to_owned);
     if st.ini_seen == seen {
         return;
     }
-    let first = st.ini_seen == Default::default();
+    let first = st.ini_seen.iter().all(String::is_empty);
     st.ini_seen = seen;
+    let owner = parse_owner(v.owner).unwrap_or_else(|_| {
+        warn.push(format!("wardrobe_owner = {:?} is not 'save slot[,sen]', ignored", v.owner));
+        None
+    });
     let skin = parse_skin(v.skin).unwrap_or_else(|_| {
         warn.push(format!("wardrobe_skin = {:?} is not game/wolf/shura/ashina/tengu/sculptor, using game", v.skin));
         None
@@ -595,6 +692,8 @@ pub fn load_ini(v: IniValues<'_>, warn: &mut Vec<String>) {
     st.choices = choices;
     st.original = original;
     st.added = added;
+    st.owner = owner;
+    st.foreign_logged = false;
 }
 
 fn describe(c: &Choices) -> String {
@@ -609,12 +708,13 @@ pub fn edit(e: Edit) {
     }
     match e {
         Edit::Toggle => {
-            st.open = !st.open;
+            let open = !st.open;
+            set_open(&mut st, open);
             log::line(if st.open { "wardrobe: panel opened" } else { "wardrobe: panel closed" });
         }
         Edit::Close => {
             if st.open {
-                st.open = false;
+                set_open(&mut st, false);
                 log::line("wardrobe: panel closed");
             }
         }
@@ -634,7 +734,7 @@ pub fn edit(e: Edit) {
 }
 
 pub fn panel_open() -> bool {
-    STATE.lock().is_ok_and(|s| s.open && s.enabled)
+    OPEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What the overlay draws.
@@ -853,33 +953,49 @@ fn clean_added(pgd: usize, added: &mut Vec<i32>, keep: &[i32]) {
     });
 }
 
-fn write_ini(st: &State) {
-    let upd = [
-        ("wardrobe_skin", skin_ini(st.choices.skin).to_owned()),
-        ("wardrobe_head", head_ini(st.choices.head).to_owned()),
-        ("wardrobe_legs", legs_ini(st.choices.legs).to_owned()),
-        ("wardrobe_original", outfit_ini(st.original)),
-        ("wardrobe_added", rows_ini(&st.added)),
-    ];
-    if let Err(e) = settings::write_keys(&upd) {
-        log::line(&format!("wardrobe: ini not written: {e}"));
-    }
-}
-
-fn remember_ini(st: &mut State) {
-    st.ini_seen = (
+fn ini_values(st: &State) -> [String; 6] {
+    [
         skin_ini(st.choices.skin).to_owned(),
         head_ini(st.choices.head).to_owned(),
         legs_ini(st.choices.legs).to_owned(),
         outfit_ini(st.original),
         rows_ini(&st.added),
-    );
-    write_ini(st);
+        owner_ini(st.owner),
+    ]
+}
+
+const INI_KEYS: [&str; 6] = ["wardrobe_skin", "wardrobe_head", "wardrobe_legs", "wardrobe_original", "wardrobe_added", "wardrobe_owner"];
+
+fn remember_ini(st: &mut State) {
+    // No records, no owner.
+    if st.original.is_none() && st.added.is_empty() {
+        st.owner = None;
+    }
+    st.ini_seen = ini_values(st);
+    let upd: Vec<(&str, String)> = INI_KEYS.into_iter().zip(st.ini_seen.iter().cloned()).collect();
+    if let Err(e) = settings::write_keys(&upd) {
+        log::line(&format!("wardrobe: ini not written: {e}"));
+    }
     st.ini_dirty = false;
 }
 
 /// Every in-world frame (puppet.rs, game thread, not during our warp).
 pub fn tick(player: Chr, in_world_for: Duration) {
+    let mut reload = None;
+    tick_locked(player, in_world_for, &mut reload);
+    // The parts reload runs without our lock: the render thread (panel) must never wait on
+    // a model build.
+    if let Some(same) = reload {
+        if game::load_pending() {
+            log::line("wardrobe: parts reload dropped (a load started; it rebuilds the parts)");
+        } else {
+            let r = crate::ghost::reload_parts(player);
+            log::line(&format!("wardrobe: parts reload {r:?} (holder follows the PGD: {same})"));
+        }
+    }
+}
+
+fn tick_locked(player: Chr, in_world_for: Duration, reload: &mut Option<bool>) {
     let Ok(mut st) = STATE.lock() else { return };
     if !st.enabled || st.disabled.is_some() {
         return;
@@ -915,17 +1031,55 @@ pub fn tick(player: Chr, in_world_for: Duration) {
             h.is_some() && h == read::<u32>(pgd + PGD_CHR_ASM + ASM_HANDLES + 4 * s)
         });
         if RELOAD.load(std::sync::atomic::Ordering::Relaxed) {
-            let r = crate::ghost::reload_parts(player);
-            log::line(&format!("wardrobe: parts reload {r:?} (holder follows the PGD: {same})"));
+            *reload = Some(same);
         } else {
             log::line(&format!("wardrobe: parts reload off (wardrobe_reload = 0; holder follows the PGD: {same})"));
         }
     }
 
-    // Somebody else changed the outfit we put on.
+    // The records belong to one character of the save file (`wardrobe_owner`).
+    if st.original.is_some() || !st.added.is_empty() {
+        let (slot, sen) = crate::ownworld::fingerprint();
+        match st.owner {
+            None => {
+                if let Some(slot) = slot {
+                    st.owner = Some(Owner { slot, sen });
+                    log::line(&format!("wardrobe: records taken as save slot {slot}'s (sen {sen:?})"));
+                    remember_ini(&mut st);
+                } else {
+                    st.status = "Waiting: save slot".into();
+                    return;
+                }
+            }
+            Some(o) if !o.matches(slot, sen) => {
+                if !st.foreign_logged {
+                    st.foreign_logged = true;
+                    log::line(&format!(
+                        "wardrobe: original {:?} / added {:?} belong to save slot {} (sen {:?}), this is slot {slot:?} (sen {sen:?}): \
+                         nothing changed here; load that character and pick 'As in game', or clear wardrobe_original / wardrobe_added / wardrobe_owner",
+                        st.original.map(|o| o.rows()),
+                        st.added,
+                        o.slot,
+                        o.sen
+                    ));
+                }
+                st.status = format!("Waiting: outfit of save slot {} (see log)", o.slot);
+                return;
+            }
+            Some(_) => {}
+        }
+    }
+
+    // Somebody else changed the outfit we put on. Handled only when the outfit may be
+    // touched (a Change Form menu / talk / cutscene may still be changing it over several
+    // frames, and no inventory entry is removed under an open menu).
     if let Some(a) = st.applied
         && a != current
     {
+        if let Some(why) = blocker(player, in_world_for) {
+            st.status = format!("Waiting: {why}");
+            return;
+        }
         match external(&a, &current) {
             External::Story => {
                 log::line(&format!("wardrobe: the game changed torso / arm {:?} -> {:?}: putting the skin on again", a.rows(), current.rows()));
@@ -956,8 +1110,8 @@ pub fn tick(player: Chr, in_world_for: Duration) {
     let want = match resolve(&st.choices, st.class, &current) {
         Some(w) => w,
         None => match st.original {
-            // "As in game" after a change: restore.
-            Some(o) => o,
+            // "As in game" after a change: restore (in the story state of now).
+            Some(o) => restore_target(&o, &current),
             None => {
                 st.status = "As in game".into();
                 return;
@@ -969,6 +1123,11 @@ pub fn tick(player: Chr, in_world_for: Duration) {
         st.waiting_logged = None;
         st.failed = None;
         if restoring {
+            // The clean-up removes inventory entries: only when the outfit may be touched.
+            if let Some(why) = blocker(player, in_world_for) {
+                st.status = format!("Waiting: {why}");
+                return;
+            }
             // Restored: forget the original, take back what we added.
             st.original = None;
             st.applied = None;
@@ -1016,8 +1175,16 @@ pub fn tick(player: Chr, in_world_for: Duration) {
         return;
     }
     if st.original.is_none() && !restoring {
+        let (slot, sen) = crate::ownworld::fingerprint();
+        let Some(slot) = slot else {
+            st.status = "Waiting: save slot".into();
+            return;
+        };
+        if st.owner.is_none_or(|o| !o.matches(Some(slot), sen)) {
+            st.owner = Some(Owner { slot, sen });
+        }
         st.original = Some(current);
-        log::line(&format!("wardrobe: original outfit remembered {:?}", current.rows()));
+        log::line(&format!("wardrobe: original outfit remembered {:?} (save slot {slot}, sen {sen:?})", current.rows()));
         // In the ini before anything is changed.
         remember_ini(&mut st);
     }
@@ -1321,6 +1488,48 @@ mod tests {
         assert_eq!(external(&WOLF_SWORD, &other), External::Yield);
         let hair = Outfit { hair: 304_000, ..WOLF_SWORD };
         assert_eq!(external(&WOLF_SWORD, &hair), External::Yield);
+    }
+
+    #[test]
+    fn restore_follows_the_story_state_of_now() {
+        // Original before the prosthetic and without the Mortal Blade; meanwhile (skin Ashina)
+        // the story gave both: the restore keeps them.
+        let early = Outfit { torso: 141_000, arm: 112_000, ..WOLF_SWORD };
+        let now = Outfit { head: 400_000, torso: 401_000, arm: 402_000, legs: 403_000, hair: -1 };
+        assert_eq!(restore_target(&early, &now), Outfit { torso: 101_000, arm: 102_000, ..early });
+        // Nothing changed in the story: the original as it was.
+        let now = Outfit { torso: 431_000, ..now };
+        assert_eq!(restore_target(&WOLF_SWORD, &now), WOLF_SWORD);
+        // A Tengu original keeps its family.
+        let tengu = Outfit { head: 500_000, torso: 531_000, arm: 502_000, legs: 503_000, hair: -1 };
+        assert_eq!(restore_target(&tengu, &Outfit { torso: 101_000, ..WOLF_SWORD }).torso, 501_000);
+        // No sword state for non-Wolf families: x31000.
+        assert_eq!(restore_target(&tengu, &Outfit { torso: 141_000, ..WOLF_SWORD }).torso, 531_000);
+        // The Sculptor's torso tells nothing: torso kept. A missing arm stays the original's.
+        let sculpt = Outfit { head: 200_000, torso: 201_000, arm: 122_000, legs: 203_000, hair: -1 };
+        assert_eq!(restore_target(&WOLF_SWORD, &sculpt), WOLF_SWORD);
+        // Stable: restoring the target again changes nothing (the tick compares to it).
+        let t = restore_target(&early, &Outfit { torso: 401_000, arm: 402_000, ..WOLF_SWORD });
+        assert_eq!(restore_target(&early, &t), t);
+    }
+
+    #[test]
+    fn owner_of_the_records() {
+        let o = Owner { slot: 2, sen: Some(1000) };
+        assert!(o.matches(Some(2), Some(1000)));
+        assert!(o.matches(Some(2), Some(5000)));
+        assert!(o.matches(Some(2), None));
+        // Another slot, the title screen, a new character in the same slot.
+        assert!(!o.matches(Some(3), Some(5000)));
+        assert!(!o.matches(None, Some(1000)));
+        assert!(!o.matches(Some(2), Some(10)));
+        for x in [None, Some(o), Some(Owner { slot: 0, sen: None })] {
+            assert_eq!(parse_owner(&owner_ini(x)), Ok(x));
+        }
+        assert_eq!(parse_owner(" 4 , 77 "), Ok(Some(Owner { slot: 4, sen: Some(77) })));
+        for bad in ["10", "-1", "a", "1,2,3", "1,-2", "1,"] {
+            assert_eq!(parse_owner(bad), Err(()), "{bad}");
+        }
     }
 
     #[test]

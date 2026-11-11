@@ -400,7 +400,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
         let i = ini.choice("wardrobe_pad_button", &["none", "back", "start", "l3", "r3"], 0, warn);
         crate::wardrobe::PAD_BUTTON.store([0u16, 0x0020, 0x0010, 0x0040, 0x0080][i as usize], Relaxed);
     }
-    crate::wardrobe::RELOAD.store(ini.flag("wardrobe_reload", true, warn), Relaxed);
+    crate::wardrobe::RELOAD.store(ini.flag("wardrobe_reload", false, warn), Relaxed);
     crate::wardrobe::load_ini(
         crate::wardrobe::IniValues {
             enabled: ini.flag("wardrobe", true, warn),
@@ -409,6 +409,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
             legs: &ini.text("wardrobe_legs"),
             original: &ini.text("wardrobe_original"),
             added: &ini.text("wardrobe_added"),
+            owner: &ini.text("wardrobe_owner"),
         },
         warn,
     );
@@ -785,13 +786,17 @@ wardrobe_pad_button = none
 wardrobe_skin = game
 wardrobe_head = skin
 wardrobe_legs = skin
-; The outfit before the wardrobe's first change (head,torso,arm,legs,hair row ids) and the
-; rows it had to add to your inventory; both are cleared when skin = game restored them.
+; The outfit before the wardrobe's first change (head,torso,arm,legs,hair row ids), the
+; rows it had to add to your inventory and the character they belong to (save slot,sen);
+; all cleared when skin = game restored them. Another character of the save is left alone
+; while they are set.
 wardrobe_original =
 wardrobe_added =
-; 1 = reload your character's parts right after a change (shows it at once). 0 = only change
-;     the equipment; the look may then update only after the next load screen.
-wardrobe_reload = 1
+wardrobe_owner =
+; 1 = reload your character's parts right after a change (shows it at once; never tried live
+;     on your own character, may crash). 0 = only change the equipment, as the game's own
+;     event script does; the look may then update only after the next load screen.
+wardrobe_reload = 0
 
 [ADVANCED]
 ; Changing anything here (or the password / name) restarts the connection.

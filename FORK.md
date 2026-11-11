@@ -40,8 +40,8 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `pvp_dry_run` | DEBUG | 0 | Friendly fire |
 | `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | Friendly fire |
 | `block_change_grace_ms` | DEBUG | 2500 (0..3000; 0 = the old immediate rule) | Block-border grace (IMPLEMENTATION-NOTES) |
-| `wardrobe`, `wardrobe_key`, `wardrobe_pad`, `wardrobe_pad_button`, `wardrobe_reload` | DISPLAY | 1, 113 (F2), 1, none, 1 | Wardrobe |
-| `wardrobe_skin`, `wardrobe_head`, `wardrobe_legs`, `wardrobe_original`, `wardrobe_added` | DISPLAY | game, skin, skin, empty, empty (written by the panel) | Wardrobe |
+| `wardrobe`, `wardrobe_key`, `wardrobe_pad`, `wardrobe_pad_button`, `wardrobe_reload` | DISPLAY | 1, 113 (F2), 1, none, 0 | Wardrobe |
+| `wardrobe_skin`, `wardrobe_head`, `wardrobe_legs`, `wardrobe_original`, `wardrobe_added`, `wardrobe_owner` | DISPLAY | game, skin, skin, empty, empty, empty (written by the panel) | Wardrobe |
 | `fx_speffect_mirror` | DEBUG | 1 (0 off, 2 = also enchant states) | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 | `native_full_parts` | DEBUG | 1 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 | `fx_debug` | DEBUG | 0 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
@@ -568,7 +568,9 @@ the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
   update reacts to weapon slots only, the loader `0xA361C0` runs from PlayerIns vtable slots
   8/21/27/33/35. So one frame later the wardrobe calls slot 21 (`ghost::reload_parts`, used on
   replicas in the 2026-11-12 test without trouble; never on the local player before) [ARV].
-  `wardrobe_reload = 0` leaves it out (the look may then change only at the next load). The
+  Default `wardrobe_reload = 0` leaves it out (the look may then change only at the next load;
+  review 2026-11-12: 0 = exactly the game's own EMEVD path, the safer default until slot 21 on
+  the local player is seen working live). The
   "Change Form" menu itself was not found; slot 16 for the hair is inferred from `0x79E230`
   reading protector kinds 0..4 [ARV].
 - **Save and inventory.** Worn protectors are part of EquipGameData, which the save keeps
@@ -576,19 +578,27 @@ the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
   ids already match. Rows the player does not own (Sculptor's set, 153000, costumes before
   their Memory) are added to the inventory (count 1, no "new" mark) and listed in
   `wardrobe_added`; protectors have no menu page in Sekiro, so they should not show anywhere
-  [Г]. Skin "As in game" re-equips `wardrobe_original` (the 5 rows before the first change) and
-  removes the added rows that are not worn and whose item-lot flag (50003400.., the game's
-  award) is not set. The ini is per player, not per save: a second save gets the same skin.
+  [Г]. Skin "As in game" re-equips `wardrobe_original` (the 5 rows before the first change,
+  brought to the story state of now: `restore_target` keeps a Mortal Blade / prosthetic the
+  story gave meanwhile) and removes the added rows that are not worn and whose item-lot flag
+  (50003400.., the game's award) is not set. The ini is per player, not per save: a second
+  save gets the same skin, but the records belong to one character (`wardrobe_owner` = save
+  slot + total sen earned, ownworld's fingerprint): another slot / a new character in the slot
+  is left alone (`wardrobe: ... belong to save slot N`) until that character restores or the
+  three keys are cleared.
 - **Not fighting the game.** If only the torso / arm change under us (story: Mortal Blade,
   prosthetic) the skin is put on again with the new sword state. If the head, legs or slot 16
   change too (the game's Change Form, NG+) the wardrobe goes back to "As in game" and says so.
+  Both are handled only once the blockers below clear (a Change Form menu / talk may change the
+  parts over several frames; nothing is removed from the inventory under an open menu).
 - **Safety.** First use byte-checks the 10 called functions (one `wardrobe: DISABLED` line on a
   mismatch); every row must be in EquipParamProtector. Nothing is applied on a load / less than
   5 s after it (gpuguard: the driver crash fired most after loads), dead, remnant, in a menu,
   talk, cutscene or a throw / deathblow (`enemies::throw_active`), and not twice within 400 ms.
   While the panel is open the keyboard's window messages do not reach the game
   (`MessageFilter::InputKeyboard`; if the game reads the keyboard through DirectInput it still
-  sees the arrows [Г]) and the stuck watchdog ignores Esc.
+  sees the arrows [Г]) and the stuck watchdog ignores Esc. The parts reload runs outside the
+  wardrobe lock; `panel_open` (window thread) is an atomic.
 - **The friend.** Slots 12..16 travel in the loadout (`loadout.rs`), sent the frame they change.
   The replica side validates them (category 1, an EquipParamProtector row) and now also replays
   emptying slot 16 (`loadout::SLOT_EMPTIABLE`, the game's own way for slots 17..21), else the
@@ -600,13 +610,14 @@ the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
   skipped for now (REASON)`, `wardrobe: the game changed ...`, `wardrobe: original outfit [..]
   restored`, `wardrobe: R removed from the inventory`. Friend: `loadout: peer N ids`, `slot 16
   ... -> emptied`.
-- **Live test.** Solo first: F2, Skin -> Tengu, wait: the log shows the slots, `parts reload
-  Ok`, the body changes on screen without a load. Then flick Left/Right fast: one apply per
-  pause. Then "As in game": the old outfit and `restored`. Then with `wardrobe_reload = 0`:
-  does the body change without the reload? (Settles whether slot 21 is needed.) In co-op the
+- **Live test.** Solo first, default `wardrobe_reload = 0`: F2, Skin -> Tengu, wait: the log
+  shows the slots and `parts reload off`; does the body change on screen without a load? If
+  not, `wardrobe_reload = 1`, change again: `parts reload Ok`, the body changes (settles whether
+  slot 21 is needed and safe on the local player). Then flick Left/Right fast: one apply per
+  pause. Then "As in game": the old outfit and `restored`. In co-op the
   friend's replica must change within a second or two (`loadout: peer N ids`).
 - Unit tests: `wardrobe::tests` (torso variants, legs rule, fallback on a skin change, ini
-  round trip, external changes, award flags).
+  round trip, external changes, award flags, restore target, records owner).
 
 ## Player packet rate (experimental)
 
