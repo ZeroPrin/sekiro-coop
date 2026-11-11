@@ -374,6 +374,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::persist::BOSS_PERSIST.store(ini.flag("boss_persist_on_death", true, warn), Relaxed);
     crate::persist::WAIT_FOR_DOWN.store(ini.flag("persist_wait_for_down", true, warn), Relaxed);
     enemies::STEALTH_WINDOW_M.store(ini.num("stealth_window_m", 15, 0, 40, warn), Relaxed);
+    enemies::STEALTH_HANG_COVER.store(ini.flag("stealth_hang_cover", true, warn), Relaxed);
 
     // [DISPLAY]. vsync = 0 means "turn the game's vsync off" (fps.rs VSYNC_OFF).
     fps::UNLOCK.store(ini.flag("fps_unlock", true, warn), Relaxed);
@@ -657,6 +658,9 @@ persist_wait_for_down = 1
 ; within this many metres runs on your own machine's AI (its awareness is yours, as in
 ; single player). 0 = the old 5 m check behind it only. 0..40.
 stealth_window_m = 15
+; 1 = also while you hang from a ledge or hug a wall at a corner (peeking), enemies within 12 m run on your own
+;     machine's AI, so the ledge and wall-hug stealth deathblows work as in single player. 0 = off.
+stealth_hang_cover = 1
 
 [DISPLAY]
 ; 1 = frame rate unlocked to 120 fps.

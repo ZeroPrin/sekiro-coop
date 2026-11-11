@@ -229,6 +229,8 @@ pub struct Enemies {
     claim_logs: u32,
     /// Last `stealth_claims` run (rate limit, see there).
     claims_at: Option<Instant>,
+    /// Our player's HKS throwable state (`player_throw_state`): when read, the value.
+    throw_state: (Option<Instant>, Option<u8>),
     _forget: ForgetOnDrop,
 }
 
@@ -1387,6 +1389,43 @@ const STEALTH_HOLD_EXTRA_M: f32 = 5.0;
 /// Native session: a claim is dropped this long after the approach ended.
 const CLAIM_LINGER: Duration = Duration::from_millis(3000);
 
+/// `[GAMEPLAY] stealth_hang_cover` (1.0.11): while our player hangs from a ledge or hugs a
+/// wall at a corner (peeking), enemies within `HANG_COVER_M` run on our own AI too, so the
+/// ledge and wall-hug stealth deathblows work as in single player.
+pub static STEALTH_HANG_COVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+const HANG_COVER_M: f32 = 12.0;
+/// The player's ThrowModule (`*(chr+0x1FF8)+0x88`) byte `+0x79`: the attacker throwable
+/// state HKS `act(160, ...)` writes every frame [VAR, RE-BACKSTAB.md: act handler `0xB32410`,
+/// read by the attacker check `0xBE3520`]. Values from `c0000_define.lua`:
+/// THROWABLE_STATE_ATK_PC_COVER_LOOK_L = 4, _R = 5, _HANG = 6 (`c0000.lua:566-573`).
+/// 1.0.11 logs the same byte ("stealth: our throw state Some(3) -> 6 (Hang)").
+const THROW_ATK_STATE_HKS: usize = 0x79;
+const THROW_STATE_COVER_L: u8 = 4;
+const THROW_STATE_COVER_R: u8 = 5;
+const THROW_STATE_HANG: u8 = 6;
+/// The throwable state is read at most this often (it is shared by every enemy's test).
+const THROW_STATE_EVERY: Duration = Duration::from_millis(50);
+
+/// "hang" / "cover" for a ledge hang / a wall-corner peek, None otherwise.
+fn hang_cover_kind(state: Option<u8>) -> Option<&'static str> {
+    match state? {
+        THROW_STATE_HANG => Some("hang"),
+        THROW_STATE_COVER_L | THROW_STATE_COVER_R => Some("cover"),
+        _ => None,
+    }
+}
+
+/// An enemy within `HANG_COVER_M` (3D) of us while we hang or peek (`hang_cover_kind`).
+fn hang_cover_approach(kind: Option<&'static str>, d: [f32; 3]) -> Option<&'static str> {
+    let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    kind.filter(|_| dist <= HANG_COVER_M)
+}
+
+fn player_throw_state(player: Chr) -> Option<u8> {
+    let tm = game::read_ptr(player.0 + 0x1FF8).and_then(|m| game::read_ptr(m + 0x88)).filter(|&t| t != 0)?;
+    game::read::<u8>(tm + THROW_ATK_STATE_HKS)
+}
+
 fn stealth_window_m() -> f32 {
     STEALTH_WINDOW_M.load(std::sync::atomic::Ordering::Relaxed).min(40) as f32
 }
@@ -1415,7 +1454,7 @@ fn approach_kind(d: [f32; 3], forward: Option<[f32; 2]>, r: f32, holding: bool) 
 /// Not for a boss: its deathblow window comes from the posture / throw node reasons, which
 /// stay allowed.
 fn boss_handoff_allowed(is_boss: bool, reason: &str) -> bool {
-    !(is_boss && matches!(reason, "behind" | "above"))
+    !(is_boss && matches!(reason, "behind" | "above" | "hang" | "cover"))
 }
 
 /// Starts with two or more lives (NpcParam deathblows): a boss or a miniboss, also one that
@@ -1453,7 +1492,32 @@ impl Enemies {
         }
         let d = [pp[0] - ep[0], pp[1] - ep[1], pp[2] - ep[2]];
         let forward = chr.angle().and_then(|a| self.facing.forward(a));
-        approach_kind(d, forward, stealth_window_m(), holding).map(|k| (k, d[1]))
+        approach_kind(d, forward, stealth_window_m(), holding)
+            .or_else(|| hang_cover_approach(self.hang_cover(player), d))
+            .map(|k| (k, d[1]))
+    }
+
+    /// Our player hangs from a ledge or peeks round a wall ("hang" / "cover"), with
+    /// `stealth_hang_cover` on. The state change is logged (both edges of hang / cover).
+    fn hang_cover(&mut self, player: Chr) -> Option<&'static str> {
+        if !STEALTH_HANG_COVER.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let now = Instant::now();
+        let (at, old) = self.throw_state;
+        if at.is_none_or(|t| now.duration_since(t) >= THROW_STATE_EVERY) {
+            let new = player_throw_state(player);
+            self.throw_state = (Some(now), new);
+            let (was, is) = (hang_cover_kind(old), hang_cover_kind(new));
+            if was != is {
+                log::line(&format!(
+                    "stealth: our throw state {old:?} -> {new:?} ({}): enemies within {HANG_COVER_M} m {}",
+                    is.or(was).unwrap_or("-"),
+                    if is.is_some() { "run on our AI for a ledge / wall-hug deathblow" } else { "back to the normal stealth window" }
+                ));
+            }
+        }
+        hang_cover_kind(self.throw_state.1)
     }
 
     /// Client, NetAI enemies (mode 4): true while the enemy is handed to its local AI
@@ -1841,6 +1905,26 @@ mod tests {
         assert_eq!(wire(0xA002), (true, 0x11, 0));
         // Unknown character: no target, counted as unmapped.
         assert_eq!(wire(0xA004), (false, netai::TARGET_NONE, 0xA004));
+    }
+
+    #[test]
+    fn hang_and_cover_hand_off_enemies_within_12_m() {
+        assert_eq!(hang_cover_kind(Some(6)), Some("hang"));
+        assert_eq!(hang_cover_kind(Some(4)), Some("cover"));
+        assert_eq!(hang_cover_kind(Some(5)), Some("cover"));
+        // Stand, crouch, fall, wire fall, swim, none.
+        for s in [1, 2, 3, 8, 12, 255] {
+            assert_eq!(hang_cover_kind(Some(s)), None, "state {s}");
+        }
+        assert_eq!(hang_cover_kind(None), None);
+        // Any direction (a ledge is usually above, a corner beside), 12 m in 3D.
+        assert_eq!(hang_cover_approach(Some("hang"), [3.0, 4.0, 0.0]), Some("hang"));
+        assert_eq!(hang_cover_approach(Some("cover"), [-8.0, 0.0, 8.9]), Some("cover"));
+        assert_eq!(hang_cover_approach(Some("cover"), [9.0, 0.0, 9.0]), None);
+        assert_eq!(hang_cover_approach(None, [1.0, 0.0, 0.0]), None);
+        // Never a boss.
+        assert!(!boss_handoff_allowed(true, "hang") && !boss_handoff_allowed(true, "cover"));
+        assert!(boss_handoff_allowed(false, "hang"));
     }
 
     #[test]
