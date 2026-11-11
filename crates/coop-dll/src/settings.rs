@@ -457,6 +457,9 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::objact::DEBUG.store(ini.flag("objact_debug", false, warn), Relaxed);
     crate::objact::SENDER.store(ini.choice("objact_sender", &["hook", "poll"], crate::objact::SENDER_HOOK, warn), Relaxed);
     crate::hook::freeze::SKIP_DRIVER_THREADS.store(ini.flag("freeze_skip_driver_threads", true, warn), Relaxed);
+    crate::remotefx::MIRROR.store(ini.num("fx_speffect_mirror", 1, 0, 2, warn) as u8, Relaxed);
+    crate::remotefx::FULL_PARTS.store(ini.flag("native_full_parts", true, warn), Relaxed);
+    crate::remotefx::FX_DEBUG.store(ini.flag("fx_debug", false, warn), Relaxed);
     // Log categories switched off (log.rs). Missing key = the default list; an empty value = none.
     log::set_muted(log::parse_categories(ini.get("log_off").map_or(DEFAULT_LOG_OFF, String::as_str)));
     // Read once at start: the observation hooks stay once installed.
@@ -882,6 +885,18 @@ objact_sender = hook
 ; 1 = code patches leave GPU driver threads running (they never run game code; waiting
 ;     for one froze the game for up to 5 s). 0 = every thread is paused, as before v8.61.
 freeze_skip_driver_threads = 1
+; The friend's combat art effects (docs/RE-REMOTE-FX.md): art slashes, Dragon Flash sounds and
+; the extra Floating Passage / Mortal Draw effects need SpEffects the game's event script gives
+; only to your own character. 1 = the friend's character on your screen gets the ones the friend
+; has (106000, 140310, 140510, 140610); 2 = also the enchant (buff) states the art events test;
+; 0 = off. Both players need this build (each sends its own).
+fx_speffect_mirror = 1
+; 1 = the friend's character uses the full-detail parts (sharper textures) instead of the
+; game's low-detail _L parts for other players. Applies when the character is created or dressed.
+native_full_parts = 1
+; 1 = log effect / sound diagnostics (fx: lines: SpEffects, animation effect and sound events
+; with their conditions, parts) for you and the friend's character. Long logs. 0 = off.
+fx_debug = 0
 ; v7.7 behaviours, switchable for testing (0 = as in v7.6). Same value on both machines.
 ; Claims / contests force the game's ownership hand-out at once (max once per second).
 ns_force_distribution = 1

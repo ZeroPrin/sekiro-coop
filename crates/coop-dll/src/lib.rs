@@ -69,6 +69,7 @@ mod ngblock;
 mod optprobe;
 mod packetrate;
 mod quitblock;
+mod remotefx;
 mod restsync;
 mod resurrect;
 mod resync;
@@ -326,6 +327,7 @@ fn init(hmodule: usize) {
                         MOD_ALIVE.store(false, Ordering::Release);
                         log::line("coop: too many panics, co-op disabled until restart");
                         let _ = panic::catch_unwind(artfx::shutdown);
+                        let _ = panic::catch_unwind(remotefx::shutdown);
                         let _ = panic::catch_unwind(nsession::shutdown);
                         let _ = panic::catch_unwind(pvp::shutdown);
                     }
