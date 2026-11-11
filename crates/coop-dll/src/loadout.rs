@@ -417,6 +417,10 @@ const FOLLOW_NONE: Follow = Follow { chr: 0, check: None, logged: None };
 static FOLLOW: Mutex<[Follow; MAX_PLAYERS]> = Mutex::new([FOLLOW_NONE; MAX_PLAYERS]);
 /// A replica's ChrAsm failed the layout check: this feature stays off on this machine.
 static REPLICA_ASM_BAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Replica ChrAsm checks failed in a row (any replica); `REPLICA_ASM_MISS_LIMIT` turns it off.
+static REPLICA_ASM_MISSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// About 1 s of dress ticks.
+const REPLICA_ASM_MISS_LIMIT: u32 = 60;
 
 /// native.rs (game thread, the replica in the player chr set): put the active prosthetic
 /// `l` carries on `peer`'s replica `chr` (PGD `pgd`). Writes the replica PGD's ChrAsm index
@@ -454,13 +458,22 @@ pub fn follow_active(chr: Chr, pgd: usize, peer: PeerId, l: &Loadout) {
     }
     let Some((vt, arm, now)) = asm_read(asm) else { return };
     if !asm_sane(vt, arm, now) {
-        REPLICA_ASM_BAD.store(true, Ordering::Relaxed);
-        log::line(&format!(
-            "loadout: active prosthetic DISABLED on this side: replica {:#x} ChrAsm (PGD {pgd:#x} +0x310) fails the check (vtable ok {vt}, arm style {arm}, index {now})",
-            chr.0
-        ));
+        // Not on the first miss: the first call comes from the dress in the creation frame,
+        // on a PGD just filled from CharaInitParam. Only a lasting failure turns it off.
+        let n = REPLICA_ASM_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n >= REPLICA_ASM_MISS_LIMIT {
+            log::line(&format!(
+                "loadout: replica {:#x} ChrAsm (PGD {pgd:#x} +0x310) fails the check (vtable ok {vt}, arm style {arm}, index {now}), miss {n}{}",
+                chr.0,
+                if n >= REPLICA_ASM_MISS_LIMIT { ": active prosthetic DISABLED on this side" } else { "" }
+            ));
+        }
+        if n >= REPLICA_ASM_MISS_LIMIT {
+            REPLICA_ASM_BAD.store(true, Ordering::Relaxed);
+        }
         return;
     }
+    REPLICA_ASM_MISSES.store(0, Ordering::Relaxed);
     let want = l.active_prosthetic();
     let Some(replica) = ids_of(pgd) else { return };
     match check_active(want, &l.slots, &replica) {
