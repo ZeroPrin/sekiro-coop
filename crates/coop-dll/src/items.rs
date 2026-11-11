@@ -13,7 +13,8 @@
 //! - Use: detour on `PlayerIns::OnGoodsUsed` (`0xA262D0`, PlayerIns vtable slot 125)
 //!   sets a bit for our ids on the main player; the frame task acts on it.
 //! - Give: on the player's own idol rest once the Dilapidated Temple idol is unlocked
-//!   (the tutorial is over), each missing item through `0x91C970` with the normal
+//!   (the tutorial is over), and at the moment that idol is lit (its unlock flag goes
+//!   0 -> 1 while we watch, 1.0.11), each missing item through `0x91C970` with the normal
 //!   "item received" popup. Never at game start. The mod only runs with the co-op save
 //!   (`S0000.coop.sl2`, me3 profile), so the items only ever land there.
 //! - Title screen: detours on the TitleStep and InGameStep constructors (`0xA89DA0`,
@@ -223,7 +224,7 @@ pub fn solo_hint() -> String {
         return "solo (connection_items = 0: set auto_connect = 1 to connect)".into();
     }
     match STAGE.load(Ordering::Relaxed) {
-        STAGE_TUTORIAL => "co-op unlocks after the tutorial, at the Dilapidated Temple idol".into(),
+        STAGE_TUTORIAL => "co-op unlocks after the tutorial: light the Dilapidated Temple idol".into(),
         STAGE_REST => "rest at an idol to receive the co-op items".into(),
         STAGE_READY => format!("use {HOST_NAME} to host or {JOIN_NAME} to join"),
         STAGE_FAILED => "co-op items unavailable (see log.txt), use auto_connect = 1".into(),
@@ -469,6 +470,8 @@ struct State {
     give_pending: bool,
     /// That rest was at the temple idol itself.
     rested_at_temple: bool,
+    /// The temple idol's unlock flag at the last look (None = not read since the load).
+    temple_lit: Option<bool>,
     in_world_since: Option<Instant>,
     cooldown: [Option<Instant>; 3],
     title_seen: u32,
@@ -877,12 +880,14 @@ impl State {
             self.hold = Some(false);
             self.give_pending = false;
             self.rested_at_temple = false;
+            self.temple_lit = None;
             // A question open across the title is forgotten (its late answer is dropped).
             self.confirm = None;
             net::on_title();
         }
         let Some(_) = player else {
             self.in_world_since = None;
+            self.temple_lit = None;
             if self.hold == Some(false) {
                 self.hold = Some(true);
             }
@@ -918,6 +923,16 @@ impl State {
             self.rested_at_temple |= temple;
         }
         self.last_rest = rest;
+        // The temple idol was just lit (its flag 0 -> 1 while we watch, not a load that
+        // finds it on): the items come at once, no rest needed (1.0.11).
+        if let Some(Some(t)) = self.temple {
+            let lit = event_flag(t.flag);
+            if lit_edge(self.temple_lit, lit) {
+                log::line("items: the temple idol was just lit: giving the co-op items");
+                self.give_pending = true;
+            }
+            self.temple_lit = Some(lit);
+        }
         // After the rest menu: give if the tutorial is over (the temple idol is unlocked,
         // or this rest was at it: its first rest may set the flag a moment later).
         if self.give_pending && game::safe_for_reward(in_world).is_ok() {
@@ -969,9 +984,23 @@ pub fn on_frame() {
     state.tick();
 }
 
+/// The temple idol's flag went 0 -> 1 between two looks in the same world (`was` = None:
+/// the first look after a load, never an edge).
+fn lit_edge(was: Option<bool>, now: bool) -> bool {
+    was == Some(false) && now
+}
+
 #[cfg(test)]
 mod full_tests {
     use super::*;
+
+    #[test]
+    fn items_come_when_the_temple_idol_is_lit() {
+        assert!(lit_edge(Some(false), true));
+        assert!(!lit_edge(None, true), "a load that finds it lit is no edge (the rest rule covers it)");
+        assert!(!lit_edge(Some(true), true));
+        assert!(!lit_edge(Some(false), false));
+    }
 
     #[test]
     fn the_template_is_found_by_id_in_any_language() {
