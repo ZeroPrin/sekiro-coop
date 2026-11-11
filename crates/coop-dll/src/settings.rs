@@ -372,6 +372,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::puppetguard::ENABLED.store(ini.flag("puppet_type5_guard", true, warn), Relaxed);
     crate::bossrules::CLEAR_STALE_NO_REVIVE.store(ini.flag("clear_stale_no_revive", true, warn), Relaxed);
     crate::persist::BOSS_PERSIST.store(ini.flag("boss_persist_on_death", true, warn), Relaxed);
+    crate::persist::WAIT_FOR_DOWN.store(ini.flag("persist_wait_for_down", true, warn), Relaxed);
     enemies::STEALTH_WINDOW_M.store(ini.num("stealth_window_m", 15, 0, 40, warn), Relaxed);
 
     // [DISPLAY]. vsync = 0 means "turn the game's vsync off" (fps.rs VSYNC_OFF).
@@ -647,6 +648,11 @@ clear_stale_no_revive = 1
 ;     (only a rest or both players dying resets it). 0 = as in the base game (and other
 ;     seamless co-op mods): a death reload brings the boss back at full health.
 boss_persist_on_death = 1
+; 1 = when you come back from a death while another player is down (at 0 HP choosing to
+;     Resurrect, or dead), the boss keeps waiting: if they die too it is a wipe and the boss
+;     resets for everybody; if they get up, the boss keeps the health it lost as usual (at
+;     most 30 s). 0 = your return ends your part of a wipe at once.
+persist_wait_for_down = 1
 ; Stealth and plunging deathblows: an enemy you approach from behind or from above
 ; within this many metres runs on your own machine's AI (its awareness is yours, as in
 ; single player). 0 = the old 5 m check behind it only. 0..40.
