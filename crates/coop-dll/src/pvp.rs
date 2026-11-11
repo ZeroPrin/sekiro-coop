@@ -55,6 +55,11 @@
 //!   still never applied.
 //! - Diagnostics only: `call 0xB6AB40` in `0xB6A040` -> `reaction_hook` counts the friend's
 //!   copy hitting us (the laggy local path; 0 expected with team 28).
+//! - Prosthetic tools, bullets, explosions need nothing extra [VAR, E:\RE\work_pvpff_bul]:
+//!   `0x995600` -> `0xB06360(hit, victim, bullet)` (chr owner) -> `0xB68A50` -> victim damage
+//!   module slot 9 (router) -> action 4 -> `0xB72CC0`, the same type-20 record (flags `+0x3B`
+//!   bit 1 = bullet; the first live test already sent such records). Not covered: damage over
+//!   time (SpEffects tick locally) and owner-less bullets (traps).
 //!
 //! Non-lethal duels: a hit that brings us to 1 HP (or a deathblow, hit type 5, which is not
 //! applied at all) ends the duel: `pvp: duel over, <name> wins`, a DuelOver message to the
@@ -176,8 +181,12 @@ const HIT_TYPE: usize = 0x28;
 const HIT_HP: usize = 0x1E0;
 const HIT_POSTURE: usize = 0x1E4;
 const HIT_TYPE_DEATHBLOW: i32 = 5;
-/// Record: AtkParam id (`0xB680C0` looks the attack up by it), scaled damage shorts.
+/// Record: BehaviorParam id (`0xB686A0` copies hit+0x4C; `0xB680C0` resolves it by table
+/// 0xC + attacker kind), scaled damage shorts, flags (bit 1 = bullet: `+0x4C` then holds the
+/// BulletParam id and the victim takes the AtkParam from that row).
 const REC_ATK_ID: usize = 0x48;
+const REC_DMG_FLAGS: usize = 0x3B;
+const REC_FLAG_BULLET: u8 = 2;
 const REC_DMG: usize = 0x30;
 
 // ===================================================================== pure, unit-tested
@@ -332,6 +341,15 @@ pub fn skip_death_attacker(chr: usize, is_native_remote: bool) -> bool {
     chr != 0 && is_native_remote
 }
 
+/// The record came from a bullet (prosthetic tool, explosion): flags `+0x3B` bit 1.
+pub fn record_is_bullet(record: &[u8]) -> bool {
+    record.get(REC_DMG_FLAGS).is_some_and(|f| f & REC_FLAG_BULLET != 0)
+}
+
+pub fn hit_kind(bullet: bool) -> &'static str {
+    if bullet { "bullet" } else { "melee" }
+}
+
 /// The throw / deathblow finders' decision: a candidate that is one of our native remotes is
 /// refused (the friend is an ally: no deathblow, no throw).
 pub fn finder_refuses(candidate: usize, is_native_remote: bool) -> bool {
@@ -434,8 +452,9 @@ struct Serving {
     held_ms: u16,
     queued_ms: u64,
     attacker: usize,
-    /// AtkParam id of the record (blade vs prosthetic / bullet in the log).
+    /// BehaviorParam id of the record and whether it is a bullet (prosthetic tools, explosions).
     atk: i32,
+    bullet: bool,
 }
 
 /// What the hooks saw, logged by `tick` (names, pings are only there).
@@ -571,7 +590,7 @@ fn serve(buf: *mut u8) -> Option<usize> {
         }
         unsafe { std::ptr::copy_nonoverlapping(inc.record.as_ptr(), buf, HIT_RECORD) };
         if let Ok(mut s) = SERVING.lock() {
-            *s = Some(Serving { from: inc.from, seq: inc.seq, held_ms: inc.held_ms, queued_ms: queued.as_millis() as u64, attacker, atk });
+            *s = Some(Serving { from: inc.from, seq: inc.seq, held_ms: inc.held_ms, queued_ms: queued.as_millis() as u64, attacker, atk, bullet: record_is_bullet(&inc.record) });
         }
         return Some(attacker);
     }
@@ -1234,6 +1253,7 @@ impl Pvp {
             let held_ms = c.at.elapsed().as_millis().min(u16::MAX as u128) as u16;
             let atk = i32::from_le_bytes(c.record[REC_ATK_ID..REC_ATK_ID + 4].try_into().unwrap_or([0xFF; 4]));
             let dmg: Vec<i16> = (0..5).map(|k| i16::from_le_bytes([c.record[REC_DMG + 2 * k], c.record[REC_DMG + 2 * k + 1]])).collect();
+            let bullet = record_is_bullet(&c.record);
             let msg = encode(&Msg::Hit { nonce: nonce(), seq, held_ms, record: c.record });
             let ok = net.send_bulk_to(Dest::Peer(c.peer), BULK_PVP, &msg);
             if ok {
@@ -1247,9 +1267,10 @@ impl Pvp {
                 _ => "? m".into(),
             };
             log::line(&format!(
-                "pvp: hit #{seq} (local {id}) sent to {} (peer {}, ok {ok}): atk param {atk}, record dmg {dmg:?}, held {held_ms} ms; us {ours:?}, replica {theirs:?} ({dist}); last type 1 of the victim {} ms ago; ping {} ms",
+                "pvp: hit #{seq} (local {id}) sent to {} (peer {}, ok {ok}): behavior {atk} ({}), record dmg {dmg:?}, held {held_ms} ms; us {ours:?}, replica {theirs:?} ({dist}); last type 1 of the victim {} ms ago; ping {} ms",
                 p.map_or("?", |p| p.name.as_str()),
                 c.peer.slot(),
+                hit_kind(bullet),
                 native::frame_age_ms(c.peer).map_or("?".into(), |v| v.to_string()),
                 p.and_then(|p| p.rtt_ms).map_or("?".into(), |v| v.to_string()),
             ));
@@ -1265,10 +1286,11 @@ impl Pvp {
                 Event::Applied { s, hp, posture, dmg_hp, dmg_posture, hit_type, result, lost } => {
                     let est = rtt(s.from).map_or("?".into(), |r| (s.held_ms as u32 + r / 2).to_string());
                     log::line(&format!(
-                        "pvp: hit #{} from {} received (atk param {}, +~{est} ms sender->here incl. {} ms held there, {} ms queued here) -> applied hp {}->{} posture {}->{} (hit hp {} posture {dmg_posture}, type {hit_type}, result {result}){}",
+                        "pvp: hit #{} from {} received (behavior {} ({}), +~{est} ms sender->here incl. {} ms held there, {} ms queued here) -> applied hp {}->{} posture {}->{} (hit hp {} posture {dmg_posture}, type {hit_type}, result {result}){}",
                         s.seq,
                         name(s.from),
                         s.atk,
+                        hit_kind(s.bullet),
                         s.held_ms,
                         s.queued_ms,
                         hp.0,
@@ -1289,7 +1311,7 @@ impl Pvp {
                     refill(player);
                 }
                 Event::Dry { from, seq, atk } => {
-                    log::line(&format!("pvp: hit #{seq} from {} received, atk param {atk}: DRY RUN, not applied", name(from)))
+                    log::line(&format!("pvp: hit #{seq} from {} received, behavior {atk}: DRY RUN, not applied", name(from)))
                 }
                 Event::Dropped { from, seq, why } => log::line(&format!("pvp: hit #{seq} from {} dropped: {why}", name(from))),
                 Event::Hello { from } => log::line(&format!("pvp: {} has friendly fire on: our hits on their copy are sent to them", name(from))),
@@ -1521,6 +1543,19 @@ mod tests {
         assert!(!skip_death_attacker(0x7ff0_1234_0000, false), "an enemy killer stays");
         assert!(!skip_death_attacker(0, false), "no attacker: unchanged");
         assert!(!skip_death_attacker(0, true));
+    }
+
+    #[test]
+    fn bullet_flag_is_record_byte_0x3b_bit_1() {
+        let mut r = vec![0u8; HIT_RECORD];
+        assert!(!record_is_bullet(&r));
+        r[0x3B] = 0x02;
+        assert!(record_is_bullet(&r));
+        r[0x3B] = 0xFD;
+        assert!(!record_is_bullet(&r), "other bits only");
+        assert!(!record_is_bullet(&[]), "short record");
+        assert_eq!(hit_kind(true), "bullet");
+        assert_eq!(hit_kind(false), "melee");
     }
 
     #[test]

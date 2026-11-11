@@ -31,10 +31,10 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `loadout_sync` | DEBUG | 1 | Loadout sync |
 | `player_packet_hz` | ADVANCED | 30 (12 = the game's own, nothing patched) | Player packet rate |
 | `native_pin_delay_ms` | DEBUG | 0 (auto) | Player packet rate |
-| `friendly_fire` | GAMEPLAY | **0** (the host's value is used) | PvP |
-| `friendly_fire_in_boss_fights` | GAMEPLAY | 0 | PvP |
-| `pvp_dry_run` | DEBUG | 0 | PvP |
-| `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | PvP |
+| `friendly_fire` | GAMEPLAY | **0** (the host's value is used) | Friendly fire |
+| `friendly_fire_in_boss_fights` | GAMEPLAY | 0 | Friendly fire |
+| `pvp_dry_run` | DEBUG | 0 | Friendly fire |
+| `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | Friendly fire |
 
 Reliable bulk kinds added by the fork: 46 (pickups), 0xA7 (ObjAct), 0xA8 (loadout), 0xA9
 (PvP); `net::tests::bulk_kinds_are_unique` checks them against the upstream kinds. The doctor
@@ -421,12 +421,19 @@ Live checks: the sender's tee stats `type 1: ~300 (30.0/s ...)`; the receiver's 
 is closer to their real position. If walking reads as running, set `native_pin_delay_ms` by hand
 (try 90-130) and report the value.
 
-## PvP on the native hit packet (experimental, `[GAMEPLAY] friendly_fire`, default 0)
+## Friendly fire on the native hit packet (experimental, `[GAMEPLAY] friendly_fire`, default 0)
 
-Not tested in play. Player-vs-player damage with FromSoftware's own protocol: the attacker's
-game detects the hit, the victim's game computes it against the victim's current state
-(guard, deflect, dodge i-frames). 1.0.9 had no PvP at all; 1.0.11's friendly fire applied the
-friend's copy's hits locally (laggy, "hits register half the time") and crashed on death.
+Friendly fire, not duels: the friend stays an ally (no lock-on, no enemy HP bar, Sculptor's
+Idols usable next to them, no deathblows or throws on each other), but careless hits hurt.
+Damage uses FromSoftware's own protocol: the attacker's game detects the hit, the victim's
+game computes it against the victim's current state (guard, deflect, dodge i-frames). 1.0.9
+had no PvP at all; 1.0.11's friendly fire applied the friend's copy's hits locally (laggy,
+"hits register half the time") and crashed on death.
+
+First live test (2026-11-12, logs `E:\RE\logs-2026-11-12`): hooks installed, hits captured
+and sent both ways (22 / 24 received), **0 applied**; team 29 made the friend a full enemy
+(lock-on, native enemy HP bar with a debug name, idols unusable near them). Both are fixed
+in the `pvp-ff` branch (below: "Fixes after the first live test").
 Code: `crates/coop-dll/src/pvp.rs`, plus `native.rs` (`recv_side_send`), `net.rs` (bulk
 dispatch), `scaling.rs` (ScaleCfg 11th byte), `doctor.rs`, `settings.rs`, `puppet.rs`.
 
@@ -450,7 +457,7 @@ Marks: [VAR] read in the Ghidra decompilation / disassembly of the 2026-11-11 pr
   player) -> `0xB72A80(dmgModule, rx)`: `0x8D7B10(rx, &record)` (it ignores `rx` and walks
   FrpgSessionManager's member vector `0x8E4010`) returns the next type-20 record of any member
   and the PlayerIns whose session (`[[chr+0x2038]]+0x58`) is that member; `0xB680C0` rebuilds
-  the hit (AtkParam id at record `+0x48`); for throw kinds 1 and 3 (`hit+0xD9`, the stack byte
+  the hit (BehaviorParam id at record `+0x48`, not an AtkParam id); for throw kinds 1 and 3 (`hit+0xD9`, the stack byte
   `[rsp+0x109]` in `0xB72A80`) the record's u16 `+0xB0` is compared with our `chr+0x78` handle
   and the kind is zeroed on a mismatch; `0xB68FF0(dmgModule, attacker, hit, 0)` applies it.
 - [VAR] Teams: `chr+0x74` (`0x9F64D0` derives it from the chr type `+0x70`, set by
@@ -474,17 +481,16 @@ Marks: [VAR] read in the Ghidra decompilation / disassembly of the 2026-11-11 pr
 1. Setting `[GAMEPLAY] friendly_fire = 0|1`. The host's value is used by both (ScaleCfg byte
    11, sent with the scaling percentages; an older host = off). The doctor warns when the two
    ini values differ.
-2. While on and linked: team 29 on the native remote of every friend whose Hello is fresh
+2. While on and linked: team 28 ("Coop NPC"; was 29 before `pvp-ff`) on the native remote of every friend whose Hello is fresh
    (never on our player, never for an older build; restored when off, when the Net goes away,
    on a hub reset (Drop) and in `shutdown`, only while the chr is still in the player set).
    The remote also gets the "cannot die" bit while its owner's snapshot says more than 1 HP
    and its type-1 frames are under 1 s old, so a local-only hit (`0x2A7C660`'s `[2][1]` = 1,
-   `hit+0xFC` = bullets [ARV]) can never kill the copy; otherwise the bit goes and the game
+   `hit+0xFC` set) can never kill the copy; otherwise the bit goes and the game
    kills the copy the vanilla way (`pvp: replica held at 1 HP while its owner is dead` if
    seen). Boss fights: `[GAMEPLAY] friendly_fire_in_boss_fights = 0` (default) gives the
    copies their own team back and drops player hits while a boss gauge is shown
-   (`game::boss_state`): no lock-on onto the friend mid-boss, allied NPCs (teams 25-28 are
-   hostile to 29) stay friendly.
+   (`game::boss_state`).
 3. The laggy path: nothing to patch. Vanilla `[1][2]` is already 0 (reaction only); the hooks
    refuse to install if either table reads otherwise. A pass-through call-site hook at
    `0xB6A12A` (`call 0xB6AB40`) only counts these copy-on-us hits for the log.
@@ -501,7 +507,10 @@ Marks: [VAR] read in the Ghidra decompilation / disassembly of the 2026-11-11 pr
    (`call 0x8D7B10`) -> our queued records first (copied into the game's own buffer
    `0x143D85AE0`, attacker = the sender's native remote), then the original; `0xB72BB8`
    (`call 0xB68FF0`) -> for our records only: the "cannot die" bit on our data module for
-   that one call, HP / posture logged before and after.
+   that one call, HP / posture logged before and after. Since `pvp-ff` the mod itself calls
+   `0xB72A80(our dmgModule, sentinel rx)` from the frame task while hits are queued (the
+   vanilla call never gets past its rx NULL check in our session, see below); `recv_hook`
+   returns 0 for the sentinel once the queue is empty, so the original `0x8D7B10` never sees it.
 6. Non-lethal duels: a hit that leaves us at 1 HP (or would have killed) ends the duel:
    `pvp: duel over, <name> wins`, a DuelOver message to the winner (`pvp: duel over, we
    win`), and for 5 s both sides drop that peer's player hits (per peer). A deathblow (hit
@@ -520,16 +529,63 @@ Marks: [VAR] read in the Ghidra decompilation / disassembly of the 2026-11-11 pr
    filter and queued hits. A queued hit is served only while its sender's remote is still in
    the WorldChrMan player set (`native::live_remote`).
 
+10. No deathblow / throw on a friend (since `pvp-ff`): the two chr finders' candidate checks
+   are replaced in their vtables by wrappers that refuse every native remote and call the
+   original otherwise: `SprjChrThrowModule::RequestThrow_AllChr` finder (slot `0x142A8EBD0`,
+   `0xBDF930`) and `FdpChrCeremonyModule::_GetEnableExecuteCremonyChr` finder (slot
+   `0x142A7BC20`, `0xB5DD30`); class names from RTTI. Both decide by M1
+   (`0xC09AA0` = `M1[attacker team][candidate team]`), which passes for team 28. A received
+   hit of type 5 is still never applied (item 6).
+
+### Fixes after the first live test (`pvp-ff`, 2026-11-12)
+- [VAR, Ghidra on the dump, project copy `E:\RE\ghidra_pvpff`, jobs `E:\RE\work_pvpff`]
+  Why 0 hits were applied: `0xA37560` allocates `PlayerIns+0x2088` (`param_1[0x411]`) only
+  while `0x9F3430(player)` = `[[0x143D7A1E0]+0x88] == player` (the game's own online player),
+  then calls `0xB72A80(dmgModule, [player+0x2088])`; `0xB72A80` begins with `test rdx,rdx;
+  jz 0xB72BFF`, so with a NULL rx none of our call sites ran. [ARV] that it was NULL in the
+  test (not read live); the new one-time line `pvp: receive path: PlayerIns+0x2088 = ...`
+  shows it. Fix: the frame task drives `0xB72A80` itself (item 5). Neither `0xB680C0` nor
+  `0xB68FF0` (two call levels down) checks the team matrices, so the attacker's team 28 does
+  not stop the application.
+- Team 28 instead of 29 (RE `E:\RE\work_team\team_matrices.txt`): M1 `0x143B0A680`
+  `[1][28]` is the same functor object as `[1][29]` (our hitboxes hit the copy, the hit filter
+  `0xB68A50` passes, the router's `[2][1]` = 4 still makes the type-20 packet); M2
+  `0x143B0CAA0` `[1][28]` / `[28][1]` are not hostile (no lock-on, so no enemy bar; the idol's
+  enemy finder ignores it); enemy AI treats 28 like 2; `M1[28][1]` = F, so the copy's own
+  hitboxes no longer hit us locally (the "local-vs-replica" counter should stay 0).
+
 Install checks (all or nothing; `pvp: hooks NOT installed: ...` otherwise): the four call
 targets, `[1][2]` = 0 in both tables and `[2][1]` = 4, the 19 bytes of `0x1061880` and
-PlayerDebugSession vtable (`0x2B86048`) slot 4 = `0x1061880`; at the first remote, its recv
-vtable copy's slot 4 is logged (`pvp: remote session slot 4 = ...`).
+PlayerDebugSession vtable (`0x2B86048`) slot 4 = `0x1061880`, the first 9 bytes of
+`0xB72A80` (`48 85 D2 0F 84 76 01 00 00`), both finder vtable slots holding their function
+and those functions' first 8 bytes; at the first remote, its recv vtable copy's slot 4 is
+logged (`pvp: remote session slot 4 = ...`).
 
-Not covered: prosthetic / bullet hits (through `0x2A7C660` [ARV]: local copy only, no type 20),
-throws (the game cancels them: the record's target handle is the sender's), lethal PvP.
+Prosthetic tools, bullets and explosions [VAR, Ghidra `E:\RE\work_pvpff_bul`]: they take the
+same path as the blade. Bullet hit dispatcher `0x995600` -> `0xB06360(hit, victim, bullet)`
+(owner from bullet `+0x4BC`; an owner of type 1 = a chr) -> the hit filter `0xB68A50` (M1,
+rows = attacker team, with the AtkParam's `+0x89` hit-friend / hit-enemy bits) -> victim
+damage module slot 9 `0xB729E0` (the router `0xB6A040` is inside it) -> action 4 -> slot 10
+`0xB72CC0` -> type-20 record. The record flags `+0x3B` bit 1 mark a bullet (`+0x4C` then
+holds the BulletParam id; the victim reads the AtkParam from that row). The first live test
+already captured and sent bullet records (behaviors 107200110 = BulletParam 720010 and
+107200297 = BulletParam 295); like every other hit they were never applied (the receive
+bug above). `0xC02140` / `0xC099F0` are SpEffect target filters, not bullet filters. So no
+separate mechanism is needed. The old note "bullets go through `0x2A7C660`, local copy only"
+was wrong. Log lines now say `melee` or `bullet` per hit.
 
-Risks [ARV]: the copy's swing still plays the vanilla reaction-only path on us (hit SFX,
-maybe a guard spark) before the real hit arrives. The death crash above is reachable whenever
+Not covered: damage over time (burn, poison: SpEffects ticking locally, never a type-20
+record [ARV]); bullets with no chr owner (traps: the router's no-attacker branch); lethal
+friendly fire.
+
+Open [ARV]: SpEffects carried by a hit (flame vent burn, status build-up) may be applied
+through `0xC00130` / `0xC02140` with the attacker's copy as the applier; with team 28
+`M1[28][1]` = functor A ("hit friend" bit only), so an effect flagged for enemies only
+would be refused (team 29 gave C and would pass). The direct damage is not affected. Watch
+for "flame vent hits but no burn" in the test.
+
+Risks [ARV]: with team 29 the copy's swing played the vanilla reaction-only path on us (hit SFX,
+maybe a guard spark) before the real hit arrived; with team 28 it should not hit us at all. The death crash above is reachable whenever
 a friend's applied hit and our death fall into the same event update; the death guard (item 7)
 closes it at the faulting lookup, untested live. (`0xB53BA0` is NOT that path: it reads the
 `chr+0x1FF8 -> +0x88` module's `+0x18` / `+0x20`, written only by `0xBE14D0` from `0xB6F140`
@@ -537,28 +593,34 @@ for grab / link hits with `hit+0x88` >= 1.) The HP damage field `hit+0x1E0` is l
 or float (Ghidra typed it float).
 
 ### Log lines (`pvp:`)
-- Attacker: `pvp: hit #N (local K) sent to <name> (peer P, ok true): atk param A, record dmg
+- Attacker: `pvp: hit #N (local K) sent to <name> (peer P, ok true): behavior B (melee|bullet), record dmg
   [...], held H ms; us [x,y,z], replica [x,y,z] (D m); last type 1 of the victim T ms ago;
   ping R ms`.
-- Victim: `pvp: hit #N from <name> received (+~L ms sender->here incl. H ms held there, Q ms
-  queued here) -> applied hp a->b posture c->d (hit hp X posture Y, type T, result R)[,
-  CLAMPED at 1 HP (duel lost)]`, or `... dropped: <why>` / `DRY RUN`.
+- Victim: `pvp: hit #N from <name> received (behavior B (melee|bullet), +~L ms sender->here incl. H ms
+  held there, Q ms queued here) -> applied hp a->b posture c->d (hit hp X posture Y, type T,
+  result R)[, CLAMPED at 1 HP (duel lost)]`, or `... dropped: <why>` / `DRY RUN`.
+- Once, at the first queued hit: `pvp: receive path: PlayerIns+0x2088 = 0x0 (NULL: the
+  game's own receive never runs ...); game's online player is ours: false`.
 - Every 10 s while on: `pvp: 10 s: our hits captured .. sent ..; friend's received ..
-  applied ..; local-vs-replica hit dropped (laggy path, reaction only) ..; dropped: ...`.
-- On / off with the reason, team changes, install result.
+  applied .. (receive loop driven Nx); local-vs-replica hit dropped (laggy path, reaction
+  only) ..; throw / deathblow on a friend refused ..; dropped: ...`.
+- On / off with the reason, team changes (`team 2 -> 28 (Coop NPC ...)`), install result.
 
 ### Live test protocol (the first test is diagnostic)
 1. Same build on both PCs; the HOST sets `friendly_fire = 1` (the client's value does not
    matter; the doctor notes a difference). Optional first round: both `pvp_dry_run = 1`.
 2. Connect, meet in one block, wait until both logs show `pvp: player-vs-player damage ON`
-   and `pvp: peer ...: team 2 -> 29`.
-3. Duel for 5 minutes: single slashes, combos, block, deflect, dodge through a slash, a
-   prosthetic, a combat art, one duel to the end (1 HP). Note the time of anything odd (F11
-   writes a marker).
-4. Exchange `%LOCALAPPDATA%\sekiro-coop\log.txt` from both sides; match `hit #N` lines
+   and `pvp: peer ...: team 2 -> 28`.
+3. Check the ally side first: no lock-on on the friend, no enemy HP bar over them, an idol
+   next to them can be used, no deathblow prompt on them (also not when their posture breaks).
+4. Then hit each other for 5 minutes: single slashes, combos, block, deflect, dodge through
+   a slash, every prosthetic tool you have (shuriken, firecracker, flame vent, axe, spear),
+   a combat art, one round to the end (1 HP). Note the time of anything odd (F11 writes a
+   marker).
+5. Exchange `%LOCALAPPDATA%\sekiro-coop\log.txt` from both sides; match `hit #N` lines
    attacker -> victim (sent vs applied, latency, HP before / after, results of blocked /
-   deflected / dodged hits), the 10 s counters, any crash.rs breadcrumb.
-5. End the session (Severed Thread): `pvp: player-vs-player damage off (no link)`; a remote
+   deflected / dodged hits, behavior ids and melee / bullet of tools), the 10 s counters, any crash.rs breadcrumb.
+6. End the session (Severed Thread): `pvp: player-vs-player damage off (no link)`; a remote
    that is still there gets `team ... restored`.
 
 ## Working on this fork
