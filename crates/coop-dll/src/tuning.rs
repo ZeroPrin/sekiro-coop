@@ -131,6 +131,13 @@ pub fn native_solid() -> bool {
 pub fn native_dress() -> bool {
     NATIVE_DRESS.load(Ordering::Relaxed)
 }
+/// `[DEBUG] loadout_sync` (loadout.rs, FORK.md "Loadout sync"): send our equipment to the
+/// peers and dress their native remotes with theirs. 0 = the remote wears ours (as before).
+pub static LOADOUT_SYNC: AtomicBool = AtomicBool::new(true);
+
+pub fn loadout_sync() -> bool {
+    LOADOUT_SYNC.load(Ordering::Relaxed)
+}
 
 // --- Load-time mitigations for the driver crash (gpuguard.rs, 2026-10-23) ---------------
 // The crash fires most in the seconds after a load, while new models and materials are

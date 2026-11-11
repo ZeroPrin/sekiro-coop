@@ -150,6 +150,60 @@ pub fn decode_flag_dump(buf: &[u8]) -> Option<(u8, Vec<(u32, Vec<u8>)>)> {
     (r.at == buf.len()).then_some((status, out))
 }
 
+/// Equipment slots of a player's ChrAsm. Layout 2 carries the real item ids by slot
+/// (EquipGameData `PGD+0x278` `+0x374`, category bits included; slot 1 = the combat art),
+/// coop-dll loadout.rs. Layout 1 carried the ChrAsm gaitem handles (`ChrIns+0x2140`), which
+/// mean nothing on another machine.
+pub const LOADOUT_SLOTS: usize = 25;
+/// Body of a loadout bulk (coop-dll loadout.rs): magic, layout version, then i32s.
+pub const LOADOUT_MAGIC: [u8; 2] = *b"LD";
+pub const LOADOUT_VERSION: u8 = 2;
+/// magic, version, 25 slots, art, 3 extra.
+pub const LOADOUT_LEN: usize = 2 + 1 + 4 * (LOADOUT_SLOTS + 1 + 3);
+
+/// The sender's equipment (reliable bulk, sent on change and as a periodic refresh).
+/// `art` and `extra` are reserved (-1): the combat art is `slots[1]` (FORK.md "Loadout
+/// sync").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loadout {
+    pub slots: [i32; LOADOUT_SLOTS],
+    pub art: i32,
+    pub extra: [i32; 3],
+}
+
+impl Loadout {
+    pub fn new(slots: [i32; LOADOUT_SLOTS]) -> Self {
+        Self { slots, art: -1, extra: [-1; 3] }
+    }
+}
+
+pub fn encode_loadout(l: &Loadout) -> Vec<u8> {
+    let mut v = Vec::with_capacity(LOADOUT_LEN);
+    v.extend_from_slice(&LOADOUT_MAGIC);
+    v.push(LOADOUT_VERSION);
+    for x in l.slots.iter().chain(std::iter::once(&l.art)).chain(l.extra.iter()) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v
+}
+
+/// None for another magic or layout version, a short body or trailing bytes.
+pub fn decode_loadout(buf: &[u8]) -> Option<Loadout> {
+    let mut r = Reader { buf, at: 0 };
+    if r.take(2)? != LOADOUT_MAGIC || r.u8()? != LOADOUT_VERSION {
+        return None;
+    }
+    let mut l = Loadout::new([0; LOADOUT_SLOTS]);
+    for s in l.slots.iter_mut() {
+        *s = r.i32()?;
+    }
+    l.art = r.i32()?;
+    for e in l.extra.iter_mut() {
+        *e = r.i32()?;
+    }
+    (r.at == buf.len()).then_some(l)
+}
+
 /// The local player's state, sent many times per second (unreliable).
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Snapshot {
@@ -1055,6 +1109,47 @@ pub(crate) mod tests {
         // The roster always fits one bulk chunk.
         let full: Vec<_> = (0..=MAX_PEERS as u8).map(|i| e(i, u64::MAX, 9, &"x".repeat(64))).collect();
         assert!(encode_roster(u32::MAX, &full).len() <= BULK_CHUNK);
+    }
+
+    #[test]
+    fn loadout_round_trip_and_rejects() {
+        let mut slots = [0i32; LOADOUT_SLOTS];
+        for (i, s) in slots.iter_mut().enumerate() {
+            *s = if i % 3 == 0 { -1 } else { 100_000 * i as i32 + 7 };
+        }
+        let l = Loadout { slots, art: 5_000_100, extra: [i32::MIN, 0, i32::MAX] };
+        let bytes = encode_loadout(&l);
+        assert_eq!(bytes.len(), LOADOUT_LEN);
+        assert_eq!(&bytes[..3], &[b'L', b'D', LOADOUT_VERSION]);
+        assert_eq!(decode_loadout(&bytes), Some(l));
+        // The reserved fields default to -1.
+        let d = Loadout::new(slots);
+        assert_eq!((d.art, d.extra), (-1, [-1; 3]));
+        assert_eq!(decode_loadout(&encode_loadout(&d)), Some(d));
+        for cut in 0..bytes.len() {
+            assert_eq!(decode_loadout(&bytes[..cut]), None, "cut at {cut}");
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(decode_loadout(&extra), None);
+        let mut magic = bytes.clone();
+        magic[0] = b'X';
+        assert_eq!(decode_loadout(&magic), None);
+        let mut ver = bytes.clone();
+        ver[2] = LOADOUT_VERSION + 1;
+        assert_eq!(decode_loadout(&ver), None);
+        // A layout-1 sender (gaitem handles, same length) is ignored.
+        assert_eq!(LOADOUT_VERSION, 2);
+        let mut v1 = bytes.clone();
+        v1[2] = 1;
+        assert_eq!(decode_loadout(&v1), None);
+        // Item ids with category bits survive (protector 0x1000_0000 | 100000).
+        let mut ids = Loadout::new([-1; LOADOUT_SLOTS]);
+        ids.slots[1] = 5200;
+        ids.slots[12] = 0x1000_0000 | 100_000;
+        assert_eq!(decode_loadout(&encode_loadout(&ids)), Some(ids));
+        // One bulk chunk.
+        assert!(LOADOUT_LEN <= BULK_CHUNK);
     }
 
     /// VERSION 13: the hidden byte carries two bits; each combination survives the trip.

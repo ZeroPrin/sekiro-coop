@@ -151,6 +151,10 @@ pub struct Remote {
     dress_due: Option<Instant>,
     /// The peer a Net remote stands for (None for N0 clones).
     peer: Option<PeerId>,
+    /// The first dress ran (`dress_now`): from then on a new loadout of the peer re-dresses.
+    dressed: bool,
+    /// The peer's item ids last put on its PGD (loadout.rs), None while it wears ours (fallback).
+    applied: Option<[i32; crate::ghost::EQUIP_SLOTS]>,
     /// Last seen look (v8.53): model ins (ChrIns+0x48) and its draw group (model+0x23). A change
     /// is logged at once ("my model is not visible" left no trace in the log, 2026-10-27).
     look: Option<(Option<usize>, Option<u8>)>,
@@ -723,7 +727,7 @@ fn create(player: Chr) -> Result<Remote, String> {
         "native: CREATED {p:#x} {} (PGD slot {idx} at {pgd:#x}, playerNo {player_no}, CharaInitParam {CHARA_INIT_ROW})",
         class(Some(p))
     ));
-    Ok(Remote { chr, kind: Kind::Loopback, pgd_idx: idx, pgd, player_no, since: Instant::now(), late_logged: false, seen_in_set: false, dress_due: None, peer: None, look: None })
+    Ok(Remote { chr, kind: Kind::Loopback, pgd_idx: idx, pgd, player_no, since: Instant::now(), late_logged: false, seen_in_set: false, dress_due: None, peer: None, dressed: false, applied: None, look: None })
 }
 
 fn delete_chr(r: &Remote) {
@@ -1177,9 +1181,7 @@ impl Native {
         let delay = crate::tuning::native_dress_delay_ms();
         if delay == 0 {
             log::line("native: dressing right after the factory (native_dress_delay_ms = 0)");
-            if let Err(e) = crate::ghost::dress_like(r.chr, player) {
-                log::line(&format!("native: dress failed: {e}"));
-            }
+            Self::dress_now(r, player);
         } else {
             r.dress_due = Some(Instant::now() + Duration::from_millis(delay as u64));
             log::line(&format!("native: dress of {:#x} deferred {delay} ms (until it is in the player chr set and the load has settled)", r.chr.0));
@@ -1192,7 +1194,86 @@ impl Native {
         let in_world = self.in_world;
         for r in self.remotes.iter_mut().chain(self.tests.iter_mut()) {
             Self::dress_one(r, player, in_world);
+            Self::redress_on_loadout(r, in_world);
         }
+    }
+
+    /// The dress itself: a peer's remote wears the peer's own equipment (loadout.rs) when
+    /// it has sent it, else ours (the old behaviour, and N0 clones always).
+    fn dress_now(r: &mut Remote, player: Chr) {
+        r.dressed = true;
+        let theirs = r.peer.filter(|_| crate::tuning::loadout_sync()).and_then(|p| Some((p, crate::loadout::of(p)?)));
+        if let Some((peer, l)) = theirs {
+            Self::dress_from_peer(r, peer, &l);
+            return;
+        }
+        if let Some(peer) = r.peer.filter(|_| crate::tuning::loadout_sync()) {
+            log::line(&format!(
+                "native: no loadout from peer slot {} yet, {:#x} wears ours for now (re-dressed when it comes)",
+                peer.slot(),
+                r.chr.0
+            ));
+        }
+        r.applied = None;
+        if let Err(e) = crate::ghost::dress_like(r.chr, player) {
+            log::line(&format!("native: dress failed: {e}"));
+        }
+    }
+
+    /// `l`'s item ids onto `peer`'s remote (loadout.rs): equipped into the replica's own
+    /// PlayerGameData (`r.pgd`) as the game fills / equips a PGD, then its ChrAsm copied into
+    /// the PlayerIns holders (as the PlayerIns ctor does) and the parts reloaded through the
+    /// guarded vtable slot 21 (RE-FINDINGS-2 § Solid ghost (c)). The holders are synced even
+    /// when no slot changed the first time: the fallback dress put OUR handles there.
+    fn dress_from_peer(r: &mut Remote, peer: PeerId, l: &coop_net::Loadout) {
+        let first = r.applied.is_none();
+        r.applied = Some(l.slots);
+        let who = format!("peer slot {}", peer.slot());
+        let n = match crate::loadout::apply(r.pgd, &l.slots, &who) {
+            Ok(n) => n,
+            Err(e) => {
+                log::line(&format!("loadout: {who} not applied to {:#x}: {e}", r.chr.0));
+                return;
+            }
+        };
+        if n == 0 && !first {
+            return;
+        }
+        match crate::loadout::sync_chr(r.chr, r.pgd) {
+            Ok(h) => log::line(&format!("loadout: {who} {n} slot(s) applied, {h} ChrAsm holder(s) of {:#x} synced from its PGD", r.chr.0)),
+            Err(e) => {
+                log::line(&format!("loadout: {who} ChrAsm sync of {:#x} skipped: {e}", r.chr.0));
+                return;
+            }
+        }
+        // `native_dress_delay_ms = 0` dresses right after the factory: no model to reload yet.
+        if !r.seen_in_set {
+            log::line(&format!("loadout: refresh of {:#x} skipped (not in the player chr set yet)", r.chr.0));
+            return;
+        }
+        match crate::ghost::reload_parts(r.chr) {
+            Ok(()) => log::line(&format!("loadout: refresh of {:#x}: parts reloaded (vtable slot 21)", r.chr.0)),
+            Err(e) => log::line(&format!("loadout: refresh of {:#x} skipped: {e}", r.chr.0)),
+        }
+    }
+
+    /// A peer's remote dressed earlier: wear the peer's newest loadout when it differs from
+    /// the one on it (equipment changed, or the first one came after the fallback dress).
+    fn redress_on_loadout(r: &mut Remote, in_world: Duration) {
+        let Some(peer) = r.peer else { return };
+        if !r.dressed || r.dress_due.is_some() || !r.seen_in_set || !crate::tuning::loadout_sync() {
+            return;
+        }
+        let settled = in_world >= Duration::from_secs(crate::tuning::native_spawn_delay_s() as u64);
+        if !crate::tuning::native_dress() || !settled {
+            return;
+        }
+        let Some(l) = crate::loadout::of(peer) else { return };
+        if r.applied == Some(l.slots) {
+            return;
+        }
+        log::line(&format!("native: new loadout from peer slot {}, re-dressing {:#x}", peer.slot(), r.chr.0));
+        Self::dress_from_peer(r, peer, &l);
     }
 
     /// `dress_when_due` for one remote (a peer's or an N0 clone).
@@ -1218,9 +1299,7 @@ impl Native {
             in_world.as_secs_f32(),
             model
         ));
-        if let Err(e) = crate::ghost::dress_like(r.chr, player) {
-            log::line(&format!("native: dress failed: {e}"));
-        }
+        Self::dress_now(r, player);
     }
 
     /// N1: keeps a native remote for every peer in `wants` with `want` set and removes the
