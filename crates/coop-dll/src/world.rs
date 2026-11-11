@@ -31,7 +31,7 @@
 //! which is separate from the normal save, so the solo game is untouched.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use coop_net::{FLAG_DUMP_DISABLED, FLAG_DUMP_OK, FLAG_DUMP_UNAVAILABLE, decode_flag_dump, encode_flag_dump};
@@ -1513,6 +1513,10 @@ fn down_mask(peers: impl Iterator<Item = (u8, bool)>) -> u32 {
     peers.filter(|&(s, d)| d && s < 32).fold(0, |m, (s, _)| m | 1 << s)
 }
 
+/// `[GAMEPLAY] shop_stock_per_player`: the limited-stock counter bits (`shop_counter_bits`) are
+/// per player too. Read when the set is built (the first flag after the params load).
+pub static SHOP_STOCK_PER_PLAYER: AtomicBool = AtomicBool::new(true);
+
 static ITEM_FLAGS: std::sync::OnceLock<std::collections::HashSet<u32>> = std::sync::OnceLock::new();
 
 fn item_flags() -> Option<&'static std::collections::HashSet<u32>> {
@@ -1550,9 +1554,16 @@ fn item_flags() -> Option<&'static std::collections::HashSet<u32>> {
     }
     let lots = i;
     let mut j = 0;
+    let mut counters = 0;
     while let Some(r) = unsafe { shops_file.get_row_by_index::<SHOP_LINEUP_PARAM>(j) } {
         if r.event_flag() > 0 {
             set.insert(r.event_flag() as u32);
+            let q = if SHOP_STOCK_PER_PLAYER.load(Ordering::Relaxed) { r.sell_quantity() } else { 0 };
+            for f in shop_counter_bits(r.event_flag() as u32, q) {
+                if set.insert(f) {
+                    counters += 1;
+                }
+            }
         }
         j += 1;
     }
@@ -1587,10 +1598,22 @@ fn item_flags() -> Option<&'static std::collections::HashSet<u32>> {
         return None;
     }
     log::line(&format!(
-        "world: {} item/shop/skill/tutorial flags are per player ({lots} item lots, {j} shop rows, {skills} skill flags, {tutorials} tutorial flags)",
+        "world: {} item/shop/skill/tutorial flags are per player ({lots} item lots, {j} shop rows, {counters} shop counter bits, {skills} skill flags, {tutorials} tutorial flags)",
         set.len()
     ));
     Some(ITEM_FLAGS.get_or_init(|| set))
+}
+
+/// A limited shop row (`sellQuantity` q > 1) counts its purchases in the flags right after its
+/// `eventFlag`: the stock counter is `bit_length(q)` bits from `eventFlag` up, so `eventFlag + 1
+/// ..= eventFlag + floor(log2 q)` are counter bits. They are per player like `eventFlag`
+/// (1.0.11 "shop counter bits"): shared, one player's purchase used up the other's stock.
+/// [ARV] The width is fitted to 1.0.11's own count: its log reads "75 shop counter bits" with
+/// the same 1084 other flags as ours, and floor(log2 q) over the 1.06 ShopLineupParam's
+/// limited rows gives exactly 75 (q-1, ceil(log2(q+1)) etc. give 97..264).
+pub(crate) fn shop_counter_bits(event_flag: u32, sell_quantity: i16) -> impl Iterator<Item = u32> {
+    let extra = if sell_quantity > 1 { (sell_quantity as u16).ilog2() } else { 0 };
+    (1..=extra).map(move |k| event_flag + k)
 }
 
 /// Idol unlock flags (BonfireWarpParam `eventflagId`), for the "new idol" notice.
@@ -1741,6 +1764,38 @@ fn changed_flags(old: &HashMap<u32, Vec<u8>>, new: &[(u32, Vec<u8>)]) -> Vec<(u3
 mod peer_tests {
     use super::*;
     use crate::peers::PeerFrame;
+
+    /// Every distinct limited `eventFlag` with `sellQuantity` > 1 in the 1.06 ShopLineupParam
+    /// (E:\RE\sekiro-data\params\csv\ShopLineupParam.csv); the other 76 limited flags sell 1.
+    const LIMITED: [(u32, i16); 51] = [
+        (71101010, 4), (71101020, 2), (71101030, 6), (71101040, 3), (71101220, 3), (71101230, 12), (71101250, 3), (71101260, 2),
+        (71101410, 8), (71101420, 6), (71101430, 2), (71101440, 5), (71101470, 2), (71101480, 5), (71101490, 2), (71101500, 4),
+        (71101510, 3), (71101520, 3), (71101530, 2), (71102010, 8), (71102080, 3), (71102090, 3), (71102100, 2), (71111020, 4),
+        (71111030, 8), (71111040, 4), (71111050, 3), (71111060, 2), (71111520, 8), (71111530, 3), (71111540, 2), (71501010, 5),
+        (71501020, 2), (71501030, 2), (71501040, 3), (71501050, 2), (71501070, 2), (71701010, 5), (71701030, 2), (71701040, 5),
+        (71701050, 2), (72001010, 2), (72001020, 3), (72001030, 5), (72001040, 2), (72001050, 2), (72001060, 3), (72001070, 2),
+        (72501020, 2), (79621010, 2), (79901200, 10),
+    ];
+
+    #[test]
+    fn shop_counter_bits_of_real_rows() {
+        let bits = |f, q| shop_counter_bits(f, q).collect::<Vec<_>>();
+        // 1000000 (school technique, 1 in stock): the sold-out flag alone.
+        assert!(bits(71001000, 1).is_empty());
+        assert!(bits(71001000, -1).is_empty(), "unlimited row");
+        // 1100002, 2 in stock: one counter bit.
+        assert_eq!(bits(71101020, 2), [71101021]);
+        // 1500001, 5 in stock: a 3-bit counter from 71501010 up.
+        assert_eq!(bits(71501010, 5), [71501011, 71501012]);
+        // 1100201, 8: a 4-bit counter.
+        assert_eq!(bits(71101410, 8), [71101411, 71101412, 71101413]);
+        // 1100103 Ashina-area row, 12 in stock (the most of any row).
+        assert_eq!(bits(71101230, 12), [71101231, 71101232, 71101233]);
+        // The next row's flag (10 ids on) is never touched.
+        assert!(LIMITED.iter().all(|&(f, q)| shop_counter_bits(f, q).all(|b| b < f + 10)));
+        // 1.0.11 logs "75 shop counter bits" on the same game data.
+        assert_eq!(LIMITED.iter().map(|&(f, q)| shop_counter_bits(f, q).count()).sum::<usize>(), 75);
+    }
 
     #[test]
     fn per_peer_state_reads() {

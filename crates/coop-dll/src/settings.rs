@@ -358,6 +358,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::SYNC_POSTURE.store(ini.flag("sync_posture", true, warn), Relaxed);
     crate::keyitems::ENABLED.store(ini.flag("share_key_items", true, warn), Relaxed);
     crate::keyitems::SHARE_PICKUPS.store(ini.flag("share_pickups", true, warn), Relaxed);
+    crate::world::SHOP_STOCK_PER_PLAYER.store(ini.flag("shop_stock_per_player", true, warn), Relaxed);
     crate::bossgate::ENABLED.store(ini.flag("boss_start_gate", true, warn), Relaxed);
     crate::dialog::CONFIRM_ITEMS.store(ini.flag("confirm_items", true, warn), Relaxed);
     tuning::DIALOG_DEFAULT_YES.store(ini.flag("dialog_default_yes", true, warn), Relaxed);
@@ -594,6 +595,10 @@ share_key_items = 1
 ;     Both players need 1. Pickups made alone or before the session are not shared.
 ;     Shops stay your own. 0 = each player picks up their own copy.
 share_pickups = 1
+; 1 = shop items with a limited stock count each player's own purchases: what the friend
+;     buys does not use up your stock. 0 = the stock count is shared (the old behaviour).
+;     Takes effect at the next start.
+shop_stock_per_player = 1
 ; 1 = a boss fight the friend starts far from you (other area or over 60 m) does not
 ;     start in your world until you come near it; the kill still counts for you. 0 = off.
 boss_start_gate = 1
