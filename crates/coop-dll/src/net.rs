@@ -1790,6 +1790,43 @@ impl Net {
 mod tests {
     use super::*;
 
+    /// Every reliable bulk kind in the tree is distinct (test2 merge: share_pickups 46, objact
+    /// 0xA7, loadout 0xA8, pvp 0xA9 were added on separate branches). testsync.rs (feature
+    /// `testsync`, not in public builds) uses 20..=23.
+    #[test]
+    fn bulk_kinds_are_unique() {
+        let kinds: [(u8, &str); 21] = [
+            (crate::world::BULK_FLAGS, "world flags"),
+            (crate::world::BULK_DEAD_LIST, "world dead list"),
+            (crate::world::BULK_BOSS_REWARD, "world boss reward"),
+            (crate::puppet::BULK_SCALE_CFG, "puppet scale cfg"),
+            (crate::world::BULK_PHASE, "world phase"),
+            (20, "testsync log"),
+            (21, "testsync offer"),
+            (22, "testsync want"),
+            (23, "testsync dll"),
+            (crate::doctor::BULK_DOCTOR, "doctor"),
+            (crate::keyitems::BULK_ITEM_GRANT, "item grant"),
+            (crate::keyitems::BULK_KEY_ITEMS, "key items"),
+            (crate::keyitems::BULK_BOSS_DROP, "boss drop"),
+            (crate::keyitems::BULK_GRANT_ACK, "grant ack"),
+            (crate::keyitems::BULK_LOT_LEDGER, "lot ledger"),
+            (crate::keyitems::BULK_PICKUP, "share_pickups"),
+            (crate::persist::BULK_PERSIST, "persist"),
+            (crate::audit::BULK_AUDIT, "audit"),
+            (crate::nsession::BULK_KIND, "nsession"),
+            (coop_net::protocol::ROSTER_KIND, "roster"),
+            (crate::objact::BULK_OBJACT, "objact"),
+        ];
+        let more = [(crate::loadout::BULK_LOADOUT, "loadout"), (crate::pvp::BULK_PVP, "pvp")];
+        let all: Vec<(u8, &str)> = kinds.iter().chain(more.iter()).copied().collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.0, b.0, "bulk kind {} used by {} and {}", a.0, a.1, b.1);
+            }
+        }
+    }
+
     fn snap(hp: i32, hidden: bool) -> Snapshot {
         Snapshot { hp, hidden, pos: [1.0, 2.0, 3.0], ..Default::default() }
     }

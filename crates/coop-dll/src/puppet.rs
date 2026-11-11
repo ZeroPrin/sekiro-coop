@@ -1548,7 +1548,7 @@ fn all_dead(dead: &[bool]) -> bool {
 /// Max HP and posture lost per death stack (ER Seamless uses about 20 %).
 const DEBUFF_PCT: u32 = 10;
 /// Bulk kind of the host's scaling percentages (world.rs uses 1, 5 and 6).
-const BULK_SCALE_CFG: u8 = 7;
+pub(crate) const BULK_SCALE_CFG: u8 = 7;
 
 fn own_scale_cfg(players: u32) -> crate::scaling::ScaleCfg {
     use std::sync::atomic::Ordering::Relaxed;
