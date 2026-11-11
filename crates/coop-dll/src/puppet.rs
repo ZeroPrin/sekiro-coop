@@ -416,6 +416,7 @@ impl Puppet {
         // The settings file: re-read when it changed (fps and the other live settings apply
         // here); new network keys reconnect.
         settings::tick();
+        crate::logzip::tick();
         fps::apply();
         let cmd = ui::take_commands();
         let f5 = self.f5.pressed(VK_F5) && keys;

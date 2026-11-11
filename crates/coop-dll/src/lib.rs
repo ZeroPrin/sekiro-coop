@@ -37,6 +37,8 @@ mod keyitems;
 mod leave;
 mod livesync;
 mod log;
+mod logzip;
+mod me3scan;
 mod mode4;
 mod motion;
 mod msfunc;
@@ -180,17 +182,21 @@ fn init(hmodule: usize) {
     // Shown in the overlay once in the world; it does not wrap, hence the line breaks.
     match log::previous_end() {
         log::PrevEnd::NoExitLine => bossrules::notice(
-            "Last time the game didn't close normally.\nTo stop: Severed Thread first, then Quit Game.\nFroze or crashed? Send log.txt and log.old.txt."
-                .to_string(),
+            format!(
+                "Last time the game didn't close normally.\nTo stop: Severed Thread first, then Quit Game.\nFroze or crashed? Send the newest crash_*.zip\nfrom {}\\logs",
+                platform::data_folder_hint()
+            ),
             30,
         ),
         log::PrevEnd::Crash => bossrules::notice(
-            format!("The game crashed last time.\nPlease send log.txt and log.old.txt\nfrom {}", platform::data_folder_hint()),
+            format!("The game crashed last time.\nPlease send the newest crash_*.zip\nfrom {}\\logs", platform::data_folder_hint()),
             30,
         ),
         // A clean exit, or no log to read: nothing to report.
         log::PrevEnd::Clean | log::PrevEnd::NoLog => {}
     }
+    // me3 file mods next to ours, for the doctor (a thread of its own).
+    me3scan::start();
     // Launcher scripts next to the DLL kept current (a friend's old update.ps1 only fetches the DLL).
     #[cfg(feature = "testsync")]
     shipfiles::start();

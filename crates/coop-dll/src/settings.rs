@@ -358,6 +358,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::SYNC_POSTURE.store(ini.flag("sync_posture", true, warn), Relaxed);
     crate::keyitems::ENABLED.store(ini.flag("share_key_items", true, warn), Relaxed);
     crate::keyitems::SHARE_PICKUPS.store(ini.flag("share_pickups", true, warn), Relaxed);
+    crate::world::SHOP_STOCK_PER_PLAYER.store(ini.flag("shop_stock_per_player", true, warn), Relaxed);
     crate::bossgate::ENABLED.store(ini.flag("boss_start_gate", true, warn), Relaxed);
     crate::dialog::CONFIRM_ITEMS.store(ini.flag("confirm_items", true, warn), Relaxed);
     tuning::DIALOG_DEFAULT_YES.store(ini.flag("dialog_default_yes", true, warn), Relaxed);
@@ -367,10 +368,13 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::doctor::ALLOW_CROSS_CYCLE.store(ini.flag("allow_cross_cycle", false, warn), Relaxed);
     crate::nopause::ENABLED.store(ini.flag("no_pause_in_coop", true, warn), Relaxed);
     crate::livesync::ENABLED.store(ini.flag("native_lives_sync", true, warn), Relaxed);
+    crate::nsession::dblock::FRESH_LIFE_VETO.store(ini.flag("getup_deathblow_veto", true, warn), Relaxed);
     crate::puppetguard::ENABLED.store(ini.flag("puppet_type5_guard", true, warn), Relaxed);
     crate::bossrules::CLEAR_STALE_NO_REVIVE.store(ini.flag("clear_stale_no_revive", true, warn), Relaxed);
     crate::persist::BOSS_PERSIST.store(ini.flag("boss_persist_on_death", true, warn), Relaxed);
+    crate::persist::WAIT_FOR_DOWN.store(ini.flag("persist_wait_for_down", true, warn), Relaxed);
     enemies::STEALTH_WINDOW_M.store(ini.num("stealth_window_m", 15, 0, 40, warn), Relaxed);
+    enemies::STEALTH_HANG_COVER.store(ini.flag("stealth_hang_cover", true, warn), Relaxed);
 
     // [DISPLAY]. vsync = 0 means "turn the game's vsync off" (fps.rs VSYNC_OFF).
     fps::UNLOCK.store(ini.flag("fps_unlock", true, warn), Relaxed);
@@ -383,6 +387,9 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     PARTY_SCALE.store(ini.num("party_hp_scale", 100, 50, 200, warn), Relaxed);
     tuning::CUSTOM_ICONS.store(ini.flag("custom_icons", true, warn), Relaxed);
     crate::dialog::NATIVE_NOTICES.store(ini.flag("native_notices", false, warn), Relaxed);
+    crate::logzip::SEND_LOGS_KEY.store(ini.num("send_logs_key", 118, 0, 255, warn), Relaxed);
+    // Read again by log.rs at the next start (the per-run file opens before this reader runs).
+    let _ = ini.flag("log_per_run", true, warn);
 
     // [ADVANCED], live (no reconnect): the native session (nsession.rs).
     tuning::NATIVE_SESSION.store(ini.flag("native_session", true, warn), Relaxed);
@@ -590,6 +597,10 @@ share_key_items = 1
 ;     Both players need 1. Pickups made alone or before the session are not shared.
 ;     Shops stay your own. 0 = each player picks up their own copy.
 share_pickups = 1
+; 1 = shop items with a limited stock count each player's own purchases: what the friend
+;     buys does not use up your stock. 0 = the stock count is shared (the old behaviour).
+;     Takes effect at the next start.
+shop_stock_per_player = 1
 ; 1 = a boss fight the friend starts far from you (other area or over 60 m) does not
 ;     start in your world until you come near it; the kill still counts for you. 0 = off.
 boss_start_gate = 1
@@ -623,6 +634,10 @@ no_pause_in_coop = 1
 ;     death on either machine are applied on the other one too (within about half a
 ;     second), so both see the same life orbs and the same dead enemies. 0 = off.
 native_lives_sync = 1
+; 1 = after a boss or miniboss loses a life to a deathblow, nobody can deathblow it again
+;     for 10 seconds while it gets up (stops a second deathblow taking both lives in one
+;     posture break when another player made the first one). 0 = off.
+getup_deathblow_veto = 1
 ; 1 = a Puppeteer Ninjutsu puppet (an enemy you raised to fight for you) is not killed by
 ;     the host's copy of that enemy, which stays dead there (native session). 0 = off.
 puppet_type5_guard = 1
@@ -634,10 +649,18 @@ clear_stale_no_revive = 1
 ;     (only a rest or both players dying resets it). 0 = as in the base game (and other
 ;     seamless co-op mods): a death reload brings the boss back at full health.
 boss_persist_on_death = 1
+; 1 = when you come back from a death while another player is down (at 0 HP choosing to
+;     Resurrect, or dead), the boss keeps waiting: if they die too it is a wipe and the boss
+;     resets for everybody; if they get up, the boss keeps the health it lost as usual (at
+;     most 30 s). 0 = your return ends your part of a wipe at once.
+persist_wait_for_down = 1
 ; Stealth and plunging deathblows: an enemy you approach from behind or from above
 ; within this many metres runs on your own machine's AI (its awareness is yours, as in
 ; single player). 0 = the old 5 m check behind it only. 0..40.
 stealth_window_m = 15
+; 1 = also while you hang from a ledge or hug a wall at a corner (peeking), enemies within 12 m run on your own
+;     machine's AI, so the ledge and wall-hug stealth deathblows work as in single player. 0 = off.
+stealth_hang_cover = 1
 
 [DISPLAY]
 ; 1 = frame rate unlocked to 120 fps.
@@ -667,6 +690,14 @@ custom_icons = 1
 ;     companion entered your world, the host closed their world, back in your own world)
 ;     are always in the top left, whatever this says.
 native_notices = 0
+; Key that packs the logs into one zip for a bug report (the path is shown on screen):
+; the last 3 game runs, audit.txt and this file without the password. 118 = F7, 0 = off.
+; Windows virtual-key code (F1..F12 = 112..123).
+send_logs_key = 118
+; 1 = every game run also gets its own log file in sekiro-coop\\logs (the last 20 are kept;
+;     log.txt stays as before). A run that crashed is packed into a crash_*.zip there at the
+;     next start. 0 = log.txt only. Takes effect at the next start.
+log_per_run = 1
 
 [ADVANCED]
 ; Changing anything here (or the password / name) restarts the connection.

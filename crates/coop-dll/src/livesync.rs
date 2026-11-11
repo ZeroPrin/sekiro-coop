@@ -118,6 +118,42 @@ pub enum Plan {
     Kill { loot: bool },
 }
 
+/// A boss's lives / death that differ from another player's this long are a desync (logged).
+/// Longer than every normal hand-over: a throw hold (3 s), a kill wait (12 s cap only for a
+/// single-life boss's throw, which ends as dead on both), the get-up window (6 s).
+const DESYNC_AFTER: Duration = Duration::from_secs(15);
+
+/// Our copy's lives / death differ from the other players' merged state. A single-life
+/// enemy's lives field is not tracked (reads 0): only death counts there.
+pub fn lives_differ(multi: bool, lives: i32, dead: bool, theirs: Remote) -> bool {
+    let their_dead = theirs.flags & LIFE_DEAD != 0;
+    if dead || their_dead || !multi {
+        return dead != their_dead;
+    }
+    theirs.lives >= 0 && theirs.lives != lives
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Desync {
+    None,
+    /// Different for `DESYNC_AFTER` now (once per stretch).
+    Started,
+    /// A logged stretch ended after this long.
+    Ended(Duration),
+}
+
+/// One scan of the desync watch: `prev` = (different since, logged).
+pub fn desync_step(prev: Option<(Instant, bool)>, differs: bool, now: Instant) -> (Option<(Instant, bool)>, Desync) {
+    match (prev, differs) {
+        (None, false) => (None, Desync::None),
+        (None, true) => (Some((now, false)), Desync::None),
+        (Some((since, false)), true) if now.duration_since(since) >= DESYNC_AFTER => (Some((since, true)), Desync::Started),
+        (Some(s), true) => (Some(s), Desync::None),
+        (Some((since, true)), false) => (None, Desync::Ended(now.duration_since(since))),
+        (Some((_, false)), false) => (None, Desync::None),
+    }
+}
+
 /// A single-life boss's remote kill waits at most this long for its deathblow throw (v8.29a).
 const BOSS_THROW_WAIT: Duration = Duration::from_secs(12);
 
@@ -327,6 +363,8 @@ struct State {
     logs: u32,
     /// Puppets logged this engagement.
     puppets: HashSet<u16>,
+    /// Bosses whose lives differ from another player's: (since, logged) (`desync_step`).
+    desync: HashMap<u16, (Instant, bool)>,
 }
 
 impl State {
@@ -523,6 +561,7 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
                 "livesync: enemy {entity} netId {n:#x}: lives {before} -> {lives_read} (seen here), getting up{}",
                 if owned { "" } else { " (NetAI copy: HP and posture full at once)" }
             ));
+            nsession::dblock::life_lost(n, entity, "seen here");
             if !owned {
                 refill(chr, data, max_hp, max_posture);
                 refilled_now = true;
@@ -579,6 +618,9 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
                             "livesync: enemy {entity} netId {n:#x}: lives {lives} -> {to} (the friend's deathblow){}",
                             if up { ", gets up: HP and posture full" } else { "" }
                         ));
+                        if up {
+                            nsession::dblock::life_lost(n, entity, "the friend's deathblow");
+                        }
                         lives = to;
                     }
                 }
@@ -631,6 +673,35 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
                     dead = true;
                     fresh = false;
                 }
+            }
+        }
+        // A boss / miniboss whose lives or death stay different from the other players'
+        // (1.0.11 `enemies: HP mismatch`; the fork's audit saw 25 boss desyncs): one line when
+        // it starts, one when it ends. Not right after our death reload (their states are old).
+        if tracked && !after_death {
+            let theirs = st.remote.get(&n).map(|(r, _)| *r);
+            let differs = theirs.is_some_and(|r| lives_differ(multi, lives, dead, r));
+            let (next, ev) = desync_step(st.desync.get(&n).copied(), differs, now);
+            match next {
+                Some(s) => st.desync.insert(n, s),
+                None => st.desync.remove(&n),
+            };
+            let entity = chr.entity_id().unwrap_or(-1);
+            match (ev, theirs) {
+                (Desync::Started, Some(r)) => log::line(&format!(
+                    "livesync: DESYNC enemy {entity} netId {n:#x} (boss / miniboss): for {} s here lives {lives}{} HP {hp}/{max_hp}, another player's copy lives {}{} (owned {})",
+                    DESYNC_AFTER.as_secs(),
+                    if dead { " dead" } else { "" },
+                    r.lives,
+                    if r.flags & LIFE_DEAD != 0 { " dead" } else { "" },
+                    if nsession::owned_here(n) { "here" } else { "by another player" }
+                )),
+                (Desync::Ended(d), _) => log::line(&format!(
+                    "livesync: enemy {entity} netId {n:#x}: lives agree with the other players again after {} s (here lives {lives}{})",
+                    d.as_secs(),
+                    if dead { " dead" } else { "" }
+                )),
+                _ => {}
             }
         }
         // A lives drop was recorded above (`own_drop`): an owned copy gets `OWN_GETUP_AFTER`
@@ -719,6 +790,36 @@ fn stats_line(st: &mut State, end: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boss_lives_desync_is_logged_once_per_stretch() {
+        let r = |lives: i32, flags: u8| Remote { lives, flags };
+        // Fork audit p3: 1110504 lives differ; 1.0.11: 1100300 dead here, 2 lives on the friend.
+        assert!(lives_differ(true, 1, false, r(2, 0)));
+        assert!(lives_differ(true, 0, true, r(2, 0)));
+        assert!(!lives_differ(true, 2, false, r(2, 0)));
+        assert!(!lives_differ(true, 0, true, r(0, LIFE_DEAD)));
+        // Single-life boss: lives field untracked, only death.
+        assert!(!lives_differ(false, 0, false, r(1, 0)));
+        assert!(lives_differ(false, 0, false, r(0, LIFE_DEAD)));
+        // Nothing known about their lives yet (-1).
+        assert!(!lives_differ(true, 2, false, r(-1, 0)));
+
+        let t0 = Instant::now();
+        let (s, e) = desync_step(None, true, t0);
+        assert_eq!(e, Desync::None);
+        let (s, e) = desync_step(s, true, t0 + DESYNC_AFTER - Duration::from_millis(1));
+        assert_eq!(e, Desync::None);
+        let (s, e) = desync_step(s, true, t0 + DESYNC_AFTER);
+        assert_eq!(e, Desync::Started);
+        let (s, e) = desync_step(s, true, t0 + DESYNC_AFTER * 2);
+        assert_eq!(e, Desync::None, "logged once");
+        let (s, e) = desync_step(s, false, t0 + Duration::from_secs(40));
+        assert_eq!((s, e), (None, Desync::Ended(Duration::from_secs(40))));
+        // A short difference (a throw hand-over) never logs.
+        let (s, _) = desync_step(None, true, t0);
+        assert_eq!(desync_step(s, false, t0 + Duration::from_secs(3)), (None, Desync::None));
+    }
 
     #[test]
     fn stale_lives_after_a_rest_are_a_baseline() {

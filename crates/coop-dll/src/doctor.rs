@@ -140,6 +140,31 @@ pub fn compare(ours: &Info, theirs: &Info) -> Vec<Finding> {
         // miniboss 1110504 1874 HP here, 1249 on the host, never died there).
         out.push(Finding { log: format!("mod version differs: {v}"), notice: Some(format!("Different co-op mod versions ({v}): update both.")) });
     }
+    // me3 file mods (me3scan.rs). An older build sends no `pkgs`: nothing to compare.
+    if differs("pkgs") && readable("pkgs") {
+        let names = |i: &Info| {
+            let none = i.get("pkgs").is_some_and(|v| v == "none");
+            i.get("pkg_names").cloned().unwrap_or_else(|| if none { "none" } else { "?" }.into())
+        };
+        let same_names = ours.get("pkg_names") == theirs.get("pkg_names");
+        out.push(Finding {
+            log: format!(
+                "WARNING me3 file mods differ: {} [{}] here, {} [{}] on the friend's side",
+                ours["pkgs"],
+                names(ours),
+                theirs["pkgs"],
+                names(theirs)
+            ),
+            notice: Some(if same_names {
+                "Same file mods but different files (versions differ): the worlds can go out of sync.".into()
+            } else {
+                format!("Different file mods (you: {}, companion: {}): the worlds can go out of sync.", names(ours), names(theirs))
+            }),
+        });
+    }
+    if differs("natives") && readable("natives") {
+        out.push(Finding { log: format!("me3 natives differ (other DLL mods): {}", pair("natives")), notice: None });
+    }
     let native = |i: &Info| i.get("native_session").cloned();
     if differs("native_session") || (native(ours).as_deref() == Some("1") && differs("native_stage")) {
         out.push(Finding {
@@ -222,6 +247,16 @@ fn gather(is_host: bool) -> Info {
     put("enemy_mode", tuning::enemy_mode().to_string());
     put("merge_quests", tuning::merge_quests().to_string());
     put("own_world_mode", crate::ownworld::mode_name().into());
+    match crate::me3scan::result() {
+        Some(s) => {
+            put("pkgs", s.pkgs.clone());
+            if s.pkg_names != "none" {
+                put("pkg_names", s.pkg_names.clone());
+            }
+            put("natives", s.natives.clone());
+        }
+        None => put("pkgs", "?".into()),
+    }
     put("death_debuffs", (tuning::DEATH_DEBUFFS.load(std::sync::atomic::Ordering::Relaxed) as u8).to_string());
     let p = |a: &std::sync::atomic::AtomicU32| a.load(std::sync::atomic::Ordering::Relaxed);
     put(
@@ -497,6 +532,28 @@ mod tests {
 
     fn info(pairs: &[(&str, &str)]) -> Info {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn me3_file_mods_that_differ_warn() {
+        // Live 2026-11-08 (1.0.11 doctor): the friend runs ps5-glyphs, the host nothing.
+        let host = info(&[("pkgs", "none"), ("natives", "none")]);
+        let friend = info(&[("pkgs", "1:195a8a9633569c99"), ("pkg_names", "ps5-glyphs"), ("natives", "none")]);
+        let f = compare(&host, &friend);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].log, "WARNING me3 file mods differ: none [none] here, 1:195a8a9633569c99 [ps5-glyphs] on the friend's side");
+        assert!(f[0].notice.as_deref().is_some_and(|n| n.starts_with("Different file mods (you: none, companion: ps5-glyphs)")));
+        // Same mod, other files.
+        let other = info(&[("pkgs", "1:0000000000000001"), ("pkg_names", "ps5-glyphs"), ("natives", "none")]);
+        assert!(compare(&friend, &other)[0].notice.as_deref().is_some_and(|n| n.starts_with("Same file mods but different files")));
+        // Same, unknown (scan not done / no profile) or an older build without the key: quiet.
+        assert!(compare(&friend, &friend).is_empty());
+        assert!(compare(&host, &info(&[("pkgs", "?")])).is_empty());
+        assert!(compare(&host, &info(&[])).is_empty());
+        // Other DLL mods: a log line only.
+        let f = compare(&host, &info(&[("pkgs", "none"), ("natives", "fps.dll")]));
+        assert_eq!(f.len(), 1);
+        assert!(f[0].notice.is_none());
     }
 
     #[test]

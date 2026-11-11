@@ -40,6 +40,10 @@ use crate::{livesync, log, nsession, posture};
 
 /// `[GAMEPLAY] boss_persist_on_death` (default on). 0 = vanilla: a death reload resets a boss.
 pub static BOSS_PERSIST: AtomicBool = AtomicBool::new(true);
+/// `[GAMEPLAY] persist_wait_for_down`: our death reload while another player is down (HP 0,
+/// or a committed death not over yet) holds boss restores and dead-set kills until that
+/// player gets up (a lone death) or dies too (a wipe), at most `DOWN_WAIT_MAX` (1.0.11).
+pub static WAIT_FOR_DOWN: AtomicBool = AtomicBool::new(true);
 
 pub const BULK_PERSIST: u8 = 50;
 const VERSION: u8 = 1;
@@ -61,6 +65,8 @@ const AFTER_REST_IGNORE: Duration = Duration::from_secs(13);
 const GETUP_GRACE: Duration = Duration::from_secs(6);
 const MAX_LOGS: u32 = 40;
 const STATS_EVERY: Duration = Duration::from_secs(30);
+/// The longest our restores / dead-set kills wait for a down peer (1.0.11: "at most 30 s").
+const DOWN_WAIT_MAX: Duration = Duration::from_secs(30);
 
 // --- Pure rules (unit tested) ---------------------------------------------------------
 
@@ -182,6 +188,31 @@ pub fn commit_edge(last: u32, now: u32) -> bool {
 /// our death reload, or the peer's last hidden snapshot) and is alive again now.
 pub fn death_over(dead_at: Instant, reloaded_at: Option<Instant>, alive: bool) -> bool {
     alive && reloaded_at.is_some_and(|t| t > dead_at)
+}
+
+/// How a wait for down peers (`WAIT_FOR_DOWN`) ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownEnd {
+    /// Every down peer got up: a lone death, our restores run.
+    LoneDeath,
+    /// A wipe was cleared meanwhile: the world is fresh, nothing to restore.
+    Wipe,
+    /// `DOWN_WAIT_MAX` passed: they run anyway.
+    Timeout,
+}
+
+/// One frame of the wait: `still_down` = how many of the peers that were down when it began
+/// still are, `wiped` = a wipe cleared the records since. None = keep waiting.
+pub fn down_wait_end(waited: Duration, still_down: usize, wiped: bool) -> Option<DownEnd> {
+    if wiped {
+        Some(DownEnd::Wipe)
+    } else if still_down == 0 {
+        Some(DownEnd::LoneDeath)
+    } else if waited >= DOWN_WAIT_MAX {
+        Some(DownEnd::Timeout)
+    } else {
+        None
+    }
 }
 
 /// Boss records are restored only on a load that follows a death of ours, and only for the
@@ -312,6 +343,11 @@ struct State {
     /// lives it had at our last sight (this load).
     life_lost_at: HashMap<i32, Instant>,
     last_lives: HashMap<i32, i32>,
+    /// Our death reload came while these peers were down (`WAIT_FOR_DOWN`): since when, and
+    /// `wipes` then. Our death keeps counting for a wipe meanwhile.
+    down_wait: Option<(Instant, Vec<PeerId>, u32)>,
+    /// Wipe clears so far (the wait ends on a new one).
+    wipes: u32,
     stats: Stats,
     stats_at: Option<Instant>,
     logs: u32,
@@ -497,6 +533,7 @@ pub fn tick(c: Ctx) {
     if let Some(set) = wipe_deaths(st.our_dead_at, &peer_deaths, st.wipe_cleared.as_deref()) {
         st.wipe_cleared = Some(set);
         mark_wipe();
+        st.wipes += 1;
         st.clear(if peer_deaths.len() > 1 { "wipe (every player died)" } else { "wipe (both players died)" });
         // Dead now: the bosses here are still the damaged ones until our reload.
         if c.player.hp().is_some_and(|h| h <= 0) {
@@ -508,11 +545,41 @@ pub fn tick(c: Ctx) {
     // so a peer death that came in during our own death reload is still a wipe. (Live
     // 2026-11-09, 1.0.9: the host died, reloaded and played on for 79 s; the friend's death
     // then counted as a wipe and cleared the dead set and the boss records on both sides.)
+    // A peer that is down (HP 0: the Resurrect choice, or a committed death not over) when we
+    // come back can still die too: that is a wipe (1.0.11 F4, a boss kept its old HP after
+    // everyone died). Our death keeps counting and our restores / dead-set kills wait until
+    // every such peer got up or died, at most `DOWN_WAIT_MAX`.
+    let down = |p: &crate::peers::PeerFrame, dead_at: &BTreeMap<PeerId, Instant>| p.dead_since.is_some() || dead_at.contains_key(&p.id);
     if let Some(d) = st.our_dead_at
+        && st.down_wait.is_none()
         && death_over(d, st.death_load_at, c.player.hp().is_some_and(|h| h > 0))
     {
-        st.our_dead_at = None;
-        log::line("persist: we are back after our death: it no longer counts for a wipe");
+        let down_now: Vec<PeerId> = c.peers.iter().filter(|p| down(p, &st.peer_dead_at)).map(|p| p.id).collect();
+        if WAIT_FOR_DOWN.load(Ordering::Relaxed) && !down_now.is_empty() {
+            log::line(&format!(
+                "persist: our death reload while peer(s) {:?} are down: boss restores and dead-set kills wait until they get up (lone death) or die too (wipe), at most {} s",
+                down_now.iter().map(|p| p.slot()).collect::<Vec<_>>(),
+                DOWN_WAIT_MAX.as_secs()
+            ));
+            st.down_wait = Some((now, down_now, st.wipes));
+        } else {
+            st.our_dead_at = None;
+            log::line("persist: we are back after our death: it no longer counts for a wipe");
+        }
+    }
+    if let Some((since, ids, wipes)) = st.down_wait.clone() {
+        let still = ids.iter().filter(|id| c.peers.by_id(**id).is_some_and(|p| down(p, &st.peer_dead_at))).count();
+        if let Some(end) = down_wait_end(now.duration_since(since), still, st.wipes != wipes) {
+            st.down_wait = None;
+            // Lone death or the cap: our death is over now. A wipe already cleared it all.
+            st.our_dead_at = None;
+            log::line(&format!(
+                "persist: the down peer(s) settled {} ms after our death reload: restores / dead-set kills {}{}",
+                now.duration_since(since).as_millis(),
+                if end == DownEnd::Wipe { "have nothing left (wipe: fresh world)" } else { "run now" },
+                if end == DownEnd::Timeout { " (waited the maximum)" } else { "" }
+            ));
+        }
     }
     for p in c.peers.iter() {
         if let Some(&d) = st.peer_dead_at.get(&p.id)
@@ -566,7 +633,8 @@ pub fn tick(c: Ctx) {
     if st.scan_at.is_none_or(|t| now.duration_since(t) >= SCAN_EVERY) {
         st.scan_at = Some(now);
         if !st.frozen() {
-            scan(st, c.enemies, c.in_world_for);
+            let hold = st.down_wait.is_some();
+            scan(st, c.enemies, c.in_world_for, hold);
         }
     }
 
@@ -629,7 +697,9 @@ pub fn tick(c: Ctx) {
     }
 }
 
-fn scan(st: &mut State, enemies: &Enemies, in_world_for: Duration) {
+/// `hold`: a wait for down peers runs (`WAIT_FOR_DOWN`): no boss restore and no dead-set kill
+/// yet (bosses are not even looked at, so their restore check runs once the wait ends).
+fn scan(st: &mut State, enemies: &Enemies, in_world_for: Duration, hold: bool) {
     let gauge = game::boss_state().map(|b| b.entity);
     let settled = in_world_for >= SETTLE;
     let mut kills = 0;
@@ -648,7 +718,7 @@ fn scan(st: &mut State, enemies: &Enemies, in_world_for: Duration) {
         st.seen.insert(id, Seen { chr: chr.0, alive, lives0, boss });
 
         if boss {
-            if settled {
+            if settled && !hold {
                 boss_step(st, chr, id, alive, lives0);
             }
             continue;
@@ -668,7 +738,7 @@ fn scan(st: &mut State, enemies: &Enemies, in_world_for: Duration) {
             }
             continue;
         }
-        if settled && kills < KILLS_PER_SCAN && st.dead.contains(&id) && !st.killed_here.contains(&id) {
+        if settled && !hold && kills < KILLS_PER_SCAN && st.dead.contains(&id) && !st.killed_here.contains(&id) {
             st.killed_here.insert(id);
             let loot = !st.rewarded.contains(&id);
             if enemies.force_dead_one(id, loot) {
@@ -782,6 +852,22 @@ mod tests {
         // Both down at the same time (the host still dead): still a wipe.
         let host_dead = Some(t).filter(|&d| !death_over(d, None, false));
         assert!(is_wipe(host_dead, &[friend_dead]));
+    }
+
+    #[test]
+    fn restores_wait_for_a_down_peer() {
+        use super::{DOWN_WAIT_MAX, DownEnd, down_wait_end};
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        // 1.0.11 live: the friend got up 3.3 s after our death reload: a lone death.
+        assert_eq!(down_wait_end(s(1), 1, false), None);
+        assert_eq!(down_wait_end(Duration::from_millis(3336), 0, false), Some(DownEnd::LoneDeath));
+        // It died too: the wipe cleared everything, nothing is restored.
+        assert_eq!(down_wait_end(s(5), 1, true), Some(DownEnd::Wipe));
+        assert_eq!(down_wait_end(s(5), 0, true), Some(DownEnd::Wipe), "a wipe wins over getting up");
+        // Never longer than the cap.
+        assert_eq!(down_wait_end(DOWN_WAIT_MAX - Duration::from_millis(1), 2, false), None);
+        assert_eq!(down_wait_end(DOWN_WAIT_MAX, 2, false), Some(DownEnd::Timeout));
     }
 
     #[test]
