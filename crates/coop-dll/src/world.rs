@@ -553,6 +553,7 @@ impl World {
             }
             self.boss_announce.clear();
             crate::doors::reset();
+            crate::objact::new_session();
             self.intro.reset();
             self.talk_tagged.clear();
         }

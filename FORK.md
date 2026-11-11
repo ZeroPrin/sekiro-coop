@@ -56,90 +56,120 @@ the chest itself stays closed for the receiver (opening it gives nothing). Enemy
 
 ## ObjAct sync (experimental, `[GAMEPLAY] sync_objact`, default 1; NOT verified live)
 
-Problem: in 1.0.9 only event flags travel. doors.rs replays a friend's door only for ObjAct
-states that keep a flag (door / one-dir door / one-loop); most doors seen live are
-`SprjObjActOneState` (no flag, EMEVD sets one), so the object the friend opened stays closed
-here until a reload (IMPLEMENTATION-NOTES §37 "Risks"). The game's own type 45 replay only
-runs with the native session engaged at stage 4.
+Problem: in 1.0.9 only event flags travel. A door, gate or chest the friend opened stays
+closed here, and even where the object was replayed (doors.rs, the game's own type 45) the map
+script did not go on: the door templates (common_func 20005616 / 20005615, m11_01 11115620)
+and the chest templates (20005510 / 20005511) wait for `ObjActEventFlag(ObjActEntityID)` before
+they set the door's flag, disable the ObjAct, deactivate the blocker and rebuild the navmesh,
+or enable the chest's treasure. Doors also "close again after an area reload" (upstream issue
+#3, open in 1.0.11 too).
 
-Design (`objact.rs`):
+### What RE says (Sekiro 1.06, dump 2026-11-11, Ghidra copy `E:\RE\ghidra_objact`) [VAR]
 
-- **Sender: a poll, not a detour.** Every 50 ms the WorldObjActMan walk (doors.rs layout)
-  reads each loaded block's infos in one read (at most 512 per block, 2048 per poll). An info
-  whose run state (`+0x54`) turns 3 is a new execution. It is judged at the next frame at
-  least 150 ms later: ours when `info+114` went 0 -> 1 between the poll before the edge and
-  that moment (the player's own path `0x6BA7B0` -> `0x6BC1B0` sets it; the replay `0x6BA910`
-  sets `+113 = 1, +114 = 0`), or `+114` is still 1 from an earlier execution and our player
-  started an `ObjActParam.playerAnimId` animation within 2 s (used for one send only). Our
-  animation alone never sends: every execution in every loaded block would match (an EMEVD
-  gate, the friend's type 45), and no object position is known for a proximity check. Never
-  sent: our own `0x6BA910` replays (doors.rs and objact.rs mark them per ObjAct, a door's sub
-  infos sharing their primary `+0xB0`: no echo), one-loop states unless `sync_objact = 2`, an
-  unknown state class. The infos of one ObjAct go out once per 2 s. For a flag state the
-  target is the opposite of the flag before the toggle. A detour on `0x6BC1B0` was not done:
-  its signature and prologue are in no note here.
-- **Message:** bulk kind `0xA7` (`BULK_OBJACT`), 25 bytes: magic `0x4F`, version 1, reason 1,
-  state class, target state, then the block's **map id**, info index, sub index, ObjActParam
-  id (-1: not located yet), sequence number. The block descriptor is a `WorldBlockInfo` [ARV]:
-  `+0x20` (the slot doors.rs and `0x6BA910` use) is its `world_block_index` in the game's
-  WorldInfo (vendor/sekiro `world_info.rs`), so it is probably the same on both machines; the
-  map id (`+0x08`, checked against its area's number) is sent anyway because it describes the
-  block by itself and is checked here. Sent to `Dest::All`: the host to every client, a client
-  to the host, whose coop-net relays it to the other clients with the original sender.
-  An older build logs `net: bulk transfer kind 167 received` for every message and keeps it
-  in its 24-entry bulk inbox until newer transfers push it out.
-- **Receiver** (game thread, 300 ms after arrival, retried for 5 s; at most 32 waiting, a
-  drop is logged): the loaded block with that map id, the info by index / sub, then
-  `replay_gate`: target state 0 / 1 only (a one-state only 1); not replayed by doors.rs or us
-  in the last 3 s (doors.rs checks our marks too: one `0x6BA910` per ObjAct); at most one
-  replay per ObjAct per load; not executed here since the load; its run state is the idle one
-  it had when first seen after the load; class known; one-loop only with `sync_objact = 2`;
-  never a door toggling closed (doors.rs keeps door flags on). Only then the object is looked
-  at (`doors::object_view`, never for an unknown class): already at that execution's
-  animation (playing or finished) = nothing. Else `0x6BA910(block, index, -1, state)`.
-  Nothing runs in a Remnant memory.
-- **Settings:** `sync_objact` 0 off, 1 on (default; one-loop states neither sent nor
-  replayed), 2 also one-loop states (both players). `[DEBUG] objact_debug` (default 0): every
-  execution, every map flag write, the raw info bytes (first 8 per load) and the first bytes
-  of `0x6BC1B0` / `0x6BA7B0` / `0x6BA910`.
+- `0x6BA7B0(block, index, actor)` = the local start: sets `info+0x70/+0x71/+0x72 = 1`, takes the
+  value from `state->vt[6]`, builds the request (`0x6BCBC0`) and runs `0x6BC1B0(block, req, 0)`.
+  Prologue `48 89 74 24 10 44 89 44 24 18 57 48 83 EC 70` (15 bytes, position independent).
+  The closed 1.0.11 detours the same function (`objsync ObjAct start (0x6BA7B0)`).
+- `0x6BA910(block, index, actor, value)` = the replay (type 45 receive `0x6BE740`, doors.rs):
+  `state->vt[5](value)` (door / one-loop states: `SetEventFlag(flag, value != 0)`; one-state:
+  nothing), then `+0x70 = ObjActParam.isEventKickSync`, `+0x71 = 1`, `+0x72 = 0`, no packet 45.
+- `ObjActEventFlag(X)` = `EcTestObjActExecuted` (test `0x8FCB90`): true while the list
+  `[[0x143D56058]+0x70]` holds `{0, X}`. The list is cleared once per event step (`0x6C76D0`,
+  right after the EMEVD update `0x67D180`). Its only writer is `0x6B2AF0(info)`: if `+0x70` and
+  `+0x0C != 0`, push `{0, info+0x0C}`, then `+0x70 = 0`. `0x6BC1B0` calls it at its end when
+  `eventKickTiming == 1`; the info update `0x6B35D0` when the animation ends and timing is 0.
+- Every door and chest row (9999xx) has isEventKickSync 0, eventKickTiming 1: **a replay never
+  fires ObjActEventFlag**, only the local start does. The actor only moves / animates that
+  character; the kick does not depend on it.
+- info fields: `+0x0C` = MSB ObjActEntityID (dump vs `objacts_msb.tsv`: 31 infos of m11_01,
+  m11_02, m13_00 all match), `+0x50` = object handle (not an entity id), `+0x78` = ObjActParam id,
+  `+0x80` = its row (`+0x1B` isEventKickSync, `+0x25` eventKickTiming, dump vs csv).
+  `state->vt[4]` (run on `+0x72`) toggles the flag: `SetEventFlag(flag, !flag)`.
+
+So the receiver replays with `0x6BA910(block, index, -1, value)` and then kicks the EMEVD:
+`info+0x70 = 1; 0x6B2AF0(info)`, the same push the opener's own start makes. Calling
+`0x6BA7B0` on the receiver would kick too, but it also toggles the door flag (the friend's
+flag, already applied here, would go off) and sends packet 45 at stage 4.
+
+### Design (`objact.rs`)
+
+- **Sender** (`[DEBUG] objact_sender = hook | poll`, default hook). `hook`: a detour on
+  `0x6BA7B0` (bytes checked at start; on a mismatch a log line and the poll sender). The detour
+  only notes the call (block, index, actor, run state and flag before, caller); the frame task
+  sends it when the actor is our player's handle (`chr+0x08`) and the info started (run state
+  3). `poll`: the 50 ms run-state walk of the first version (fallback; `+0x72` evidence). The
+  walk runs in both modes, the receiver needs its facts. One-loop states only with
+  `sync_objact = 2`; a door's sub infos go out once per 2 s.
+- **Message v2**: bulk kind `0xA7`, 29 bytes: magic `0x4F`, version 2, reason 1, state class,
+  target value, map id, ObjActEntityID, info index, sub index, ObjActParam id, sequence number.
+  A version 1 message (first objact build) is refused with a log line: both players need this
+  build.
+- **Receiver** (game thread, 300 ms after arrival, retried 5 s, at most 32 waiting): the info
+  by ObjActEntityID in the loaded block with that map id; by index / sub only when that id is
+  not in the block (an index whose own id differs is refused). Then `receive_plan`:
+  replay + kick when idle since the load; **kick only** when it already ran here as a replay
+  (`+0x72 = 0`, e.g. the game's type 45 at stage 4) and was not kicked; nothing when doors.rs /
+  we replayed it in the last 3 s, it was replayed or kicked since the load, it ran here as a
+  local start, our own player used it, a one-loop below mode 2, a door toggling closed, an
+  unknown class. The object check (`doors::object_view`) stays: already at that animation =
+  nothing. The kick is skipped when isEventKickSync = 1 (the replay kicked), a kick is pending,
+  the info has no ObjActEntityID, `0x6B2AF0` has other bytes, or the event manager is missing.
+  doors.rs kicks after its own `0x6BA910` too (only with `sync_objact` on).
+- **Journal** (reload persistence): every executed ObjAct of the session, ours and the peers',
+  by (map id, ObjActEntityID), at most 256 (oldest dropped), only one-state / door states that
+  opened (a door closing leaves it; one-loop never: a lift must not move on a reload). Cleared
+  on a new session, never written to disk. Once per second, an info of a journaled ObjAct that
+  has been loaded and watched for 3 s, has not run since its load and whose object is not at
+  that animation is replayed and kicked once per load (`journal:` line). This is the fix for
+  doors that close again after a reload.
+- **Chests** (ObjActParam 999980 / 999985 / 999990, one-state, kick sync 0, timing 1) take the
+  same path: the kick lets 20005510 / 20005511 enable the treasure, so the item node spawns
+  here and share_pickups sees it. A chest the friend already looted: its lot flag came with the
+  pickup, the `0x91FCF0` refusal of the pickups section still applies.
+- Nothing runs in a Remnant memory.
 
 Log lines (prefix `objact:`):
-- `loaded ObjAct blocks: slot S mAA_BB_CC_DD (0x...) (N infos), ...` once per load; a `?` map
-  means the WorldBlockInfo reading is wrong.
-- `ObjAct ran here: map ..., block slot, info index, sub, <class> state, flag F before B now
-  A, info+113/+114 (+114 before the edge), object handle, object at start, our ObjAct
-  animation ...; <why>: sending as #N | not sent: <why>` (every execution with `+114 = 1` or
-  our animation near; all of them with `objact_debug`), then `sent our ObjAct #N ... ok`.
-- `map flags written from 5 s before it until now: [...]` and `flag F = V (within 5 s after
-  our ObjAct)`; with `objact_debug = 1` every `flag F = V` (8-digit ids: all map groups, the
-  doors.rs groups 1/2 and the 611xxxxx door flags seen live included).
-- `1 s after our ObjAct ...: run state, info+113/+114, flag, object anim (reached)`.
-- Receiver: `peer P ran ObjAct #N: map ..., info index, sub, class, target state`, then
-  `peer P's ObjAct #N here: ... run state R (idle ...); replayed with 0x6BA910(...) ok = ...`
-  or `not replayed: <why>` or `no such loaded info here within 5 s`, then the same info
-  `1 s after` / `3 s after` (only if the same block is still loaded).
+- `0x6BA7B0 hooked ...` / `NOT hooked ...` at start; `sender: hook | poll ...; journal: N` once.
+- `we used ObjAct: map ..., ObjActEntityID E, ObjActParam P, <class> state, flag F before B now
+  A, run state R0 -> R1, actor A (our player H), caller sekiro+0x...; <why>: sending as #N
+  (target state T) | not sent: <why>; journaled (n in the journal)`, then `sent our ObjAct #N`.
+  The first 5 calls per load by another actor are logged too (to catch a wrong handle).
+- `peer P ran ObjAct #N: map, ObjActEntityID, index, sub, ObjActParam, class, target; journaled`.
+- `peer P's ObjAct #N here: block slot, info index (found by ObjActEntityID | by index), ...;
+  replayed with 0x6BA910(...) ..., run state now 3; EMEVD kicked: ObjActEventFlag(E) holds ...`
+  or `it ran here already as a replay without its EMEVD kick ...: EMEVD kicked ...` or
+  `not replayed: <why>`; then the info `1 s after` / `3 s after` with `info+0x70/+0x71/+0x72`.
+- `doors.rs's replay (block ..., info index I): EMEVD kicked ... | EMEVD not kicked: <why>`.
+- `journal: our | a peer's ObjAct of this session (...), after its load: replayed ...; EMEVD
+  kicked ...` (only when something was done, everything with `objact_debug`).
+- With `objact_debug = 1`: every execution seen by the walk, every map flag write, raw info
+  dumps, the first bytes of `0x6BC1B0` / `0x6BA7B0` / `0x6BA910` / `0x6B2AF0`.
 
-Open questions:
-- Actor -1 vs the friend's native replica handle: if the object animates but still blocks the
-  way, try the replica (`REPLAY_ACTOR` in objact.rs, marked TODO).
-- Whether the run state really returns to a different value after an execution (the idle
-  check) and whether a finished door keeps its last animation (`reached`): first live log.
-- Keyed doors (a key item check runs before the execution on the opener's side only: the
-  receiver opens it without the key; probably fine for co-op, not checked).
-- Lifts: no object position offset is known, so a player standing on a lift is not checked;
-  one-loop states are off unless both set `sync_objact = 2`. Whether lifts are ObjActs at all
-  is unknown.
-- Chests: whether a chest is an ObjAct whose item node spawns on opening (see the pickups
-  section) is unknown; the log will show their class.
-- Whether `info+114` really marks the local player (vs NPC / script executions) and where the
-  ObjActParam id and the actor sit in the info: read the `objact_debug` info dumps in IDA.
+Verified by RE (dump, not live): entry points and arguments, prologue bytes, the
+ObjActEventFlag mechanism and its writer, the info and param offsets, the flag toggle. Not
+verified live: that the kick from the frame task is seen by the next EMEVD step (ordering
+[ARV]: our push lands outside the `0x811C90` event step, so the next step evaluates it before
+its clear), that `chr+0x08` of our player equals the actor `0x6BA7B0` gets (dump: the player's
+`chr+0x08` is `0x10050000`, a chr-type handle), the journal timing after a reload, chests
+spawning their item node here.
 
-Recommended first live test: both players set `native_session_stage = 4` and
-`objact_debug = 1` (both need this build), stand at a known one-state door in the same area,
-one opens it; the other watches whether it swings open and walks through. Exchange both
-`log.txt` files and compare the `objact:` lines (with stage 4 the receiver should mostly log
-`not replayed: ... executing` / `executed here` / `already at that execution's animation`,
-i.e. type 45 was first; then repeat with `native_session_stage = 3` to see our replay alone).
+Live test protocol (both players on this build, `objact_debug = 1`, `native_session_stage = 3`):
+1. Start: each log has `objact: 0x6BA7B0 hooked` and `sender: hook`.
+2. Same area, a one-state door (m11_01 sliding door 1113713 / ObjActParam 999970, or any
+   9999xx door). A opens it. A's log: `we used ObjAct ... sending as #N`. B's log: `peer ...
+   here: ... found by ObjActEntityID ... replayed ... EMEVD kicked`. B walks through the door
+   (the blocker must be gone), and the door's script flag is set on B (`flag ... = true` lines).
+3. A chest (999980): A opens it, B sees it open; the item node: B's pickup is refused or
+   shared as share_pickups says.
+4. B reloads the area (rest at an idol or quit to menu and back): `journal: ... replayed ...`
+   or nothing because the door loaded open; B can still pass.
+5. Repeat 2 with `native_session_stage = 4`: B should log `it ran here already as a replay
+   without its EMEVD kick ... EMEVD kicked` (type 45 first) and pass.
+6. If nothing is sent: look for `not sent: the actor is not our player` (handle) and retry with
+   `objact_sender = poll`.
+
+Open: keyed doors open on the receiver without the key (flags are shared anyway); lifts and
+levers (one-loop) stay off unless both set `sync_objact = 2` and are not journaled.
 
 ## Fixes to the 1.0.9 base
 

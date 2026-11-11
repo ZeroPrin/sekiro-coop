@@ -438,6 +438,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::keyitems::RECONCILE.store(ini.flag("reward_reconcile", true, warn), Relaxed);
     crate::statelog::ENABLED.store(ini.flag("state_log", true, warn), Relaxed);
     crate::objact::DEBUG.store(ini.flag("objact_debug", false, warn), Relaxed);
+    crate::objact::SENDER.store(ini.choice("objact_sender", &["hook", "poll"], crate::objact::SENDER_HOOK, warn), Relaxed);
     crate::hook::freeze::SKIP_DRIVER_THREADS.store(ini.flag("freeze_skip_driver_threads", true, warn), Relaxed);
     // Log categories switched off (log.rs). Missing key = the default list; an empty value = none.
     log::set_muted(log::parse_categories(ini.get("log_off").map_or(DEFAULT_LOG_OFF, String::as_str)));
@@ -783,6 +784,10 @@ state_log = 1
 ;     write and the raw ObjAct data (objact: lines; long logs). 0 = only our own ObjActs,
 ;     the friend's, and the map flags written around ours.
 objact_debug = 0
+; hook = our own door / gate / chest uses are caught where the game starts them (0x6BA7B0,
+;     the default; checked at start, a different game version falls back to poll); poll =
+;     the older detection that watches the ObjAct list every 50 ms (fallback for tests).
+objact_sender = hook
 ; 1 = code patches leave GPU driver threads running (they never run game code; waiting
 ;     for one froze the game for up to 5 s). 0 = every thread is paused, as before v8.61.
 freeze_skip_driver_threads = 1

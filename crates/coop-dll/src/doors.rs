@@ -506,6 +506,8 @@ fn open_if_closed(s: &mut State, d: &Door, why: &str) -> bool {
     crate::objact::note_replay(d.block, d.index);
     let replay: extern "C" fn(usize, i32, i32, u32) -> u8 = unsafe { std::mem::transmute(game::module_base() + REPLAY_RVA) };
     let ok = replay(d.block, d.index, -1, 1) != 0;
+    // The EMEVD waits for ObjActEventFlag, which a replay never sets (objact.rs header).
+    crate::objact::kick_after_replay(d.block, d.index, "doors.rs");
     s.replays += 1;
     let n = s.replays;
     note_log(s, || {

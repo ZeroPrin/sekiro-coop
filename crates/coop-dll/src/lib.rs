@@ -204,6 +204,7 @@ fn init(hmodule: usize) {
     bossrules::install();
     items::install();
     dialog::install();
+    objact::install();
     quitblock::install();
     optprobe::install();
     optmenu::install();
