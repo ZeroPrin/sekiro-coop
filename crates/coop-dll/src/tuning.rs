@@ -415,6 +415,22 @@ pub static NATIVE_SESSION: AtomicBool = AtomicBool::new(true);
 /// packets (28, 52, 18, 42), 4 = + ObjAct events (45, experimental).
 pub static NATIVE_SESSION_STAGE: AtomicU8 = AtomicU8::new(3);
 
+/// `player_packet_hz` ([ADVANCED], packetrate.rs; experimental): how often our own player
+/// frame (game packet type 1) goes out, 12..=60. 12 = the game's own rate (every 5 frames),
+/// nothing patched. Each machine sets only its own sending; the same value on both is
+/// recommended. Read at start for the patch, live for the rate.
+pub static PLAYER_PACKET_HZ: AtomicU32 = AtomicU32::new(crate::packetrate::DEFAULT_HZ);
+pub fn player_packet_hz() -> u32 {
+    PLAYER_PACKET_HZ.load(Ordering::Relaxed)
+}
+/// `native_pin_delay_ms` ([DEBUG]): how far in the past the native remote's position pin
+/// reads the peer's snapshots. 0 = auto (130 ms while the peer sends at the game's own rate,
+/// matched to its measured packet play-out when it sends faster; native.rs `pin_delay_ms`).
+pub static NATIVE_PIN_DELAY_MS: AtomicU32 = AtomicU32::new(0);
+pub fn native_pin_delay_ms() -> u32 {
+    NATIVE_PIN_DELAY_MS.load(Ordering::Relaxed)
+}
+
 // --- 3-6 players (PLAN-MULTIPLAYER, NOT verified live) -------------------------------------
 
 /// Settings file `max_players` ([ADVANCED]): players in the host's world, the host
