@@ -30,6 +30,20 @@ Every entry: what, where, source, and how it was verified on this machine.
 - **Cost of following**: about 2–3 FPS (57–58 → 55–58).
 - A full position-copy scan (F6, ~68k `VirtualQuery` calls) stalls the game for about 10 s; it is fine for one-off RE only.
 
+## Action unlocks (2026-11-11, dump `sekiro-1.06-ingame-2026-11-11.dmp` + Ghidra)
+
+| What | Value | Verified by |
+|---|---|---|
+| ActionUnlockParam getter | `0x10B4F10(out*, id)`: `0x10CE0E0(repo, 0x74)` + binary search (only caller `0x10B4ED0`) | Decompile; repo index 0x74 = `ACTION_UNLOCK_PARAM_ST` in the dump |
+| Unlock counters | EquipInventoryData `+0x90`, `i32[30]` (one per action00..29); EquipInventoryData = EquipGameData `+0x168` (`0x79EAC0`/`0x79EAD0`) = PlayerGameData `+0x3E0` | Constructor `0x7A6FF0` zeroes 0x78 bytes at +0x90; dump: counters == sum over the inventory of qty x unlock set with the VANILLA goods rows (exact match, 30 values) |
+| Add/remove | `0x7A9A80(inv, u32* itemId, int delta)`: goods `row+0x28`, weapons (incl. skills 2000xx) `EquipParamWeapon+0x24C` -> ActionUnlockParam, `counter[i] += delta` per set action | Decompile; callers `0x7A7330`, `0x7A82D0`, `0x7A8F20`, `0x7A93F0`, `0x7A864C` |
+| Rebuild | `0x7A8200(inv)`: zero +0x90..+0x108, then `0x7A9A80` for entries `0..=[inv+0x88]`. Prologue `40 55 56 41 56 48 83 EC 20 48 8D 81 08 01 00 00` | Disasm; callers: save deserializer `0x7A8140` [ARV: reads +0x88 and the entries from a stream, called through a vtable], debug param reload `0x10B2AB0` (`testdata:/interrootparam/`), `0x7A9BF0`, `0x79EAE0` |
+| Check | `0x7A7FE0(inv, u8 action)`: `counter[a] > 0` or bit `a` of `inv+0x118` | Disasm; dump `+0x118` = 0 |
+| HKS `env(3033, n)` | case 0xBD9 in `0xB36410`: `0x7A7FE0(PGD+0x278+0x168, arg2)` | Decompile |
+
+The counters use the params of the moment an item is added or removed. Changing `+0x28` later
+does not change them until `0x7A8200` runs.
+
 ## Not yet known / next
 
 - `ForceAnimation` RVA `0x6D5A90`, `f(int entityId, int animId)` (SekiroTool snake loop: `ecx=1100850, edx=20000`). Not yet called by us.

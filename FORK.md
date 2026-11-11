@@ -291,6 +291,47 @@ Notes:
 - The shop counter width (`eventFlag + 1 ..= eventFlag + floor(log2 sellQuantity)`) is
   inferred, not read in the game's shop code: it is the only simple width that reproduces
   1.0.11's "75 shop counter bits" with the same 1084 other per-player flags.
+## Co-op items unlocked diving and every skill (`[DEBUG] fix_debug_item_unlocks`, default 1)
+
+The co-op items sit on EquipParamGoods rows 999997 (Kindred Bell), 999998 (Kindred Charm) and
+999999 (Severed Thread); 1.0.11 also uses 999996 (Rival's Charm). In vanilla these rows are
+FromSoftware debug items: their `actionUnlockParamId` (+0x28) is their own id, and
+ActionUnlockParam 999999 unlocks every action, 999998 all but action03 (Mortal Blade), 999997 all
+but 03 and 06, 999996 all but 20-23. The owner of the items could dive without Mibu Breathing
+(HKS `env(3033, 0)`), use the Mortal Blade, ninjutsu and the skill actions without having them.
+
+How the game handles it (RE 2026-11-11, dump + Ghidra, details in `docs/RE-NOTES.md`):
+EquipInventoryData (EquipGameData+0x168 = PlayerGameData+0x3E0) keeps 30 counters at +0x90, one
+per action. `0x7A9A80` adds the item's quantity to every action of its unlock set when it is
+added or removed (goods: +0x28, weapons/skills: EquipParamWeapon+0x24C), with the params of that
+moment. `0x7A8200` zeroes the counters and adds the whole inventory again; the save loader
+(`0x7A8140`, [ARV]) and the debug param reload (`0x10B2AB0`) call it. `0x7A7FE0` = "counter > 0 or bit in
++0x118" answers HKS `env(3033, n)` (case 0xBD9 of `0xB36410`). The mod rewrote our rows only
+seconds after the save had loaded, so the counters already held the debug sets and kept them.
+In the 2026-11-11 dump the counters matched "inventory x vanilla rows" exactly (action00 = 4: one
+from each of 999996-999999, no Mibu Breathing owned).
+
+Fix (`items.rs`): the ids stay (saves, the 1.0.11 Rival's Charm and upstream builds use them).
+- +0x28 of rows 999996-999999 (and of the rows this run chose) is set to 0 as soon as
+  EquipParamGoods is loaded, at the title before any save load; checked again every second.
+  Log: `items: debug unlock rows, vanilla actionUnlockParamId: 999996=999996, ... -> 0 (zeroed,
+  before the save load)`.
+- After every save load (and whenever a row had to be zeroed again in the world) the game's own
+  `0x7A8200` rebuilds the counters once (prologue bytes checked first). Owned items such as Mibu
+  Breathing (2420), Mortal Blade (2400) or ninjutsu (2100/2110/2120 -> 2301) count as before;
+  only the debug sets drop out. Log: `items: action unlocks rebuilt (debug unlocks removed):
+  before [...] after [...]; locked again: [a00 dive (Mibu Breathing), a03 Mortal Blade, ...]`,
+  or `items: action unlocks rebuilt, unchanged [...]` once the fix is in place.
+- The row writer sets `actionUnlockParamId = 0` explicitly; `items: chosen rows, vanilla
+  actionUnlockParamId: ...` lists the vanilla values.
+- `fix_debug_item_unlocks = 0` turns the zeroing and the rebuild off (the old behaviour).
+
+Existing saves need nothing: the save holds items, not counters. A player who learned to dive
+only through this bug cannot dive any more after the fix until they get Mibu Breathing.
+
+Note for upstream (Tihvert): 1.0.11 has the same bug on 999996-999999. The fix is the two parts
+above: zero `actionUnlockParamId` of those rows before the save loads, then call
+`0x7A8200(PlayerGameData + 0x278 + 0x168)` once in the world.
 
 ## Working on this fork
 

@@ -21,6 +21,18 @@
 //!   `0xA64520`) mark that the game went back to the title / loads a save: co-op ends
 //!   (`net::on_title`) and the items must be used again after loading.
 //!
+//! - Debug action unlocks (2026-11-11): the rows we use (999997-999999, and 999996 for
+//!   1.0.11's Rival's Charm) are FromSoftware's debug items in vanilla, whose
+//!   `actionUnlockParamId` (+0x28) points at ActionUnlockParam "all actions unlocked" sets.
+//!   The game keeps 30 counters at EquipInventoryData+0x90, one per action, raised by the
+//!   unlock set of every owned item when it is added (`0x7A9A80`) and rebuilt from the whole
+//!   inventory by `0x7A8200` (save load, debug param reload); HKS `env(3033, n)` reads them
+//!   through `0x7A7FE0`. Our rows were rewritten only after the save was loaded, so the owner
+//!   of the items could dive without Mibu Breathing and use every skill. Now +0x28 of these
+//!   rows is zeroed as soon as the params exist (at the title, before any save load), and
+//!   after every load the game's own `0x7A8200` rebuilds the counters once
+//!   (`fix_debug_item_unlocks`, [DEBUG]).
+//!
 //! Detours touch atomics only; everything else runs on the frame task (`on_frame`).
 
 use std::sync::Mutex;
@@ -97,6 +109,31 @@ const TEMPLE_NAME: &str = "Dilapidated Temple";
 /// temple rest gave nothing.
 const TEMPLE_ROW: i32 = 100;
 const TEMPLE_ENTITY_GUESS: i32 = 1101950;
+/// Goods rows whose vanilla `actionUnlockParamId` is a debug "all actions unlocked" set and
+/// that a build of the mod uses as a co-op item: 999996 (Rival's Charm, 1.0.11), 999997 to
+/// 999999 (Kindred Bell / Charm / Severed Thread). Old saves hold them, so the ids stay.
+const DEBUG_UNLOCK_ROWS: [u32; 4] = [999_996, 999_997, 999_998, 999_999];
+/// `void RecomputeActionUnlocks(EquipInventoryData*)`: zeroes the 30 counters at +0x90 and
+/// adds every inventory entry again through `0x7A9A80` with the current params. The save
+/// deserializer (`0x7A8140`) and the debug param reload (`0x10B2AB0`) call it.
+const RECOMPUTE_UNLOCKS_RVA: usize = 0x7A8200;
+// push rbp; push rsi; push r14; sub rsp, 20h; lea rax, [rcx+108h]
+const RECOMPUTE_UNLOCKS_PROLOGUE: [u8; 16] =
+    [0x40, 0x55, 0x56, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x81, 0x08, 0x01, 0x00, 0x00];
+/// EquipGameData -> EquipInventoryData (`0x79EAC0` returns `this + 0x168`).
+const EGD_INVENTORY: usize = 0x168;
+/// EquipInventoryData: `i32[30]` unlock counters, one per ActionUnlockParam action; an action
+/// is unlocked while its counter is > 0 (or its bit in +0x118 is set, `0x7A7FE0`).
+const INV_UNLOCK_COUNTS: usize = 0x90;
+const UNLOCK_ACTIONS: usize = 30;
+/// After a save load: in the world this long before the counters are rebuilt.
+const RECOMPUTE_AFTER: Duration = Duration::from_secs(1);
+/// `SoloParamRepository*`; holder `i` at +0x70 + i * 0x48 (`u32` count, then res caps),
+/// EquipParamGoods is holder 3 (`0x10BF630` -> `0x10CE0E0(repo, 3)`).
+const SOLO_PARAM_REPO: usize = 0x3D978B0;
+const REPO_HOLDERS: usize = 0x70;
+const REPO_HOLDER_SIZE: usize = 0x48;
+const GOODS_HOLDER: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -209,6 +246,9 @@ pub fn title_count() -> u32 {
 }
 /// `connection_items` (settings, [DEBUG]): 0 = no items (`auto_connect = 1` instead).
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
+/// `fix_debug_item_unlocks` (settings, [DEBUG]): 1 = zero the debug `actionUnlockParamId` of
+/// our rows before any save load and rebuild the unlock counters after each load.
+pub static FIX_UNLOCKS: AtomicBool = AtomicBool::new(true);
 
 const STAGE_UNKNOWN: u8 = 0;
 const STAGE_TUTORIAL: u8 = 1;
@@ -479,6 +519,15 @@ struct State {
     hold: Option<bool>,
     /// A use waiting for its yes/no answer (dialog.rs ticket), `confirm_items = 1`.
     confirm: Option<(Kind, u64)>,
+    /// `actionUnlockParamId` of the debug unlock rows as first seen, by row id.
+    unlock_vanilla: Vec<(u32, i32)>,
+    /// The debug unlock rows were checked at least once (the params exist).
+    unlock_rows_seen: bool,
+    unlock_check: Option<Instant>,
+    /// Rebuild the unlock counters once in the world (a save was loaded, or a row changed).
+    recompute_pending: bool,
+    /// `0x7A8200` did not hold its expected bytes (logged once, never called).
+    recompute_refused: bool,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -518,7 +567,8 @@ fn referenced_ids(repo: &SoloParamRepository) -> Option<std::collections::HashSe
 }
 
 /// Finds our three rows, the template and the icons. Logs the choice; None = refused.
-fn pick_rows() -> Option<Rows> {
+/// `vanilla_unlocks`: the `actionUnlockParamId` seen before we zeroed it (for the log).
+fn pick_rows(vanilla_unlocks: &[(u32, i32)]) -> Option<Rows> {
     if std::mem::size_of::<EQUIP_PARAM_GOODS_ST>() != ROW_SIZE {
         log::line("items: ERROR EquipParamGoods row size is not 0xA0, items off");
         return None;
@@ -588,6 +638,19 @@ fn pick_rows() -> Option<Rows> {
     // The three highest ids, deterministic for every player with the same game data.
     candidates.sort_unstable();
     let chosen = [candidates[candidates.len() - 3], candidates[candidates.len() - 2], candidates[candidates.len() - 1]];
+    // The ids stay (saves and upstream builds hold them); their debug unlock sets are
+    // zeroed instead (`State::neutralize_unlocks`).
+    let unlocks: Vec<String> = chosen
+        .iter()
+        .map(|&id| {
+            let now = unsafe { file.get_row_by_id::<EQUIP_PARAM_GOODS_ST>(id) }.map_or(-1, |r| r.action_unlock_param_id());
+            match vanilla_unlocks.iter().find(|(v, _)| *v == id) {
+                Some((_, v)) if *v != now => format!("{id}={v} (now {now})"),
+                _ => format!("{id}={now}"),
+            }
+        })
+        .collect();
+    log::line(&format!("items: chosen rows, vanilla actionUnlockParamId: {}", unlocks.join(", ")));
     let mut rows = Vec::new();
     for (i, kind) in KINDS.into_iter().enumerate() {
         let id = chosen[i];
@@ -595,6 +658,8 @@ fn pick_rows() -> Option<Rows> {
         r.set_ref_id_default(-1);
         r.set_ref_id_1(-1);
         r.set_ref_category(0);
+        // Never a debug "all actions unlocked" set (the vanilla value of 999997-999999).
+        r.set_action_unlock_param_id(0);
         let icon = ICON_OVERRIDE[i].unwrap_or_else(|| icons[i].map_or(template.icon_id(), |(.., icon)| icon));
         r.set_icon_id(icon);
         r.set_sort_id(template.sort_id() + 1 + i as i32);
@@ -637,7 +702,7 @@ fn pick_rows() -> Option<Rows> {
         r.set_use_limit_sp_effect_type3(0);
         r.set_use_limit_sp_effect_type4(0);
         log::line(&format!(
-            "items: row id={id} ({}) template={template_id} icon={icon}{} consume=0 drop=0 refcat=0",
+            "items: row id={id} ({}) template={template_id} icon={icon}{} consume=0 drop=0 refcat=0 unlock=0",
             name_of(kind),
             if ICON_OVERRIDE[i].is_some() {
                 " (custom icon id)".to_owned()
@@ -707,7 +772,144 @@ fn find_temple() -> Option<Temple> {
     found
 }
 
+/// The goods rows whose `actionUnlockParamId` must be 0: the debug rows any build uses and
+/// the rows this run chose (0 = not chosen yet), sorted, without duplicates.
+fn unlock_rows(chosen: [u32; 3]) -> Vec<u32> {
+    let mut v: Vec<u32> = DEBUG_UNLOCK_ROWS.iter().copied().chain(chosen.into_iter().filter(|&id| id != 0)).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Short names of the ActionUnlockParam actions seen in vanilla goods (the rest by index).
+fn action_name(i: usize) -> String {
+    match i {
+        0 => "a00 dive (Mibu Breathing)".into(),
+        1 => "a01 night eyes".into(),
+        2 => "a02 resurrection".into(),
+        3 => "a03 Mortal Blade".into(),
+        4 => "a04 prosthetic".into(),
+        5 => "a05 combat art".into(),
+        6 => "a06 ninjutsu / emblem arts".into(),
+        _ => format!("a{i:02}"),
+    }
+}
+
+/// Actions unlocked before and not after (`gone`), and the other way round (`gained`).
+fn unlock_diff(before: &[i32; UNLOCK_ACTIONS], after: &[i32; UNLOCK_ACTIONS]) -> (Vec<usize>, Vec<usize>) {
+    let on = |c: i32| c > 0;
+    let gone = (0..UNLOCK_ACTIONS).filter(|&i| on(before[i]) && !on(after[i])).collect();
+    let gained = (0..UNLOCK_ACTIONS).filter(|&i| !on(before[i]) && on(after[i])).collect();
+    (gone, gained)
+}
+
+/// EquipParamGoods is loaded: the same pointer chain `0x10BF630` follows (repository,
+/// holder 3, ParamResCap +0x70, FD4ParamResCap +0x70 = file with rows), read fault-safe.
+/// The frame task starts at boot, possibly while the params still load.
+fn goods_params_ready() -> bool {
+    let Some(repo) = read_ptr(module_base() + SOLO_PARAM_REPO) else { return false };
+    let holder = repo + REPO_HOLDERS + GOODS_HOLDER * REPO_HOLDER_SIZE;
+    read::<u32>(holder).is_some_and(|n| n > 0)
+        && read_ptr(holder + 8)
+            .and_then(|cap| read_ptr(cap + 0x70))
+            .and_then(|res| read_ptr(res + 0x70))
+            .and_then(|file| read::<u16>(file + 10))
+            .is_some_and(|rows| rows > 0)
+}
+
+fn inventory_data() -> Option<usize> {
+    equip_game_data().map(|egd| egd + EGD_INVENTORY)
+}
+
+fn unlock_counts(inv: usize) -> Option<[i32; UNLOCK_ACTIONS]> {
+    let mut b = [0u8; UNLOCK_ACTIONS * 4];
+    if !game::read_bytes(inv + INV_UNLOCK_COUNTS, &mut b) {
+        return None;
+    }
+    let mut out = [0i32; UNLOCK_ACTIONS];
+    for (o, c) in out.iter_mut().zip(b.chunks_exact(4)) {
+        *o = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+    }
+    Some(out)
+}
+
 impl State {
+    /// Zeroes `actionUnlockParamId` of the debug unlock rows (`unlock_rows`): every frame
+    /// until the params exist (at the title, before any save is loaded), then once a second.
+    /// A row changed while in the world asks for a rebuild of the counters.
+    fn neutralize_unlocks(&mut self, now: Instant) {
+        if self.unlock_rows_seen && self.unlock_check.is_some_and(|t| now.duration_since(t) < CHECK_EVERY) {
+            return;
+        }
+        if !goods_params_ready() {
+            return;
+        }
+        let Ok(repo) = (unsafe { SoloParamRepository::instance_mut() }) else { return };
+        let Some(file) = goods_file(repo) else { return };
+        self.unlock_check = Some(now);
+        let ids = unlock_rows([0, 1, 2].map(|i| IDS[i].load(Ordering::Acquire)));
+        let mut changed: Vec<(u32, i32)> = Vec::new();
+        for id in ids {
+            let Some(row) = (unsafe { file.get_row_by_id_mut::<EQUIP_PARAM_GOODS_ST>(id) }) else { continue };
+            let v = row.action_unlock_param_id();
+            if !self.unlock_vanilla.iter().any(|(r, _)| *r == id) {
+                self.unlock_vanilla.push((id, v));
+            }
+            if v != 0 {
+                row.set_action_unlock_param_id(0);
+                changed.push((id, v));
+            }
+        }
+        let in_world = game::player().is_some();
+        if !self.unlock_rows_seen {
+            self.unlock_rows_seen = true;
+            let seen: Vec<String> = self.unlock_vanilla.iter().map(|(id, v)| format!("{id}={v}")).collect();
+            log::line(&format!(
+                "items: debug unlock rows, vanilla actionUnlockParamId: {} -> 0 ({}, {})",
+                seen.join(", "),
+                if changed.is_empty() { "already 0" } else { "zeroed" },
+                if in_world { "in the world: counters rebuilt next" } else { "before the save load" }
+            ));
+        } else if !changed.is_empty() {
+            log::line(&format!("items: actionUnlockParamId set again to 0: {changed:?}"));
+        }
+        if !changed.is_empty() && in_world {
+            self.recompute_pending = true;
+        }
+    }
+
+    /// The game's own rebuild of the unlock counters (`0x7A8200`, as at a save load) with the
+    /// zeroed rows: every legitimately owned item (Mibu Breathing 2420, Mortal Blade 2400,
+    /// ninjutsu, skills) counts again, the debug sets of our items do not. Logs what changed.
+    fn recompute_unlocks(&mut self) {
+        if self.recompute_refused {
+            return;
+        }
+        let Some(inv) = inventory_data() else { return };
+        let Some(before) = unlock_counts(inv) else { return };
+        let site = module_base() + RECOMPUTE_UNLOCKS_RVA;
+        let mut found = [0u8; RECOMPUTE_UNLOCKS_PROLOGUE.len()];
+        if !game::read_bytes(site, &mut found) || found != RECOMPUTE_UNLOCKS_PROLOGUE {
+            self.recompute_refused = true;
+            log::line(&format!("items: ERROR unlock rebuild 0x7A8200 has unexpected bytes {found:02x?}, not called"));
+            return;
+        }
+        let rebuild: extern "C" fn(usize) = unsafe { std::mem::transmute(site) };
+        rebuild(inv);
+        let Some(after) = unlock_counts(inv) else { return };
+        if before == after {
+            log::line(&format!("items: action unlocks rebuilt, unchanged {after:?}"));
+            return;
+        }
+        let (gone, gained) = unlock_diff(&before, &after);
+        let names = |v: &[usize]| v.iter().map(|&i| action_name(i)).collect::<Vec<_>>().join(", ");
+        log::line(&format!(
+            "items: action unlocks rebuilt (debug unlocks removed): before {before:?} after {after:?}; locked again: [{}]; newly unlocked: [{}]",
+            names(&gone),
+            names(&gained)
+        ));
+    }
+
     /// The tutorial is over: the temple idol's unlock flag is on. If the idol row was
     /// not found at all, every rest counts (logged once by `find_temple`).
     fn temple_unlocked(&self) -> bool {
@@ -883,7 +1085,14 @@ impl State {
             self.temple_lit = None;
             // A question open across the title is forgotten (its late answer is dropped).
             self.confirm = None;
+            // A save is loading: its inventory rebuilt the counters with the params of that
+            // moment; check them once in the world.
+            self.recompute_pending = true;
             net::on_title();
+        }
+        let fix_unlocks = FIX_UNLOCKS.load(Ordering::Relaxed);
+        if fix_unlocks {
+            self.neutralize_unlocks(now);
         }
         let Some(_) = player else {
             self.in_world_since = None;
@@ -899,11 +1108,15 @@ impl State {
             self.hold = None;
             net::release_title_hold();
         }
+        if fix_unlocks && self.recompute_pending && in_world >= RECOMPUTE_AFTER {
+            self.recompute_pending = false;
+            self.recompute_unlocks();
+        }
         if !ENABLED.load(Ordering::Relaxed) {
             return;
         }
         if self.rows.is_none() && in_world >= Duration::from_secs(1) {
-            self.rows = Some(pick_rows());
+            self.rows = Some(pick_rows(&self.unlock_vanilla));
         }
         if self.temple.is_none() && in_world >= Duration::from_secs(1) {
             self.temple = Some(find_temple());
@@ -980,7 +1193,13 @@ pub fn on_frame() {
     // The game's own message box (dialog.rs): open / poll ours before the items read answers.
     crate::dialog::tick();
     let Ok(mut guard) = STATE.lock() else { return };
-    let state = guard.get_or_insert_with(|| State { last_rest: -1, title_seen: TITLE_COUNT.load(Ordering::Acquire), ..Default::default() });
+    let state = guard.get_or_insert_with(|| State {
+        last_rest: -1,
+        title_seen: TITLE_COUNT.load(Ordering::Acquire),
+        // The first save load of the run.
+        recompute_pending: true,
+        ..Default::default()
+    });
     state.tick();
 }
 
@@ -1008,6 +1227,35 @@ mod full_tests {
         assert_eq!(template_rank(3020, "Pellet"), Some(0));
         assert_eq!(template_rank(61, "\u{4e38}\u{836f}"), None, "other rows only by English name");
         assert_eq!(template_rank(7, "Ako's Sugar"), Some(2));
+    }
+
+    #[test]
+    fn unlock_rows_cover_every_debug_row_and_the_chosen_ones() {
+        assert_eq!(unlock_rows([0, 0, 0]), vec![999_996, 999_997, 999_998, 999_999], "before the rows are chosen");
+        assert_eq!(unlock_rows([999_997, 999_998, 999_999]), vec![999_996, 999_997, 999_998, 999_999], "the usual choice: 999996 (1.0.11) too");
+        assert_eq!(unlock_rows([5000, 999_998, 0]), vec![5000, 999_996, 999_997, 999_998, 999_999], "other game data: its rows too");
+    }
+
+    #[test]
+    fn unlock_diff_names_what_was_locked_again() {
+        // The 2026-11-11 dump: counters with the debug sets, and the game's rebuild without.
+        let before = [4, 5, 5, 2, 5, 5, 10, 0, 0, 0, 0, 5, 0, 5, 5, 5, 5, 4, 4, 4, 4, 3, 4, 3, 4, 5, 5, 0, 0, 0];
+        let after = [0, 1, 1, 0, 1, 1, 7, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0];
+        let (gone, gained) = unlock_diff(&before, &after);
+        assert_eq!(gone, vec![0, 3, 17, 18, 19, 21, 23, 24], "dive and Mortal Blade among them");
+        assert!(gained.is_empty());
+        assert_eq!(action_name(0), "a00 dive (Mibu Breathing)");
+        assert_eq!(action_name(17), "a17");
+        // Counters that only drop but stay above 0 lock nothing (a legit item keeps its action).
+        let mut legit = before;
+        legit[6] = 1;
+        assert_eq!(unlock_diff(&before, &legit), (vec![], vec![]));
+    }
+
+    #[test]
+    fn inventory_data_offset_matches_the_vendor_layout() {
+        assert_eq!(std::mem::offset_of!(sekiro::sprj::EquipGameData, equip_inventory_data), EGD_INVENTORY);
+        assert_eq!(std::mem::size_of::<sekiro::sprj::EquipInventoryData>(), 0x120, "0x7A6FF0 constructs 0x120 bytes");
     }
 
     #[test]
