@@ -23,7 +23,7 @@
 //!   asked for in detail (`MSG_DETAIL_REQ` / `MSG_DETAIL`) and the exact flag ids reported.
 //!   A difference is reported only after it persisted for 45 s (a grant or flag still on its
 //!   way is not a bug), each finding once per game run.
-//! - **Boss / miniboss HP** (`MSG_HP`, 2 Hz, only while a boss is within 60 m of us, the friend
+//! - **Boss / miniboss / elite HP** (elite = max posture >= 1000; `MSG_HP`, 2 Hz, only while a boss is within 60 m of us, the friend
 //!   is in our block and has the auditor, and the bulk queue is idle): HP / posture / lives of
 //!   each such boss. SUSPECT when the HP ratios differ by more than 10 % for 3 s, the lives
 //!   for 3 s, the posture ratios by more than 30 % for 5 s, or when a boss shows up (6 s after a
@@ -106,6 +106,13 @@ const SCAN_EVERY_MS: u64 = 500;
 const HP_EVERY_MS: u64 = 500;
 const HP_FRESH_MS: u64 = 1_500;
 const HP_NEAR_M: f32 = 60.0;
+/// An enemy with this much max posture or more is compared like a boss (test6).
+const ELITE_MAX_POSTURE: i32 = 1000;
+
+/// Pure: a one-life enemy the HP / posture comparison covers.
+fn elite_posture(max_posture: i32) -> bool {
+    max_posture >= ELITE_MAX_POSTURE
+}
 const HP_LIMIT_MS: u64 = 3_000;
 const POSTURE_LIMIT_MS: u64 = 5_000;
 const HP_RATIO: f32 = 0.10;
@@ -1803,7 +1810,12 @@ impl State {
             if self.boss_kind.len() > 2048 {
                 self.boss_kind.clear();
             }
-            let multi = *self.boss_kind.entry(chr.0).or_insert_with(|| livesync::multi_life(livesync::lives0_of(chr)));
+            // test6: elites too (one life, boss-like posture: 1440 / 1815 in the 2026-11-12 logs,
+            // ordinary enemies at most ~525), so posture desyncs on them show up.
+            let multi = *self.boss_kind.entry(chr.0).or_insert_with(|| {
+                livesync::multi_life(livesync::lives0_of(chr))
+                    || livesync::read_data(chr).is_some_and(|(_, _, _, max_posture, _)| elite_posture(max_posture))
+            });
             let tracked = self.bosses.get(&id).is_some_and(|b| b.chr == chr.0);
             if !multi && gauge != Some(id) && !tracked {
                 continue;
@@ -2239,6 +2251,16 @@ pub fn tick(c: Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 2026-11-12 logs: elites 1440 / 1815, the biggest ordinary enemy 525.
+    #[test]
+    fn elites_by_max_posture() {
+        assert!(elite_posture(1815));
+        assert!(elite_posture(1440));
+        assert!(elite_posture(1000));
+        assert!(!elite_posture(525));
+        assert!(!elite_posture(0));
+    }
 
     struct Fake;
 
