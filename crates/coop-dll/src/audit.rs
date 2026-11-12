@@ -113,6 +113,24 @@ const ELITE_MAX_POSTURE: i32 = 1000;
 fn elite_posture(max_posture: i32) -> bool {
     max_posture >= ELITE_MAX_POSTURE
 }
+
+/// What `boss_scan` compares: not at all, an elite (one life, boss-like posture), a boss or
+/// miniboss (more than one life; the gauge's enemy counts as a boss too).
+const RANK_NONE: u8 = 0;
+const RANK_ELITE: u8 = 1;
+const RANK_BOSS: u8 = 2;
+
+/// Pure (review m5): the log / finding label.
+fn kind_label(is_boss: bool) -> &'static str {
+    if is_boss { "boss / miniboss" } else { "elite" }
+}
+
+/// Pure (review m5): the HP samples sent to the partner, bosses before elites (stable within
+/// each), at most `max`: an elite crowd never pushes a boss out of the message.
+fn bosses_first(mut near: Vec<(i32, HpSample, bool)>, max: usize) -> Vec<(i32, HpSample)> {
+    near.sort_by_key(|&(_, _, boss)| !boss);
+    near.into_iter().take(max).map(|(id, s, _)| (id, s)).collect()
+}
 const HP_LIMIT_MS: u64 = 3_000;
 const POSTURE_LIMIT_MS: u64 = 5_000;
 const HP_RATIO: f32 = 0.10;
@@ -1399,7 +1417,8 @@ struct State {
     checks: Vec<Check>,
     inbox: Vec<(PeerId, Vec<u8>)>,
     // Bosses.
-    boss_kind: HashMap<usize, bool>,
+    /// chr -> `RANK_*` (read once per chr).
+    boss_kind: HashMap<usize, u8>,
     bosses: HashMap<i32, Boss>,
     damaged: HashSet<i32>,
     rest_seen: Option<Instant>,
@@ -1801,7 +1820,7 @@ impl State {
         }
         let gauge = game::boss_state().map(|b| b.entity);
         let me = c.player.position();
-        let mut near: Vec<(i32, HpSample)> = Vec::new();
+        let mut near: Vec<(i32, HpSample, bool)> = Vec::new();
         let cycle = self.rest_gen;
         let mut seen: HashSet<i32> = HashSet::new();
         let mut found: Vec<(PeerId, Finding)> = Vec::new();
@@ -1812,14 +1831,22 @@ impl State {
             }
             // test6: elites too (one life, boss-like posture: 1440 / 1815 in the 2026-11-12 logs,
             // ordinary enemies at most ~525), so posture desyncs on them show up.
-            let multi = *self.boss_kind.entry(chr.0).or_insert_with(|| {
-                livesync::multi_life(livesync::lives0_of(chr))
-                    || livesync::read_data(chr).is_some_and(|(_, _, _, max_posture, _)| elite_posture(max_posture))
+            let rank = *self.boss_kind.entry(chr.0).or_insert_with(|| {
+                if livesync::multi_life(livesync::lives0_of(chr)) {
+                    RANK_BOSS
+                } else if livesync::read_data(chr).is_some_and(|(_, _, _, max_posture, _)| elite_posture(max_posture)) {
+                    RANK_ELITE
+                } else {
+                    RANK_NONE
+                }
             });
             let tracked = self.bosses.get(&id).is_some_and(|b| b.chr == chr.0);
-            if !multi && gauge != Some(id) && !tracked {
+            if rank == RANK_NONE && gauge != Some(id) && !tracked {
                 continue;
             }
+            // Review m5: a boss / miniboss has lives or the gauge; an elite only its posture.
+            let is_boss = rank == RANK_BOSS || gauge == Some(id);
+            let what = kind_label(is_boss);
             let Some((data, hp, max_hp, max_posture, lives)) = livesync::read_data(chr) else { continue };
             let posture = read::<i32>(data + DATA_POSTURE).unwrap_or(0);
             let s = HpSample { hp, max_hp, posture, max_posture, lives };
@@ -1838,8 +1865,13 @@ impl State {
                     self.damaged.insert(id);
                 }
                 if p.alive && !alive {
-                    log::line(&format!("audit: boss / miniboss {id} died here, digest in {} s", BOSS_AFTER_MS / 1000));
-                    self.schedule_all(now + BOSS_AFTER_MS, REASON_BOSS);
+                    // Review m5: only a boss / miniboss death is worth a full digest.
+                    if is_boss {
+                        log::line(&format!("audit: {what} {id} died here, digest in {} s", BOSS_AFTER_MS / 1000));
+                        self.schedule_all(now + BOSS_AFTER_MS, REASON_BOSS);
+                    } else {
+                        log::line(&format!("audit: {what} {id} died here (no digest for an elite)"));
+                    }
                 }
             }
             b.alive = alive;
@@ -1847,7 +1879,7 @@ impl State {
             b.sample = s;
             if alive && !b.checked && in_world >= DAMAGE_AFTER_LOAD {
                 b.checked = true;
-                self.first_sight(id, s, "loaded", cycle);
+                self.first_sight(id, s, what, "loaded", cycle);
             }
             // Our copy against each partner's (the host: every client in its samples).
             for l in self.links.iter_mut() {
@@ -1858,7 +1890,7 @@ impl State {
                 let timer = l.hp_timers.entry(id).or_default();
                 for m in timer.step(s, r, now) {
                     let secs = timer.since(m).map_or(0, |t| now.saturating_sub(t)) as f32 / 1000.0;
-                    let (sev, what) = match m {
+                    let (sev, diff) = match m {
                         Mismatch::Hp => (3, "HP differs"),
                         Mismatch::Lives => (3, "lives differ"),
                         Mismatch::Posture => (1, "posture differs"),
@@ -1869,7 +1901,7 @@ impl State {
                             format!("hp:{id}:{cycle}:{m:?}"),
                             Class::Suspect(sev),
                             format!(
-                                "boss / miniboss {id}: {what} between the machines for {secs:.1} s: here HP {}/{} ({:.0} %) posture {}/{} lives {}, the friend HP {}/{} ({:.0} %) posture {}/{} lives {}",
+                                "{what} {id}: {diff} between the machines for {secs:.1} s: here HP {}/{} ({:.0} %) posture {}/{} lives {}, the friend HP {}/{} ({:.0} %) posture {}/{} lives {}",
                                 s.hp,
                                 s.max_hp,
                                 s.hp_ratio() * 100.0,
@@ -1892,7 +1924,7 @@ impl State {
             }
             let close = me.zip(chr.position()).is_some_and(|(a, p)| game::distance(a, p) <= HP_NEAR_M);
             if close && (alive || prev.is_some_and(|p| p.alive)) {
-                near.push((id, s));
+                near.push((id, s, is_boss));
             }
             self.bosses.insert(id, b);
         }
@@ -1906,7 +1938,7 @@ impl State {
             && let Some(b) = self.bosses.get(&e).copied()
             && b.alive
         {
-            self.first_sight(e, b.sample, "at the start of its boss fight (gauge)", cycle);
+            self.first_sight(e, b.sample, kind_label(true), "at the start of its boss fight (gauge)", cycle);
         }
         self.gauge_prev = gauge;
         // Our samples for each partner in our block that runs the auditor (its own rate and
@@ -1914,7 +1946,7 @@ impl State {
         if near.is_empty() {
             return;
         }
-        near.truncate(MAX_HP_ENTRIES);
+        let near = bosses_first(near, MAX_HP_ENTRIES);
         let mut body: Option<Vec<u8>> = None;
         for l in self.links.iter_mut() {
             let here = c.peers.by_id(l.id).is_some_and(|p| p.snapshot.is_some_and(|s| !s.hidden) && p.in_block(c.here));
@@ -1926,7 +1958,7 @@ impl State {
         }
     }
 
-    fn first_sight(&mut self, id: i32, s: HpSample, when: &str, cycle: u32) {
+    fn first_sight(&mut self, id: i32, s: HpSample, what: &str, when: &str, cycle: u32) {
         if !starts_damaged(s) || self.damaged.contains(&id) {
             return;
         }
@@ -1945,7 +1977,7 @@ impl State {
             format!("fullhp:{id}:{cycle}"),
             Class::Suspect(sev),
             format!(
-                "boss / miniboss {id} {when} with HP {}/{} ({:.0} %) lives {}, no damage seen this rest cycle, {why}",
+                "{what} {id} {when} with HP {}/{} ({:.0} %) lives {}, no damage seen this rest cycle, {why}",
                 s.hp,
                 s.max_hp,
                 s.hp_ratio() * 100.0,
@@ -2253,6 +2285,20 @@ mod tests {
     use super::*;
 
     /// The 2026-11-12 logs: elites 1440 / 1815, the biggest ordinary enemy 525.
+    #[test]
+    fn bosses_before_elites_in_the_hp_message() {
+        let s = |hp| HpSample { hp, max_hp: 1000, posture: 0, max_posture: 1500, lives: 1 };
+        // Nine elites first in the chr list, the boss last: the boss must be sent.
+        let mut near: Vec<(i32, HpSample, bool)> = (0..9).map(|i| (100 + i, s(500), false)).collect();
+        near.push((7, s(900), true));
+        let out = bosses_first(near, 8);
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[0].0, 7, "the boss first");
+        assert_eq!(out[1..].iter().map(|e| e.0).collect::<Vec<_>>(), vec![100, 101, 102, 103, 104, 105, 106], "elites keep their order");
+        assert_eq!(kind_label(true), "boss / miniboss");
+        assert_eq!(kind_label(false), "elite");
+    }
+
     #[test]
     fn elites_by_max_posture() {
         assert!(elite_posture(1815));
