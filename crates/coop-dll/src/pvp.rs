@@ -492,6 +492,12 @@ fn start_cooldown(p: PeerId) {
     }
 }
 
+/// corpse.rs: the team pvp keeps on `p`'s native remote right now is 28 (the same rule as
+/// `teams`: friendly fire active, not paused by a boss fight, a fresh Hello from that peer).
+pub fn wants_coop_npc_team(p: PeerId) -> bool {
+    ACTIVE.load(Ordering::Relaxed) && !BOSS_PAUSE.load(Ordering::Relaxed) && hello_fresh(p)
+}
+
 fn hello_fresh(p: PeerId) -> bool {
     HELLOS.lock().is_ok_and(|h| h.fresh(p, now_ms()))
 }

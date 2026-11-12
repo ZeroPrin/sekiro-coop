@@ -210,6 +210,8 @@ impl Puppet {
         }
         self.invalidate_world("our warp");
         self.warp_pending = Some(std::time::Instant::now());
+        // corpse.rs (review m4): the hide byte must not outlive our warp (a revive meanwhile).
+        crate::corpse::on_warp("our warp");
     }
 
     /// stuck.rs, every frame in the world: Esc / Start edges against the menu mask. True on the
@@ -812,6 +814,9 @@ impl Puppet {
         ui::publish_tags(self.friend_tags.clone());
         if hands_off {
             self.boss.hands_off();
+            // corpse.rs (review m4): no corpse tick while the warp runs (up to 20 s without a
+            // loading screen): our player must not stay unperceived through a revive.
+            crate::corpse::on_warp("our warp without a loading screen");
             return;
         }
 
