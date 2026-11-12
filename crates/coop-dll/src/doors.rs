@@ -415,15 +415,18 @@ struct State {
     loop_doors: HashSet<u32>,
     /// Guard 5 writes so far.
     loop_kept_on: u32,
-    /// Fallback door flags: friend ON right after its ObjAct animation.
-    candidates: HashSet<u32>,
+    /// Fallback door flags: friend ON right after its DOOR / CHEST ObjAct animation, and when
+    /// (test6: a candidate switched off within `CANDIDATE_CYCLE` is released).
+    candidates: std::collections::HashMap<u32, Instant>,
     /// Friend door flags waiting for the replay (flag, applied at).
     pending: Vec<(u32, Instant)>,
     /// Friend ON map flags of the last seconds (for an ObjAct animation seen late).
     recent_on: Vec<(u32, Instant)>,
     /// Each peer's last seen TimeAct id (slot -> anim).
     peer_anim: std::collections::BTreeMap<u8, i32>,
-    friend_objact_at: Option<Instant>,
+    /// The peers' latest ObjAct (animation or objact.rs record): when, and whether it was a
+    /// door / chest (only that opens the candidate window; a lever, bell, wall... closes it).
+    friend_objact: Option<(Instant, bool)>,
     /// A new load was seen: walk once on the next tick.
     scan_due: bool,
     last_in_world: Duration,
@@ -484,7 +487,7 @@ fn rest_quiet(now: Instant) -> bool {
 }
 
 fn known_door(s: &State, id: u32) -> bool {
-    s.door_flags.contains(&id) || s.candidates.contains(&id)
+    s.door_flags.contains(&id) || s.candidates.contains_key(&id)
 }
 
 /// `ObjActParam.playerAnimId` of every row (once the params are loaded).
@@ -508,12 +511,41 @@ pub(crate) fn objact_anims() -> Option<&'static HashSet<u32>> {
     Some(ANIMS.get_or_init(|| set))
 }
 
+/// test6: `ObjActParam.playerAnimId` split by the row's kind: (door / chest rows, every other
+/// row). Levers 205010 / 205011, bells, walls, floors, windows... are "other".
+pub(crate) fn objact_kind_anims() -> Option<(&'static HashSet<u32>, &'static HashSet<u32>)> {
+    use fromsoftware_shared::FromStatic;
+    use sekiro::param::{OBJ_ACT_PARAM_ST, ParamDef};
+    use sekiro::sprj::SoloParamRepository;
+    static ANIMS: OnceLock<(HashSet<u32>, HashSet<u32>)> = OnceLock::new();
+    if let Some((d, o)) = ANIMS.get() {
+        return Some((d, o));
+    }
+    let repo = unsafe { SoloParamRepository::instance() }.ok()?;
+    let file = repo.params().find(|p| p.struct_name() == OBJ_ACT_PARAM_ST::NAME).map(|p| &*p.data)?;
+    let (mut door, mut other) = (HashSet::new(), HashSet::new());
+    for (id, r) in unsafe { file.rows::<OBJ_ACT_PARAM_ST>() } {
+        let a = r.player_anim_id();
+        if a == 0 || a == u32::MAX {
+            continue;
+        }
+        if reopens(id as i32) { door.insert(a) } else { other.insert(a) };
+    }
+    if door.is_empty() && other.is_empty() {
+        return None;
+    }
+    let (d, o) = ANIMS.get_or_init(|| (door, other));
+    Some((d, o))
+}
+
 /// Walks the game's ObjAct infos; remembers the door flags and logs the diagnostics
 /// (first scan with a loaded block, first scan with doors, each failure step once).
 fn doors() -> Vec<Door> {
     let (all, r) = scan(&GameMem, game::module_base());
     with(|s| {
-        s.door_flags.extend(all.iter().map(|d| d.flag));
+        // test6: only doors and chests (by ObjActParam) count as door flags for guards 2 / 3;
+        // a lever's, bell's, window's or floor's own flag is left to its script.
+        s.door_flags.extend(all.iter().filter(|d| reopens(d.param)).map(|d| d.flag));
         s.loop_doors.extend(all.iter().filter(|d| d.loop_door()).map(|d| d.flag));
         if let Some(step) = r.fail {
             if !s.fails_logged.contains(&step) && s.fails_logged.len() < 8 {
@@ -651,12 +683,107 @@ fn open_if_closed(s: &mut State, d: &Door, why: &str) -> bool {
     ok
 }
 
-fn add_candidate(s: &mut State, id: u32, why: &str) {
-    if s.door_flags.contains(&id) || s.candidates.len() >= 512 || !s.candidates.insert(id) {
+fn add_candidate(s: &mut State, id: u32, why: &str, now: Instant) {
+    if s.door_flags.contains(&id) || s.candidates.len() >= 512 || s.candidates.contains_key(&id) {
         return;
     }
+    s.candidates.insert(id, now);
     s.friend_on.insert(id);
-    note_log(s, || format!("doors: flag {id} counts as a door flag ({why}): never switched off again by a toggle or the friend"));
+    note_log(s, || {
+        format!(
+            "doors: flag {id} counts as a door flag ({why}): not switched off by a toggle or the friend (released if it goes off within {} s: a script's flag)",
+            CANDIDATE_CYCLE.as_secs()
+        )
+    });
+}
+
+/// test6 (live 2026-11-12, Senpou temple lift): a candidate a script switches off soon after it
+/// came on is a busy / delay flag, not a door. The lift's 12000655-658 went ON 3 s after the
+/// lever ObjAct and OFF again 12-17 s later (each ride); a real door flag stays on.
+const CANDIDATE_CYCLE: Duration = Duration::from_secs(60);
+
+/// Pure: a candidate marked at `added` and switched off at `now` was cycled by a script.
+fn cycled_off(added: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(added) <= CANDIDATE_CYCLE
+}
+
+/// Pure: the candidate window is open for a flag at `flag` only after a DOOR / CHEST ObjAct
+/// that is still the peers' latest one.
+fn door_window(last: Option<(Instant, bool)>, flag: Instant) -> bool {
+    last.is_some_and(|(t, door)| door && objact_near(Some(t), flag))
+}
+
+/// Pure: what kind of ObjAct a peer's animation is. Some(true) = a door / chest animation (and
+/// no other kind uses it), Some(false) = any other ObjAct animation, None = no ObjAct.
+fn anim_kind(anim: i32, door: &HashSet<u32>, other: &HashSet<u32>) -> Option<bool> {
+    if is_objact_anim(anim, other) {
+        Some(false)
+    } else if is_objact_anim(anim, door) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// A peer's ObjAct (`door` = Door / Chest kind) seen at `now`: the window follows the latest.
+fn note_peer_objact(s: &mut State, door: bool, now: Instant) {
+    s.friend_objact = Some((now, door));
+    if door {
+        let late: Vec<u32> = s.recent_on.iter().filter(|(_, t)| now.duration_since(*t) <= OBJACT_FLAG_BEFORE).map(|(f, _)| *f).collect();
+        for f in late {
+            add_candidate(s, f, "the friend set it right before its door ObjAct animation showed up here", now);
+        }
+    } else {
+        // A lever right after a door: what follows is the lever's script, not the door.
+        s.recent_on.clear();
+    }
+}
+
+/// A candidate switched off (ours or the friend's) soon after it came on: released.
+fn release_if_cycled(s: &mut State, id: u32, now: Instant, who: &str) -> bool {
+    if s.door_flags.contains(&id) {
+        return false;
+    }
+    let Some(&added) = s.candidates.get(&id) else { return false };
+    if !cycled_off(added, now) {
+        return false;
+    }
+    s.candidates.remove(&id);
+    s.friend_on.remove(&id);
+    let secs = now.saturating_duration_since(added).as_secs_f32();
+    note_log(s, || format!("doors: flag {id} released: {who} switched it off {secs:.1} s after it counted as a door flag (a script's flag, not a door): the OFF goes through"));
+    true
+}
+
+/// A loading screen or a new session: no guess outlives it.
+fn clear_guesses(s: &mut State) {
+    if !s.candidates.is_empty() {
+        log::line(&format!("doors: {} fallback door flag(s) forgotten (load / new session)", s.candidates.len()));
+    }
+    s.candidates.clear();
+    s.recent_on.clear();
+    s.friend_objact = None;
+}
+
+/// objact.rs, a peer's ObjAct record (`param` = its ObjActParam): a door / chest opens the
+/// candidate window, anything else closes it.
+pub fn friend_objact(param: i32) {
+    let now = Instant::now();
+    with(|s| note_peer_objact(s, reopens(param), now));
+}
+
+/// The friend's ON for a map flag (pure part of `friend_flag`).
+fn friend_on_flag(s: &mut State, id: u32, now: Instant) {
+    if s.door_flags.contains(&id) {
+        s.friend_on.insert(id);
+    }
+    if door_window(s.friend_objact, now) {
+        add_candidate(s, id, "the friend set it right after a door ObjAct animation", now);
+    }
+    s.recent_on.retain(|(_, t)| now.duration_since(*t) <= OBJACT_FLAG_BEFORE);
+    if s.recent_on.len() < 64 {
+        s.recent_on.push((id, now));
+    }
 }
 
 /// world.rs: a friend's flag was applied here.
@@ -674,16 +801,7 @@ pub fn friend_flag(id: u32, on: bool) {
             }
             return;
         }
-        if s.door_flags.contains(&id) {
-            s.friend_on.insert(id);
-        }
-        if objact_near(s.friend_objact_at, now) {
-            add_candidate(s, id, "the friend set it right after an ObjAct animation");
-        }
-        s.recent_on.retain(|(_, t)| now.duration_since(*t) <= OBJACT_FLAG_BEFORE);
-        if s.recent_on.len() < 64 {
-            s.recent_on.push((id, now));
-        }
+        friend_on_flag(s, id, now);
         if s.pending.len() < 256 && !s.pending.iter().any(|(f, _)| *f == id) {
             s.pending.push((id, now));
         }
@@ -718,6 +836,11 @@ pub fn keep_open(id: u32) -> bool {
         if s.loop_doors.contains(&id) {
             return false;
         }
+        // test6: a fallback candidate our own script switches off soon after it came on is no
+        // door (the lift's busy flag): released, our OFF stands.
+        if release_if_cycled(s, id, now, "our game") {
+            return false;
+        }
         if !keep_open_decision(s.friend_on.contains(&id), known_door(s, id), quiet) {
             return false;
         }
@@ -736,7 +859,8 @@ pub fn ignore_friend_off(id: u32, on: bool) -> bool {
     }
     let now = Instant::now();
     let quiet = rest_quiet(now);
-    let known = with(|s| known_door(s, id));
+    // test6: the friend's script cycling a fallback candidate (a lift's busy flag): released.
+    let known = with(|s| !release_if_cycled(s, id, now, "the friend") && known_door(s, id));
     if !known {
         return false;
     }
@@ -756,8 +880,7 @@ pub fn reset() {
     with(|s| {
         s.friend_on.clear();
         s.pending.clear();
-        s.recent_on.clear();
-        s.friend_objact_at = None;
+        clear_guesses(s);
     });
 }
 
@@ -774,6 +897,8 @@ pub fn tick(peer_anims: &[(u8, i32)], in_world_for: Duration) {
             s.scan_due = true;
             s.load_checks = 0;
             s.logged = 0;
+            // test6: one wrong guess must not outlive a load (Senpou lift, live 2026-11-12).
+            clear_guesses(s);
         }
         s.last_in_world = in_world_for;
         let started: Vec<i32> = peer_anims
@@ -784,14 +909,14 @@ pub fn tick(peer_anims: &[(u8, i32)], in_world_for: Duration) {
         s.peer_anim.retain(|slot, _| peer_anims.iter().any(|(p, _)| p == slot));
         started
     });
-    if !started.is_empty() && objact_anims().is_some_and(|set| started.iter().any(|&a| is_objact_anim(a, set))) {
-        with(|s| {
-            s.friend_objact_at = Some(now);
-            let late: Vec<u32> = s.recent_on.iter().filter(|(_, t)| now.duration_since(*t) <= OBJACT_FLAG_BEFORE).map(|(f, _)| *f).collect();
-            for f in late {
-                add_candidate(s, f, "the friend set it right before its ObjAct animation showed up here");
-            }
-        });
+    // test6: only a door / chest animation opens the window; a lever's, bell's... closes it.
+    if !started.is_empty()
+        && let Some((door, other)) = objact_kind_anims()
+    {
+        let kinds: Vec<bool> = started.iter().filter_map(|&a| anim_kind(a, door, other)).collect();
+        if let Some(&last) = kinds.last() {
+            with(|s| note_peer_objact(s, last, now));
+        }
     }
     if with(|s| std::mem::take(&mut s.scan_due) || !s.logged_scan && s.fails_logged.is_empty()) {
         doors();
@@ -1040,6 +1165,102 @@ mod tests {
         let mut m = world(&[], 1);
         m.0.get_mut(&MAN).unwrap()[MAN_BLOCK_COUNT..MAN_BLOCK_COUNT + 4].copy_from_slice(&500u32.to_le_bytes());
         assert_eq!(scan(&m, BASE).1.fail, Some("block count (+0x28) is 0 or out of range"));
+    }
+
+    // --- test6: Senpou lift (live 2026-11-12), lever 205010 then flags 12000655-658 ---
+
+    const LIFT: [u32; 4] = [12000655, 12000656, 12000657, 12000658];
+
+    fn sets() -> (HashSet<u32>, HashSet<u32>) {
+        // Door player animations 7002xx, lever animations 7104xx.
+        (HashSet::from([700200, 700250]), HashSet::from([710400, 710410]))
+    }
+
+    #[test]
+    fn anim_kinds() {
+        let (d, o) = sets();
+        assert_eq!(anim_kind(700250, &d, &o), Some(true));
+        assert_eq!(anim_kind(100_700_250, &d, &o), Some(true));
+        assert_eq!(anim_kind(710400, &d, &o), Some(false));
+        assert_eq!(anim_kind(12345, &d, &o), None);
+        // An animation a door and another kind share counts as the other kind.
+        let both = HashSet::from([700250]);
+        assert_eq!(anim_kind(700250, &d, &both), Some(false));
+    }
+
+    #[test]
+    fn lever_then_flags_no_candidates() {
+        let mut s = State::default();
+        let t = Instant::now();
+        note_peer_objact(&mut s, false, t);
+        for f in LIFT {
+            friend_on_flag(&mut s, f, t + Duration::from_secs(3));
+        }
+        assert!(s.candidates.is_empty());
+        assert!(LIFT.iter().all(|&f| !known_door(&s, f)));
+    }
+
+    #[test]
+    fn door_then_flag_is_a_candidate_as_before() {
+        let mut s = State::default();
+        let t = Instant::now();
+        note_peer_objact(&mut s, true, t);
+        friend_on_flag(&mut s, 11100500, t + Duration::from_secs(2));
+        assert!(known_door(&s, 11100500));
+        assert!(s.friend_on.contains(&11100500));
+        // A flag that came just before the door animation showed up here.
+        let mut s = State::default();
+        friend_on_flag(&mut s, 11100501, t);
+        note_peer_objact(&mut s, true, t + Duration::from_millis(800));
+        assert!(known_door(&s, 11100501));
+    }
+
+    #[test]
+    fn door_then_lever_within_the_window() {
+        let mut s = State::default();
+        let t = Instant::now();
+        note_peer_objact(&mut s, true, t);
+        friend_on_flag(&mut s, 11100500, t + Duration::from_secs(1));
+        // The lever follows 2 s later: its flags are not the door's.
+        note_peer_objact(&mut s, false, t + Duration::from_secs(2));
+        for f in LIFT {
+            friend_on_flag(&mut s, f, t + Duration::from_secs(4));
+        }
+        assert!(known_door(&s, 11100500), "the door's own flag stays protected");
+        assert!(LIFT.iter().all(|&f| !known_door(&s, f)));
+    }
+
+    #[test]
+    fn candidate_cycled_off_is_released() {
+        let mut s = State::default();
+        let t = Instant::now();
+        note_peer_objact(&mut s, true, t);
+        friend_on_flag(&mut s, 12000657, t + Duration::from_secs(3));
+        assert!(known_door(&s, 12000657));
+        // OFF 12 s later (one lift ride): released, the OFF goes through.
+        assert!(release_if_cycled(&mut s, 12000657, t + Duration::from_secs(15), "the friend"));
+        assert!(!known_door(&s, 12000657) && !s.friend_on.contains(&12000657));
+        // A door flag switched off long after: still protected.
+        friend_on_flag(&mut s, 11100500, t + Duration::from_secs(4));
+        assert!(!release_if_cycled(&mut s, 11100500, t + Duration::from_secs(300), "our game"));
+        assert!(known_door(&s, 11100500));
+        // A walked door flag is never released.
+        s.door_flags.insert(11100600);
+        s.candidates.insert(11100600, t);
+        assert!(!release_if_cycled(&mut s, 11100600, t + Duration::from_secs(1), "our game"));
+        assert!(cycled_off(t, t + CANDIDATE_CYCLE) && !cycled_off(t, t + CANDIDATE_CYCLE + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn load_or_reset_clears_the_guesses() {
+        let mut s = State::default();
+        let t = Instant::now();
+        note_peer_objact(&mut s, true, t);
+        friend_on_flag(&mut s, 12000657, t);
+        assert!(!s.candidates.is_empty());
+        clear_guesses(&mut s);
+        assert!(s.candidates.is_empty() && s.friend_objact.is_none() && s.recent_on.is_empty());
+        assert!(!door_window(s.friend_objact, t));
     }
 
     #[test]

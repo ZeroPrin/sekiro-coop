@@ -1613,6 +1613,9 @@ fn decide(s: &mut State, now: Instant, mode: u8, debug: bool, by_hook: bool) -> 
 
 fn receive(s: &mut State, from: PeerId, m: Msg, mode: u8, now: Instant) {
     s.received += 1;
+    // test6: doors.rs's fallback door-flag window opens only for a door / chest ObjAct; a lever,
+    // bell, wall... closes it (Senpou lift, live 2026-11-12).
+    doors::friend_objact(m.param);
     let queued = mode != 0 && s.incoming.len() < MAX_INCOMING;
     if mode != 0 && !queued {
         s.dropped += 1;
