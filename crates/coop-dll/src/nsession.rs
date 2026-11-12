@@ -4007,6 +4007,48 @@ pub(crate) mod dblock {
         (data.and_then(|d| crate::game::read::<i32>(d + 0x130)), data.and_then(|d| crate::game::read::<i32>(d + 0x148)))
     }
 
+    // --- Stealth deathblow in combat (test6, experimental) -------------------------------
+
+    /// `[GAMEPLAY] stealth_deathblow_needs_no_combat` (default 0): our player's stealth
+    /// deathblow (ThrowKindParam category 0 "behind" / 1 "crouching behind", kind row `+0x10`)
+    /// is refused on an enemy whose AI runs here and is in battle (TargetingSystem state 3)
+    /// with a player as its battle target, unless its posture is broken or HP at 1. Live
+    /// 2026-11-12 (elite 1500495): the AI fought the friend's copy and the user, 2.5 m behind
+    /// it after 50 s of fighting it, got a stealth deathblow at 59 % HP. What makes the
+    /// enemy "throwable from behind" is its own TAE / HKS state (ThrowModule `+0x7A/+0x7B`,
+    /// RE-BACKSTAB.md); whether its script asks "in battle" or "aware of THIS player" is not in
+    /// the binary, so this is off by default. It also forbids "the friend distracts, I
+    /// backstab", which vanilla allows against enemies busy with another target.
+    pub static STEALTH_NEEDS_NO_COMBAT: AtomicBool = AtomicBool::new(false);
+    static STEALTH_VETOES: AtomicU32 = AtomicU32::new(0);
+    const PENDING_STEALTH: u32 = 0x8_0000;
+    const KIND_CATEGORY: usize = 0x10;
+
+    /// Pure: refuse this throw? `category` = the kind row's throwKindCategory; `state` /
+    /// `ai_here` / `target_is_player` from `aiview`.
+    pub fn stealth_vetoed(enabled: bool, category: Option<u8>, ai_here: bool, state: i32, target_is_player: bool, hp: Option<i32>, posture: Option<i32>) -> bool {
+        enabled
+            && matches!(category, Some(0 | 1))
+            && ai_here
+            && state == super::aiview::STATE_BATTLE
+            && target_is_player
+            && !justified(hp, posture)
+    }
+
+    fn stealth_check(def: usize, kind: usize) -> bool {
+        if !STEALTH_NEEDS_NO_COMBAT.load(Ordering::Relaxed) || kind < 0x10000 {
+            return false;
+        }
+        let category = crate::game::read::<u8>(kind + KIND_CATEGORY);
+        if !matches!(category, Some(0 | 1)) {
+            return false;
+        }
+        let Some(v) = super::aiview::read_view(def) else { return false };
+        let target_is_player = v.target.is_some_and(|t| super::aiview::player_of(t).is_some());
+        let (hp, posture) = hp_posture(def);
+        stealth_vetoed(true, category, v.ai_here, v.state, target_is_player, hp, posture)
+    }
+
     // --- Live state ---------------------------------------------------------------------
 
     static TABLE: Mutex<Table> = Mutex::new(Table::new());
@@ -4081,7 +4123,10 @@ pub(crate) mod dblock {
         // SAFETY: the trampoline (or the original once unhooked) has this signature.
         let f: extern "C" fn(usize, usize, usize) -> u64 = unsafe { std::mem::transmute(if t != 0 { t } else { module_base() + GATE_RVA }) };
         let r = f(atk, def, kind);
-        let any = ANY.load(Ordering::Acquire) || ANY_FRESH.load(Ordering::Acquire) || ANY_TAKEN.load(Ordering::Acquire);
+        let any = ANY.load(Ordering::Acquire)
+            || ANY_FRESH.load(Ordering::Acquire)
+            || ANY_TAKEN.load(Ordering::Acquire)
+            || STEALTH_NEEDS_NO_COMBAT.load(Ordering::Relaxed);
         if r & 0xFF == 0 || !any || atk == 0 || atk != PLAYER.load(Ordering::Relaxed) || def < 0x10000 || !crate::mod_alive() {
             return r;
         }
@@ -4102,6 +4147,8 @@ pub(crate) mod dblock {
             // One line per veto burst (the gate runs every frame while the marker is near).
             TAKEN_VETOES.fetch_add(1, Ordering::Relaxed);
             (TAKEN_VETOES.load(Ordering::Relaxed) == 1).then_some(PENDING_TAKEN)
+        } else if stealth_check(def, kind) {
+            (STEALTH_VETOES.fetch_add(1, Ordering::Relaxed) == 0).then_some(PENDING_STEALTH)
         } else {
             return r;
         };
@@ -4277,7 +4324,12 @@ pub(crate) mod dblock {
         }
         for s in &PENDING_LOG {
             let v = s.swap(0, Ordering::Relaxed);
-            if v & PENDING_TAKEN != 0 {
+            if v & PENDING_STEALTH != 0 {
+                log_limited(format!(
+                    "deathblow: our stealth deathblow on {:#x} refused: its AI here is in battle with a player, posture not broken and HP above 1 (stealth_deathblow_needs_no_combat)",
+                    v & 0xFFFF
+                ));
+            } else if v & PENDING_TAKEN != 0 {
                 log_limited(format!(
                     "deathblow: our attempt on {:#x} refused: taken from a downed player's machine less than {} s ago, posture not broken and HP above 1 (fresh-take veto)",
                     v & 0xFFFF,
@@ -4298,10 +4350,10 @@ pub(crate) mod dblock {
             STATS_AT.store(now, Ordering::Relaxed);
         } else if now.saturating_sub(at) >= STATS_MS {
             STATS_AT.store(now, Ordering::Relaxed);
-            let c = [&OURS_NEW, &PEERS_NEW, &VETOES, &DROPPED, &GAVE_WAY, &MISSED, &FRESH_VETOES, &TAKEN_VETOES].map(|a| a.swap(0, Ordering::Relaxed));
+            let c = [&OURS_NEW, &PEERS_NEW, &VETOES, &DROPPED, &GAVE_WAY, &MISSED, &FRESH_VETOES, &TAKEN_VETOES, &STEALTH_VETOES].map(|a| a.swap(0, Ordering::Relaxed));
             if c.iter().any(|&x| x > 0) {
                 log::line(&format!(
-                    "deathblow: 10 s: locks ours {} / other players' {}, gate vetoes {}, their throws not applied {}, ours gave way {}, ours started during another's lock {}, fresh-life vetoes {}, fresh-take vetoes {} (gate {})",
+                    "deathblow: 10 s: locks ours {} / other players' {}, gate vetoes {}, their throws not applied {}, ours gave way {}, ours started during another's lock {}, fresh-life vetoes {}, fresh-take vetoes {}, in-combat stealth vetoes {} (gate {})",
                     c[0],
                     c[1],
                     c[2],
@@ -4310,6 +4362,7 @@ pub(crate) mod dblock {
                     c[5],
                     c[6],
                     c[7],
+                    c[8],
                     if TRAMP.load(Ordering::Acquire) != 0 { "hooked" } else { "not hooked" }
                 ));
             }
@@ -7482,6 +7535,26 @@ mod dblock_tests {
         assert!(!justified(Some(6263), Some(400)), "the live stealth deathblow");
         assert!(justified(None, Some(400)), "unknown: never block blind");
         assert!(justified(Some(6263), None));
+    }
+
+    /// stealth_deathblow_needs_no_combat: only a behind / crouching-behind kind, only with the
+    /// AI running here in battle with a player, never when posture or HP opens the enemy.
+    #[test]
+    fn in_combat_stealth_veto() {
+        let v = |en, cat, here, st, pl, hp, po| stealth_vetoed(en, cat, here, st, pl, hp, po);
+        assert!(v(true, Some(0), true, 3, true, Some(5000), Some(300)), "the live case");
+        assert!(v(true, Some(1), true, 3, true, Some(5000), Some(300)), "crouching behind");
+        assert!(!v(false, Some(0), true, 3, true, Some(5000), Some(300)), "setting off (default)");
+        assert!(!v(true, Some(4), true, 3, true, Some(5000), Some(300)), "posture-break kind");
+        assert!(!v(true, Some(6), true, 3, true, Some(5000), Some(300)), "plunging");
+        assert!(!v(true, Some(7), true, 3, true, Some(5000), Some(300)), "unrestricted fall");
+        assert!(!v(true, None, true, 3, true, Some(5000), Some(300)), "kind unreadable");
+        assert!(!v(true, Some(0), false, 3, true, Some(5000), Some(300)), "AI elsewhere: stale");
+        assert!(!v(true, Some(0), true, 2, true, Some(5000), Some(300)), "searching (find): vanilla stealth");
+        assert!(!v(true, Some(0), true, 0, false, Some(5000), Some(300)), "unaware opener");
+        assert!(!v(true, Some(0), true, 3, false, Some(5000), Some(300)), "fighting a non-player");
+        assert!(!v(true, Some(0), true, 3, true, Some(5000), Some(0)), "posture broken");
+        assert!(!v(true, Some(0), true, 3, true, Some(1), Some(300)), "HP at the floor");
     }
 
     #[test]
