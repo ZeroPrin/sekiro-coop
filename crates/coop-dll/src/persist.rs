@@ -250,6 +250,12 @@ pub fn death_hold_step(h: DeathHold, waiting: bool, ended: Option<DownEnd>, peer
     }
 }
 
+/// Our death is not over yet (no reload) and a peer is down: the hold goes on before the
+/// reload, so the first frame after it is covered (`waiting` input of `death_hold_step`).
+pub fn dead_pending(wait_enabled: bool, we_dead: bool, waiting: bool, peer_down: bool) -> bool {
+    wait_enabled && we_dead && !waiting && peer_down
+}
+
 /// enemies.rs: a host HP the hold keeps off a living local copy (0 or lower).
 pub fn death_hold_blocks(hold: bool, local: i32, host: i32) -> bool {
     hold && local > 0 && host < local
@@ -642,7 +648,16 @@ pub fn tick(c: Ctx) {
         }
     }
     let peer_down = st.hold_peers.iter().any(|id| st.peer_dead_at.contains_key(id));
-    st.death_hold = death_hold_step(st.death_hold, st.down_wait.is_some(), ended, peer_down, now);
+    // Dead (not reloaded yet) while a peer is down: the wait will start at our reload, but
+    // enemies.rs runs before this tick, so its first frame after the reload would still see
+    // the hold Off. On from here; Off again on the next tick if nobody is down any more.
+    let pending = dead_pending(
+        WAIT_FOR_DOWN.load(Ordering::Relaxed),
+        st.our_dead_at.is_some(),
+        st.down_wait.is_some(),
+        c.peers.iter().any(|p| down(p, &st.peer_dead_at)),
+    );
+    st.death_hold = death_hold_step(st.death_hold, st.down_wait.is_some() || pending, ended, peer_down, now);
     if st.our_dead_at.is_some_and(|x| now.duration_since(x) > WIPE_WINDOW) {
         st.our_dead_at = None;
     }
@@ -964,6 +979,29 @@ mod tests {
         assert_eq!(step(H::Waiting, false, Some(DownEnd::Timeout), true, ms(30_000)), H::Off);
         // A wipe whose dead peer already reloaded goes straight to the tail.
         assert_eq!(step(H::Waiting, false, Some(DownEnd::Wipe), false, ms(10)), H::Tail(ms(10)));
+    }
+
+    #[test]
+    fn death_hold_on_before_our_reload() {
+        use super::{DeathHold as H, dead_pending, death_hold_step as step};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        // Dead, not reloaded, the host down: on already (enemies.rs runs before the tick).
+        let h = step(H::Off, dead_pending(true, true, false, true), None, false, ms(0));
+        assert_eq!(h, H::Waiting);
+        // Reload with nobody down any more (no wait starts): Off on the next tick.
+        let h = step(h, dead_pending(true, false, false, false), None, false, ms(16));
+        assert_eq!(h, H::Off);
+        // Same, but the host got up before our reload while we are still dead.
+        let h = step(H::Waiting, dead_pending(true, true, false, false), None, false, ms(16));
+        assert_eq!(h, H::Off);
+        // A lone death with the host alive: never on.
+        assert!(!dead_pending(true, true, false, false));
+        assert_eq!(step(H::Off, false, None, false, ms(0)), H::Off);
+        // The wait itself drives it once it runs; the setting off: no hold at all.
+        assert!(!dead_pending(true, true, true, true));
+        assert!(!dead_pending(false, true, false, true));
     }
 
     #[test]
