@@ -3472,6 +3472,8 @@ const REMOTE_THROW_MS: u64 = 4000;
 /// (0 = never). Our own slot is never set.
 static REMOTE_THROW_UNTIL: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static THROW_EVIDENCE_LOGS: AtomicU32 = AtomicU32::new(0);
+/// Last log time of one of our own throws on an enemy past the evidence cap (test6).
+static OWN_THROW_LOG_AT: AtomicU64 = AtomicU64::new(0);
 
 /// True while `slot`'s player (its native remote here) is part of a throw.
 pub fn remote_in_throw(slot: u8) -> bool {
@@ -3527,7 +3529,17 @@ fn note_throw(d: &[u8], sent: bool, origin: u8) {
         }
     }
     // 2026-10-24: always logged (throws are rare) so the attacker field can be checked live.
-    if THROW_EVIDENCE_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
+    // test6: past the 200-line cap our own player's throws on enemies are still logged (at
+    // most one line per 500 ms; one deathblow sends two ids): the live tests need every
+    // deathblow's throw id.
+    let own_on_enemy = sent && by_player && enemy_net_id(defender);
+    let past_cap = THROW_EVIDENCE_LOGS.fetch_add(1, Ordering::Relaxed) >= 200;
+    if !past_cap
+        || (own_on_enemy && {
+            let last = OWN_THROW_LOG_AT.load(Ordering::Relaxed);
+            now.saturating_sub(last) >= 500 && OWN_THROW_LOG_AT.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        })
+    {
         log::line(&format!(
             "throw: type 18 {} defender {defender:#x}, attacker {}, throw id {}{}",
             if sent { "sent".to_string() } else { format!("received from peer {origin}") },
