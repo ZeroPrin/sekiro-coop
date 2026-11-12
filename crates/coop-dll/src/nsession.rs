@@ -3162,6 +3162,19 @@ pub(crate) mod ownfill {
         slots.into_iter().any(|s| s < 32 && down & (1 << s) != 0)
     }
 
+    /// Pure (review, test6 final): the 10 s fresh-take veto (`dblock::boss_taken`) arms at
+    /// most once per boss netId per "rival down" episode, so a take -> conflict drop ->
+    /// re-take cycle cannot keep it armed for good. `armed` = netIds armed this episode; it
+    /// empties as soon as no rival is down. Called every step with `take = None` (episode
+    /// bookkeeping) and with `Some(n)` when boss `n` is taken; true = arm it now.
+    pub fn arm_take_veto(armed: &mut std::collections::HashSet<u16>, rival_down: bool, take: Option<u16>) -> bool {
+        if !rival_down {
+            armed.clear();
+            return false;
+        }
+        take.is_some_and(|n| armed.insert(n))
+    }
+
     /// Minimum gap between two native-change log lines per boss.
     const BOSS_DIAG_GAP: Duration = Duration::from_secs(5);
 
@@ -3177,6 +3190,9 @@ pub(crate) mod ownfill {
         pub cooldown: HashMap<u16, Instant>,
         /// netId -> last time a conflict "given back" line was logged.
         pub give_log_at: HashMap<u16, Instant>,
+        /// Boss netIds whose fresh-take veto was armed in the current "rival down" episode
+        /// (`arm_take_veto`).
+        pub veto_armed: std::collections::HashSet<u16>,
         pub at: Option<Instant>,
         pub taken: u32,
         pub given: u32,
@@ -3192,6 +3208,7 @@ pub(crate) mod ownfill {
             self.diag_at.clear();
             self.cooldown.clear();
             self.give_log_at.clear();
+            self.veto_armed.clear();
             self.logs = 0;
             self.taken = 0;
             self.given = 0;
@@ -3239,6 +3256,7 @@ pub(crate) mod ownfill {
             let me_down = crate::bossrules::spectating();
             let down = crate::world::down_slots();
             let others_down = rival_down(others.iter().map(|&(s, _)| s), down);
+            arm_take_veto(&mut self.veto_armed, others_down, None);
             let mut alive_ids = HashMap::new();
             for c in enemies() {
                 let Some(n) = netai::net_id(c) else { continue };
@@ -3365,7 +3383,9 @@ pub(crate) mod ownfill {
                 if boss {
                     // The boss's AI moves here fresh (no "noticed the player" state): no
                     // deathblow that its posture / HP does not open for a while.
-                    if others_down {
+                    // Once per netId per rival-down episode (a re-take after a conflict drop
+                    // does not arm it again).
+                    if arm_take_veto(&mut self.veto_armed, others_down, Some(n)) {
                         super::dblock::boss_taken(n, e);
                     }
                     self.native.insert(n, game_owned(w, n));
@@ -7400,6 +7420,24 @@ mod tests {
         assert!(rival_down([0u8, 2], 0b100));
         assert!(!rival_down([], 0b1), "nobody engaged");
         assert!(!rival_down([40u8], u32::MAX), "out-of-range slot never counts");
+    }
+
+    /// Review (test6 final): take -> conflict drop -> re-take while the rival stays down arms
+    /// the fresh-take veto once; the next episode (rival back, then down again) arms it again.
+    #[test]
+    fn fresh_take_veto_arms_once_per_rival_down_episode() {
+        use super::ownfill::arm_take_veto;
+        let mut armed = std::collections::HashSet::new();
+        assert!(!arm_take_veto(&mut armed, false, Some(7)), "no rival down: never");
+        assert!(!arm_take_veto(&mut armed, true, None), "bookkeeping only");
+        assert!(arm_take_veto(&mut armed, true, Some(7)), "first take");
+        assert!(!arm_take_veto(&mut armed, true, None));
+        assert!(!arm_take_veto(&mut armed, true, Some(7)), "re-take, same episode");
+        assert!(!arm_take_veto(&mut armed, true, Some(7)), "and again");
+        assert!(arm_take_veto(&mut armed, true, Some(8)), "another boss: its own");
+        assert!(!arm_take_veto(&mut armed, false, None), "rival back: episode over");
+        assert!(armed.is_empty());
+        assert!(arm_take_veto(&mut armed, true, Some(7)), "new episode");
     }
 
     #[test]
