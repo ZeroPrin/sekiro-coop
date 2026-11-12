@@ -250,6 +250,17 @@ pub fn death_hold_step(h: DeathHold, waiting: bool, ended: Option<DownEnd>, peer
     }
 }
 
+/// A wait that ended as a lone death really followed a wipe decided before our reload: the
+/// peer's death that is over (`back`, its `peer_back` death) and our current death are both
+/// in the last wipe cleared. A peer that only resurrected has no such death; an older wipe
+/// has another death of ours first.
+pub fn wiped_before_reload(our_dead: Option<Instant>, back: Option<Instant>, cleared: Option<&[Instant]>) -> bool {
+    match (our_dead, back, cleared) {
+        (Some(o), Some(b), Some(w)) => w.first() == Some(&o) && w[1..].contains(&b),
+        _ => false,
+    }
+}
+
 /// Our death is not over yet (no reload) and a peer is down: the hold goes on before the
 /// reload, so the first frame after it is covered (`waiting` input of `death_hold_step`).
 pub fn dead_pending(wait_enabled: bool, we_dead: bool, waiting: bool, peer_down: bool) -> bool {
@@ -626,15 +637,21 @@ pub fn tick(c: Ctx) {
         let still = ids.iter().filter(|id| c.peers.by_id(**id).is_some_and(|p| down(p, &st.peer_dead_at))).count();
         if let Some(end) = down_wait_end(now.duration_since(since), still, st.wipes != wipes) {
             st.down_wait = None;
+            // The wipe was decided before our reload (it does not end the wait then): the
+            // peer that "got up" reloaded out of its old world, whose records may still be
+            // in enemies.latest. The hold gets the wipe's tail.
+            let wiped_before = end == DownEnd::LoneDeath
+                && ids.iter().any(|id| wiped_before_reload(st.our_dead_at, st.peer_back.get(id).copied(), st.wipe_cleared.as_deref()));
+            ended = Some(if wiped_before { DownEnd::Wipe } else { end });
             st.hold_peers = ids;
-            ended = Some(end);
             // Lone death or the cap: our death is over now. A wipe already cleared it all.
             st.our_dead_at = None;
             log::line(&format!(
-                "persist: the down peer(s) settled {} ms after our death reload: restores / dead-set kills {}{}",
+                "persist: the down peer(s) settled {} ms after our death reload: restores / dead-set kills {}{}{}",
                 now.duration_since(since).as_millis(),
                 if end == DownEnd::Wipe { "have nothing left (wipe: fresh world)" } else { "run now" },
-                if end == DownEnd::Timeout { " (waited the maximum)" } else { "" }
+                if end == DownEnd::Timeout { " (waited the maximum)" } else { "" },
+                if wiped_before { " (wipe decided before our reload: death hold tail)" } else { "" }
             ));
         }
     }
@@ -1002,6 +1019,29 @@ mod tests {
         // The wait itself drives it once it runs; the setting off: no hold at all.
         assert!(!dead_pending(true, true, true, true));
         assert!(!dead_pending(false, true, false, true));
+    }
+
+    #[test]
+    fn a_wipe_before_our_reload_gets_the_tail() {
+        use super::wiped_before_reload as wb;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let s = |n| t0 + Duration::from_secs(n);
+        // The host died at 0, we at 10: the wipe cleared [ours, host's] before our reload;
+        // the host reloaded first, its death is in peer_back.
+        let wipe = [s(10), s(0)];
+        assert!(wb(Some(s(10)), Some(s(0)), Some(&wipe)));
+        // A genuine lone death: the host only resurrected (no death of its own is over).
+        assert!(!wb(Some(s(10)), None, Some(&wipe)));
+        assert!(!wb(Some(s(10)), None, None));
+        // The host is back from an older wipe (60 s ago) and we die alone now: that wipe has
+        // another death of ours first.
+        let old = [s(5), s(0)];
+        assert!(!wb(Some(s(65)), Some(s(0)), Some(&old)));
+        // Our death already over / no wipe ever: nothing.
+        assert!(!wb(None, Some(s(0)), Some(&wipe)));
+        assert!(!wb(Some(s(10)), Some(s(0)), None));
+        assert!(!wb(Some(s(10)), Some(s(0)), Some(&[])));
     }
 
     #[test]
