@@ -487,8 +487,9 @@ fn pending_get(key: &str, now: u64) -> Option<i64> {
     PENDING.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Pending::default).get(key, now)
 }
 
-/// The five rows that travel in the host's ScaleCfg and are edited through `menu::post_edit`.
-pub const VALUES_KEYS: [&str; 5] = ["enemy_health_scaling", "enemy_posture_scaling", "boss_health_scaling", "boss_posture_scaling", "death_debuffs"];
+/// The six rows that travel in the host's ScaleCfg and are edited through `menu::post_edit`.
+pub const VALUES_KEYS: [&str; 6] =
+    ["enemy_health_scaling", "enemy_posture_scaling", "boss_health_scaling", "boss_posture_scaling", "death_debuffs", "friendly_fire"];
 
 pub fn is_values_key(key: &str) -> bool {
     VALUES_KEYS.contains(&key)
@@ -501,6 +502,7 @@ pub fn values_field(v: &Values, key: &str) -> Option<i64> {
         "boss_health_scaling" => v.boss_hp as i64,
         "boss_posture_scaling" => v.boss_posture as i64,
         "death_debuffs" => v.death_debuffs as i64,
+        "friendly_fire" => v.friendly_fire as i64,
         _ => return None,
     })
 }
@@ -515,6 +517,7 @@ pub fn with_field(v: Values, key: &str, value: i64) -> Option<Values> {
         "boss_health_scaling" => v.boss_hp = pct,
         "boss_posture_scaling" => v.boss_posture = pct,
         "death_debuffs" => v.death_debuffs = value != 0,
+        "friendly_fire" => v.friendly_fire = value != 0,
         _ => return None,
     }
     Some(v)
@@ -530,6 +533,7 @@ fn live_values(role: Role) -> Values {
         boss_hp: p(&tuning::BOSS_HEALTH_SCALING),
         boss_posture: p(&tuning::BOSS_POSTURE_SCALING),
         death_debuffs: tuning::DEATH_DEBUFFS.load(Ordering::Relaxed),
+        friendly_fire: crate::pvp::FRIENDLY_FIRE.load(Ordering::Relaxed),
     };
     if role == Role::Client { menu::snapshot().2.unwrap_or(local) } else { local }
 }
@@ -943,11 +947,13 @@ mod tests {
     #[test]
     fn resolve_order_pending_live_ini() {
         let d = parse_ini(&settings::default_ini_text());
-        let live = Values { enemy_hp: 80, enemy_posture: 20, boss_hp: 30, boss_posture: 40, death_debuffs: false };
+        let live = Values { enemy_hp: 80, enemy_posture: 20, boss_hp: 30, boss_posture: 40, death_debuffs: false, friendly_fire: true };
         let ini = map(&[("enemy_health_scaling", "10"), ("share_loot", "0")]);
         // live wins over the ini for the five scaling rows
         assert_eq!(resolve_value(row("enemy_health_scaling"), None, &live, &ini, &d), 80);
         assert_eq!(resolve_value(row("death_debuffs"), None, &live, &ini, &d), 0);
+        // test5: friendly fire is a live (host's) value too, not the ini's
+        assert_eq!(resolve_value(row("friendly_fire"), None, &live, &map(&[("friendly_fire", "0")]), &d), 1);
         // pending wins over everything (clamped)
         assert_eq!(resolve_value(row("enemy_health_scaling"), Some(150), &live, &ini, &d), 150);
         assert_eq!(resolve_value(row("death_debuffs"), Some(7), &live, &ini, &d), 1);
@@ -972,13 +978,16 @@ mod tests {
 
     #[test]
     fn values_edit_helpers() {
-        let v = Values { enemy_hp: 1, enemy_posture: 2, boss_hp: 3, boss_posture: 4, death_debuffs: true };
+        let v = Values { enemy_hp: 1, enemy_posture: 2, boss_hp: 3, boss_posture: 4, death_debuffs: true, friendly_fire: false };
         assert_eq!(values_field(&v, "boss_health_scaling"), Some(3));
         assert_eq!(values_field(&v, "death_debuffs"), Some(1));
         assert_eq!(values_field(&v, "share_loot"), None);
         let w = with_field(v, "enemy_posture_scaling", 90).unwrap();
         assert_eq!((w.enemy_hp, w.enemy_posture, w.boss_hp, w.boss_posture), (1, 90, 3, 4));
         assert!(!with_field(v, "death_debuffs", 0).unwrap().death_debuffs);
+        assert_eq!(values_field(&v, "friendly_fire"), Some(0));
+        let ff = with_field(v, "friendly_fire", 1).unwrap();
+        assert!(ff.friendly_fire && ff.death_debuffs);
         assert_eq!(with_field(v, "boss_health_scaling", 5000).unwrap().boss_hp, 1000);
         assert_eq!(with_field(v, "vsync", 1), None);
         for k in VALUES_KEYS {

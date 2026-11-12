@@ -35,7 +35,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `loadout_sync` | DEBUG | 1 | Loadout sync |
 | `player_packet_hz` | ADVANCED | 30 (12 = the game's own, nothing patched) | Player packet rate |
 | `native_pin_delay_ms` | DEBUG | 0 (auto) | Player packet rate |
-| `friendly_fire` | GAMEPLAY | **0** (the host's value is used) | Friendly fire |
+| `friendly_fire` | GAMEPLAY | **0** (the host's value is used; also in Options > Co-op Settings page 1 and the F-key Mod settings panel, a client sees the host's value locked) | Friendly fire |
 | `friendly_fire_in_boss_fights` | GAMEPLAY | 0 | Friendly fire |
 | `pvp_dry_run` | DEBUG | 0 | Friendly fire |
 | `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | Friendly fire |

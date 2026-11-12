@@ -15,7 +15,8 @@ pub enum Role {
 }
 
 /// The settings the panel edits (ini keys `enemy_health_scaling`, `enemy_posture_scaling`,
-/// `boss_health_scaling`, `boss_posture_scaling`, `death_debuffs`).
+/// `boss_health_scaling`, `boss_posture_scaling`, `death_debuffs`, `friendly_fire`). All travel
+/// in the host's ScaleCfg; a client shows the host's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Values {
     pub enemy_hp: u16,
@@ -23,11 +24,13 @@ pub struct Values {
     pub boss_hp: u16,
     pub boss_posture: u16,
     pub death_debuffs: bool,
+    /// `[GAMEPLAY] friendly_fire` (pvp.rs; test5: also in the panel and the native page).
+    pub friendly_fire: bool,
 }
 
 impl Default for Values {
     fn default() -> Self {
-        Self { enemy_hp: 60, enemy_posture: 60, boss_hp: 50, boss_posture: 50, death_debuffs: true }
+        Self { enemy_hp: 60, enemy_posture: 60, boss_hp: 50, boss_posture: 50, death_debuffs: true, friendly_fire: false }
     }
 }
 
@@ -101,6 +104,7 @@ pub fn ini_updates(v: Values) -> Vec<(&'static str, String)> {
         ("boss_health_scaling", v.boss_hp.to_string()),
         ("boss_posture_scaling", v.boss_posture.to_string()),
         ("death_debuffs", (v.death_debuffs as u8).to_string()),
+        ("friendly_fire", (v.friendly_fire as u8).to_string()),
     ]
 }
 
@@ -175,8 +179,9 @@ const PAD_LB: u16 = 0x0100;
 const PAD_RB: u16 = 0x0200;
 const PAD_R3: u16 = 0x0080;
 
-/// Rows of the panel: enemy HP, enemy posture, boss HP, boss posture, death debuff, Apply.
-pub const NAV_ROWS: usize = 6;
+/// Rows of the panel: enemy HP, enemy posture, boss HP, boss posture, death debuff, friendly
+/// fire, Apply.
+pub const NAV_ROWS: usize = 7;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NavAction {
@@ -266,6 +271,8 @@ pub fn apply_nav(selected: usize, d: Values, a: NavAction) -> (usize, Values, bo
         NavAction::Toggle => {
             if sel == 4 {
                 d.death_debuffs = !d.death_debuffs;
+            } else if sel == 5 {
+                d.friendly_fire = !d.friendly_fire;
             }
         }
         NavAction::Apply => return (sel, d, true),
@@ -357,9 +364,11 @@ mod tests {
 
     #[test]
     fn apply_nav_rows() {
-        let d = Values { enemy_hp: 998, enemy_posture: 3, boss_hp: 50, boss_posture: 50, death_debuffs: true };
-        assert_eq!(apply_nav(0, d, NavAction::Move(-1)).0, 5);
-        assert_eq!(apply_nav(5, d, NavAction::Move(1)).0, 0);
+        let d = Values { enemy_hp: 998, enemy_posture: 3, boss_hp: 50, boss_posture: 50, death_debuffs: true, friendly_fire: false };
+        assert_eq!(apply_nav(0, d, NavAction::Move(-1)).0, 6);
+        assert_eq!(apply_nav(6, d, NavAction::Move(1)).0, 0);
+        assert!(apply_nav(5, d, NavAction::Toggle).1.friendly_fire);
+        assert!(apply_nav(5, d, NavAction::Toggle).1.death_debuffs, "only its own row");
         assert_eq!(apply_nav(0, d, NavAction::Adjust(25)).1.enemy_hp, 1000);
         assert_eq!(apply_nav(1, d, NavAction::Adjust(-5)).1.enemy_posture, 0);
         assert_eq!(apply_nav(2, d, NavAction::Adjust(5)).1.boss_hp, 55);
@@ -388,7 +397,7 @@ mod tests {
 
     #[test]
     fn edit_is_taken_once_and_publish_round_trips() {
-        let v = Values { enemy_hp: 1, enemy_posture: 2, boss_hp: 3, boss_posture: 4, death_debuffs: false };
+        let v = Values { enemy_hp: 1, enemy_posture: 2, boss_hp: 3, boss_posture: 4, death_debuffs: false, friendly_fire: true };
         assert_eq!(take_edit(), None);
         post_edit(v);
         assert_eq!(take_edit(), Some(v));
@@ -399,11 +408,12 @@ mod tests {
 
     #[test]
     fn ini_updates_use_the_scaling_keys() {
-        let v = Values { enemy_hp: 10, enemy_posture: 20, boss_hp: 30, boss_posture: 40, death_debuffs: true };
+        let v = Values { enemy_hp: 10, enemy_posture: 20, boss_hp: 30, boss_posture: 40, death_debuffs: true, friendly_fire: true };
         let u = ini_updates(v);
         assert_eq!(u[0], ("enemy_health_scaling", "10".to_string()));
         assert_eq!(u[3], ("boss_posture_scaling", "40".to_string()));
         assert_eq!(u[4], ("death_debuffs", "1".to_string()));
+        assert_eq!(u[5], ("friendly_fire", "1".to_string()));
     }
 
     fn inp() -> LatchIn {

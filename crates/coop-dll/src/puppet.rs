@@ -359,14 +359,15 @@ impl Puppet {
                 crate::tuning::BOSS_HEALTH_SCALING.store(v.boss_hp as u32, Relaxed);
                 crate::tuning::BOSS_POSTURE_SCALING.store(v.boss_posture as u32, Relaxed);
                 crate::tuning::DEATH_DEBUFFS.store(v.death_debuffs, Relaxed);
+                crate::pvp::FRIENDLY_FIRE.store(v.friendly_fire, Relaxed);
                 let saved = settings::write_keys(&menu::ini_updates(v));
                 let state = match &saved {
                     Ok(()) => "saved".to_string(),
                     Err(e) => format!("not saved ({e})"),
                 };
                 log::line(&format!(
-                    "menu: host set enemy_hp={} enemy_posture={} boss_hp={} boss_posture={} death_debuffs={} {state}",
-                    v.enemy_hp, v.enemy_posture, v.boss_hp, v.boss_posture, v.death_debuffs
+                    "menu: host set enemy_hp={} enemy_posture={} boss_hp={} boss_posture={} death_debuffs={} friendly_fire={} {state}",
+                    v.enemy_hp, v.enemy_posture, v.boss_hp, v.boss_posture, v.death_debuffs, v.friendly_fire
                 ));
                 menu::set_save_result(match saved {
                     Ok(()) => "Applied and saved to the settings file.".into(),
@@ -382,6 +383,7 @@ impl Puppet {
                 boss_hp: c.boss_hp,
                 boss_posture: c.boss_posture,
                 death_debuffs: c.debuffs.unwrap_or(mine.death_debuffs),
+                friendly_fire: c.friendly_fire.unwrap_or(mine.friendly_fire),
             })
         } else {
             None
@@ -1579,7 +1581,7 @@ fn own_scale_cfg(players: u32) -> crate::scaling::ScaleCfg {
     }
 }
 
-/// The five settings the 'Mod settings' panel edits, as this machine has them now.
+/// The six settings the 'Mod settings' panel edits, as this machine has them now.
 fn menu_values() -> crate::menu::Values {
     use std::sync::atomic::Ordering::Relaxed;
     let p = |a: &std::sync::atomic::AtomicU32| crate::menu::clamp_pct(a.load(Relaxed) as i64);
@@ -1589,6 +1591,7 @@ fn menu_values() -> crate::menu::Values {
         boss_hp: p(&crate::tuning::BOSS_HEALTH_SCALING),
         boss_posture: p(&crate::tuning::BOSS_POSTURE_SCALING),
         death_debuffs: crate::tuning::DEATH_DEBUFFS.load(Relaxed),
+        friendly_fire: crate::pvp::FRIENDLY_FIRE.load(Relaxed),
     }
 }
 

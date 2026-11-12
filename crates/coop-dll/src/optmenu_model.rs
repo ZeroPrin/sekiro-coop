@@ -92,12 +92,13 @@ const HP_POS: &[&str] = &["Above head", "Left list", "Top list"];
 const HP_CONTENT: &[&str] = &["Name and bar", "Bar only", "Bar and numbers"];
 const PAD_BTN: &[&str] = &["Back", "Start", "L3", "R3", "None"];
 
-static ROWS: [RowDef; 40] = [
+static ROWS: [RowDef; 41] = [
     r(1, "enemy_health_scaling", "Enemy health", "Extra enemy health per added player. Host sets it.", Pct, Host),
     r(2, "enemy_posture_scaling", "Enemy posture", "Extra enemy posture per added player. Host sets it.", Pct, Host),
     r(3, "boss_health_scaling", "Boss health", "Extra boss health per added player. Host sets it.", Pct, Host),
     r(4, "boss_posture_scaling", "Boss posture", "Extra boss posture per added player. Host sets it.", Pct, Host),
     r(5, "death_debuffs", "Death debuff", "Each co-op death lowers max HP and posture by 10 %.", OnOff, Host),
+    r(41, "friendly_fire", "Friendly fire", "Players' attacks hit each other (experimental). Host sets it.", OnOff, Host),
     r(6, "share_loot", "Share loot", "Both players get drops from enemies the friend killed.", OnOff, HostOffline),
     r(7, "share_exp", "Share sen and XP", "Both players get experience and sen from kills.", OnOff, HostOffline),
     r(8, "share_key_items", "Share key items", "Story items given to one player are given to both.", OnOff, HostOffline),

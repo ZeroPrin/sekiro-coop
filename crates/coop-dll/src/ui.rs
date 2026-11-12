@@ -223,7 +223,7 @@ struct Panel {
     synced: crate::menu::Values,
     was_visible: bool,
     collapsed: bool,
-    /// Controller navigation (v8.32a): the selected row (0..6) and the pure navigator.
+    /// Controller navigation (v8.32a): the selected row (0..7) and the pure navigator.
     selected: usize,
     nav: crate::menu::PadNav,
 }
@@ -336,6 +336,8 @@ impl Panel {
                     mark(ui, 4);
                     ui.checkbox("Death debuff (-10 % max HP/posture per death)", &mut d.death_debuffs);
                     mark(ui, 5);
+                    ui.checkbox("Friendly fire (players' hits reach each other)", &mut d.friendly_fire);
+                    mark(ui, 6);
                     if editable && ui.button("Apply") {
                         apply = true;
                     }
