@@ -7782,6 +7782,96 @@ mod dblock_tests {
     }
 }
 
+/// test6: an enemy's AI state and battle target as its own TargetingSystem holds them
+/// (docs/RE-CORPSE-TARGET.md §1, [VAR] Ghidra 2026-11-12). Read-only, fault-safe reads.
+/// - AiThink = `[[chr+0x2000]+0x340]` (the ComManipulator's think object; `chr+0x58` is the
+///   active manipulator, = `chr+0x2000` while the AI runs here, else the NetAIManipulator).
+/// - TargetingSystem = `[AiThink+0x7B30]`; `+0x158` = state (Lua `IsBattleState` `0x5E4F40`:
+///   == 3, `IsFindState` `0x5E5370`: == 2).
+/// - Slot list head `[ts+0x18]`, node next `+0x10`; the battle target slot is the
+///   `TargetSearchSysSlot_NormalEnemy` node (vtable `0x2965430`, type 1, `0x62D7B0`); its
+///   target kind `node+0x28` (1 = chr) and the target's chr handle `node+0x50` (accessor
+///   `node+0x48`, handle `+8`, `0x613840`). A chr's own handle is `chr+8`.
+pub(crate) mod aiview {
+    use crate::game::{module_base, read, read_ptr};
+    use crate::peers::PeerId;
+
+    const COM_MANIP: usize = 0x2000;
+    const ACTIVE_MANIP: usize = 0x58;
+    const THINK: usize = 0x340;
+    const TARGETING: usize = 0x7B30;
+    const TS_STATE: usize = 0x158;
+    const TS_SLOTS: usize = 0x18;
+    const NODE_NEXT: usize = 0x10;
+    const NODE_KIND: usize = 0x28;
+    const NODE_HANDLE: usize = 0x50;
+    const NORMAL_ENEMY_VT: usize = 0x2965430;
+    pub const STATE_BATTLE: i32 = 3;
+    pub const STATE_FIND: i32 = 2;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct View {
+        /// Our machine runs this enemy's AI (ComManipulator active).
+        pub ai_here: bool,
+        pub state: i32,
+        /// The battle target's chr handle, if a chr is targeted.
+        pub target: Option<i32>,
+    }
+
+    pub fn read_view(chr: usize) -> Option<View> {
+        let com = read_ptr(chr + COM_MANIP).filter(|&p| p != 0)?;
+        let ai_here = read_ptr(chr + ACTIVE_MANIP) == Some(com);
+        let ts = read_ptr(read_ptr(com + THINK).filter(|&p| p != 0)? + TARGETING).filter(|&p| p != 0)?;
+        let state = read::<i32>(ts + TS_STATE)?;
+        let vt = module_base() + NORMAL_ENEMY_VT;
+        let mut node = read_ptr(ts + TS_SLOTS).unwrap_or(0);
+        let mut target = None;
+        for _ in 0..32 {
+            if node == 0 {
+                break;
+            }
+            if read_ptr(node) == Some(vt) && read::<i32>(node + NODE_KIND) == Some(1) {
+                target = read::<i32>(node + NODE_HANDLE).filter(|&h| h != -1);
+                break;
+            }
+            node = read_ptr(node + NODE_NEXT).unwrap_or(0);
+        }
+        Some(View { ai_here, state, target })
+    }
+
+    /// Whose chr a handle is: our player, a peer's native remote, else None.
+    pub fn player_of(handle: i32) -> Option<&'static str> {
+        let h = |c: usize| read::<i32>(c + 8);
+        if crate::game::player().is_some_and(|p| h(p.0) == Some(handle)) {
+            return Some("us");
+        }
+        (0..crate::peers::MAX_PLAYERS as u8)
+            .filter_map(|s| crate::native::chr_of_peer(PeerId(s)))
+            .any(|c| h(c) == Some(handle))
+            .then_some("a peer's copy")
+    }
+
+    pub fn describe(chr: usize) -> String {
+        match read_view(chr) {
+            None => "AI unreadable".into(),
+            Some(v) => format!(
+                "AI {} state {} ({}) target {}",
+                if v.ai_here { "here" } else { "elsewhere (NetAI; stale)" },
+                v.state,
+                match v.state {
+                    STATE_BATTLE => "battle",
+                    STATE_FIND => "find",
+                    _ => "other",
+                },
+                match v.target {
+                    None => "none".to_string(),
+                    Some(t) => format!("{t:#x} ({})", player_of(t).unwrap_or("not a player")),
+                }
+            ),
+        }
+    }
+}
+
 /// v8.46 diagnostics: what became of the enemy a throw (type 18) was aimed at. A friend's deathblow on a
 /// last-life boss twice left it at 1 HP on both machines (live 2026-10-26, enemy 1110850, third throw
 /// killed it); this logs the defender's HP / lives / owner at +1 s, +3 s and +6 s after every throw, sent or
@@ -7789,7 +7879,8 @@ mod dblock_tests {
 mod throw_probe {
     use super::*;
 
-    const AFTER_MS: [u64; 3] = [1000, 3000, 6000];
+    /// test6: +0 = the first frame after the throw packet (posture / AI state at the throw).
+    const AFTER_MS: [u64; 4] = [0, 1000, 3000, 6000];
     const MAX_LINES: u32 = 400;
 
     struct Probe {
@@ -7823,12 +7914,17 @@ mod throw_probe {
         let entity = chr.entity_id().unwrap_or(-1);
         let owned = owned_here(defender);
         let forced = ownfill::forced(defender);
+        let posture = crate::game::read_ptr(chr.0 + 0x1FF8)
+            .and_then(|m| crate::game::read_ptr(m + 0x18))
+            .and_then(|d| crate::game::read::<i32>(d + 0x148))
+            .map_or("?".to_string(), |p| p.to_string());
+        let ai = super::aiview::describe(chr.0);
         match crate::livesync::read_data(chr) {
             Some((_, hp, max_hp, max_posture, lives)) => format!(
-                "entity {entity} hp {hp}/{max_hp} lives {lives} (of {}) max posture {max_posture} owned here {owned} forced {forced}",
+                "entity {entity} hp {hp}/{max_hp} lives {lives} (of {}) posture {posture}/{max_posture} owned here {owned} forced {forced}; {ai}",
                 crate::livesync::lives0_of(chr)
             ),
-            None => format!("entity {entity} (data unreadable) owned here {owned} forced {forced}"),
+            None => format!("entity {entity} (data unreadable) posture {posture} owned here {owned} forced {forced}; {ai}"),
         }
     }
 
