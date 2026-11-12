@@ -337,6 +337,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::BOSS_REWARD.store(ini.flag("boss_reward", true, warn), Relaxed);
     tuning::AUTO_FOLLOW.store(ini.flag("auto_follow", false, warn), Relaxed);
     tuning::JOIN_REST.store(ini.flag("join_rest", true, warn), Relaxed);
+    crate::world::REST_REFILLS_PARTNER.store(ini.flag("rest_refills_partner", true, warn), Relaxed);
     tuning::DEATH_DEBUFFS.store(ini.flag("death_debuffs", true, warn), Relaxed);
     tuning::INGAME_MENU.store(ini.flag("ingame_menu", false, warn), Relaxed);
     tuning::INGAME_MENU_KEY.store(ini.num("ingame_menu_key", 45, 0, 255, warn), Relaxed);
@@ -563,6 +564,11 @@ spectate_replay_load = 1
 boss_expel = 0
 ; 1 (default) = after a death reload you wake with full HP, gourd, Resurrection and restocked items, like a rest, but enemies do not respawn. 0 = off.
 death_refill = 1
+; 1 (default, as in every build so far) = when the friend rests at an idol, you are refilled
+; too (HP, gourd, Resurrection, status ailments cleared, items restocked) even if you did not
+; sit. 0 = the friend's rest still respawns the enemies and still wakes you if you are dead,
+; but a living you keeps your HP, gourd and items until you rest yourself. Per player.
+rest_refills_partner = 1
 ; Boss fights: the friend also receives the boss's item rewards.
 boss_reward = 1
 ; 1 = follow the friend's idol warps automatically. 0 = free travel.

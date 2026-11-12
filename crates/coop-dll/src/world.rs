@@ -1027,7 +1027,14 @@ impl World {
         log::line(&format!("world: join rest at idol {idol} (ok = {ok}), not told to the friend"));
     }
 
+    /// `rest_refills_partner = 0` (test5): the friend's rest respawns the world but leaves a
+    /// living us as we are. `[V]` notes: the idol's `0x3AFEB98` mailbox (REST_REQUEST) only
+    /// runs `Rest(player)` 0xA2BE40 (HP, gourd, Resurrection, status), `0x3AFEBA0`
+    /// (RESPAWN_REQUEST) alone is the respawn the game's Lua `Util_RequestRespawn` also writes
+    /// alone (docs/RE-DEATH-RESET.md). NOT verified live with the BA0 write alone; restsync.rs
+    /// falls back to AllChrRespawn if the respawn does not show within its check.
     fn apply_rest(&mut self, from: PeerId, idol: i32, block: i32) {
+        let refill = REST_REFILLS_PARTNER.load(Ordering::Relaxed);
         let here = game::current_block().unwrap_or(-2);
         self.rest_from_friend_at = Some(Instant::now());
         // A rest ends the resting peer's boss fight, whatever we do with it.
@@ -1056,15 +1063,23 @@ impl World {
             let ok = respawn_all_noted(idol);
             // v8.14: a rest by anybody is a rest for everybody: HP, gourd, resurrection and the
             // item restock too, which the idol would only do in its own block.
+            if !refill {
+                log::line(&format!("world: friend rested at idol {idol} in block {block}, we are in {here}: enemies reset directly (ok = {ok}), no refill here (rest_refills_partner = 0)"));
+                return;
+            }
             let refilled = refill_player_direct();
             log::line(&format!("world: friend rested at idol {idol} in block {block}, we are in {here}: enemies reset directly (ok = {ok}), refilled and restocked directly (ok = {refilled})"));
             return;
         }
-        let ok = game::write(base() + REST_REQUEST, idol) && game::write(base() + RESPAWN_REQUEST, idol);
+        let ok = (!refill || game::write(base() + REST_REQUEST, idol)) && game::write(base() + RESPAWN_REQUEST, idol);
         // `OnEvent_BonfireRespawn` (0x69B030) = both mailboxes + the item restock 0x7A95B0: the
         // mailboxes alone left the friend's Spirit Emblems / pellets unrestocked (live 2026-10-25).
-        let restocked = ok && restock_items();
-        log::line(&format!("world: friend rested at idol {idol}, resting here too (ok = {ok}), items restocked (ok = {restocked})"));
+        let restocked = ok && refill && restock_items();
+        if refill {
+            log::line(&format!("world: friend rested at idol {idol}, resting here too (ok = {ok}), items restocked (ok = {restocked})"));
+        } else {
+            log::line(&format!("world: friend rested at idol {idol}: respawn mailbox only (ok = {ok}), no refill here (rest_refills_partner = 0)"));
+        }
         // restsync.rs checks that the idol's mailbox really respawned our enemies (else
         // it calls AllChrRespawn directly) and keeps the host's dead from killing ours.
         if ok {
@@ -1522,6 +1537,11 @@ fn down_mask(peers: impl Iterator<Item = (u8, bool)>) -> u32 {
 /// `[GAMEPLAY] shop_stock_per_player`: the limited-stock counter bits (`shop_counter_bits`) are
 /// per player too. Read when the set is built (the first flag after the params load).
 pub static SHOP_STOCK_PER_PLAYER: AtomicBool = AtomicBool::new(true);
+
+/// `[GAMEPLAY] rest_refills_partner` (test5, default on = the behaviour since the first
+/// release): another player's rest refills a living us too (`apply_rest`). 0 = only the
+/// respawn; a dead us is still woken (bossrules.rs `rest_while_dead`, unchanged).
+pub static REST_REFILLS_PARTNER: AtomicBool = AtomicBool::new(true);
 
 static ITEM_FLAGS: std::sync::OnceLock<std::collections::HashSet<u32>> = std::sync::OnceLock::new();
 
