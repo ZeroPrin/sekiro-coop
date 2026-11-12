@@ -90,8 +90,10 @@ pub enum Step {
 
 /// One peer's frame. `held` = (chr, original team) we hold; `cur` = (its native remote now,
 /// its team now); `own_team` = the team the remote should have now when nobody hides it
-/// (`REMOTE_TEAM`, or `PVP_TEAM` while pvp.rs puts friendly fire on it).
-pub fn replica_step(held: Option<(usize, u32)>, cur: Option<(usize, u32)>, want: bool, own_team: u32) -> Step {
+/// (`REMOTE_TEAM`, or `PVP_TEAM` while pvp.rs puts friendly fire on it); `enabled` =
+/// `dead_players_untargetable`; `ours` = this module itself wrote `HIDDEN_TEAM` to `cur`'s chr
+/// and has not given it back (`WROTE`).
+pub fn replica_step(held: Option<(usize, u32)>, cur: Option<(usize, u32)>, want: bool, own_team: u32, enabled: bool, ours: bool) -> Step {
     match (held, cur) {
         (Some((h, _)), c) if c.map(|c| c.0) != Some(h) => Step::Forget,
         (Some((_, orig)), Some((_, team))) => {
@@ -104,9 +106,10 @@ pub fn replica_step(held: Option<(usize, u32)>, cur: Option<(usize, u32)>, want:
             }
         }
         (None, Some((_, team))) if want => Step::Hide { orig: if team == HIDDEN_TEAM { REMOTE_TEAM } else { team } },
-        // Review m2: on team 0, not ours to hold and not to hide (a hub rebuilt after a panic,
-        // a hold forgotten): the remote gets its own team back.
-        (None, Some((_, HIDDEN_TEAM))) => Step::Unhide { team: own_team },
+        // Review m2: on team 0, not held and not to hide (a hold lost to a panic): the remote
+        // gets its own team back, but only if WE wrote that 0 (a team 0 from the game or
+        // anything else is left alone) and never with the feature off.
+        (None, Some((_, HIDDEN_TEAM))) if enabled && ours => Step::Unhide { team: own_team },
         _ => Step::Nothing,
     }
 }
@@ -162,6 +165,14 @@ pub fn replica_dead(h: &mut Hyst, s: Seen, held: bool, now: Instant) -> bool {
     }
 }
 
+/// The stray team-0 restore logs at most once per remote per this long.
+pub const UNHIDE_LOG_GAP: Duration = Duration::from_secs(10);
+
+/// Pure: log a rate-limited line now? `last` = when the previous one was logged.
+pub fn log_due(last: Option<Instant>, now: Instant, gap: Duration) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= gap)
+}
+
 /// Why a hold ends (log text).
 pub fn restore_reason(enabled: bool, connected: bool, dead: bool, other_alive: bool) -> &'static str {
     if !enabled {
@@ -187,6 +198,10 @@ struct Held {
 }
 
 static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
+/// (peer, chr) this module wrote `HIDDEN_TEAM` to and has not given back yet. Outlives a
+/// `HELD` entry lost to a panic, so only our own stray team 0 is ever restored (`Step::Unhide`).
+/// Lock order: `HELD` before `WROTE`.
+static WROTE: Mutex<Vec<(PeerId, usize)>> = Mutex::new(Vec::new());
 /// We wrote 1 into the hide byte (and it was 0 before).
 static HIDE_SET: AtomicBool = AtomicBool::new(false);
 
@@ -198,6 +213,19 @@ pub fn holds(chr: usize) -> bool {
 /// Review m1: a panic while the lock was held must not leave a remote at team 0 for good.
 fn held() -> std::sync::MutexGuard<'static, Vec<Held>> {
     HELD.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn wrote() -> std::sync::MutexGuard<'static, Vec<(PeerId, usize)>> {
+    WROTE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn wrote_has(peer: PeerId, chr: usize) -> bool {
+    wrote().contains(&(peer, chr))
+}
+
+/// Our team 0 on this chr is gone (written back, or the chr was deleted).
+fn unmark(peer: PeerId, chr: usize) {
+    wrote().retain(|&w| w != (peer, chr));
 }
 
 /// puppet.rs (review m4): our warp without a loading screen (hands off, boss expulsion, stuck
@@ -219,10 +247,13 @@ fn clear_hide(why: &str) {
 fn restore_one(h: &Held, why: &str) {
     if native::live_remote(h.chr) != Some(h.peer) {
         log::line(&format!("corpse: peer {}'s native remote {:#x} is gone ({why}): nothing to restore", h.peer.slot(), h.chr));
+        unmark(h.peer, h.chr);
         return;
     }
     let t = restore_team(h.orig);
-    write::<u32>(h.chr + CHR_TEAM, t);
+    if write::<u32>(h.chr + CHR_TEAM, t) {
+        unmark(h.peer, h.chr);
+    }
     log::line(&format!("corpse: peer {}'s native remote {:#x}: team {HIDDEN_TEAM} -> {t} restored ({why})", h.peer.slot(), h.chr));
 }
 
@@ -249,6 +280,7 @@ pub fn on_loading() {
         log::line(&format!("corpse: loading screen, {} hidden remote(s) forgotten (the world is rebuilt)", g.len()));
         g.clear();
     }
+    wrote().clear();
 }
 
 /// Owned by the puppet hub: a dropped hub (frame panic) restores everything.
@@ -258,6 +290,8 @@ pub struct Corpse {
     foreign_logged: bool,
     /// Review m3: per-peer hysteresis of the replica's dead / unknown state.
     hyst: HashMap<PeerId, Hyst>,
+    /// Per peer: when the stray team-0 restore was last logged (`UNHIDE_LOG_GAP`).
+    unhide_log_at: HashMap<PeerId, Instant>,
 }
 
 impl Drop for Corpse {
@@ -302,6 +336,7 @@ impl Corpse {
         // Every peer's native remote.
         let mut held = held();
         self.hyst.retain(|id, _| peers.iter().any(|p| p.id == *id));
+        self.unhide_log_at.retain(|id, _| peers.iter().any(|p| p.id == *id));
         for p in peers.iter() {
             let pos = held.iter().position(|h| h.peer == p.id);
             // Review m3: dead for 0.5 s before hiding, 1 s without a fresh state before
@@ -312,12 +347,16 @@ impl Corpse {
             let want = hide_replica(enabled, connected, dead, other_alive);
             let cur = p.native.and_then(|c| read::<u32>(c.0 + CHR_TEAM).map(|t| (c.0, t)));
             let own_team = if crate::pvp::wants_coop_npc_team(p.id) { PVP_TEAM } else { REMOTE_TEAM };
-            match replica_step(pos.map(|i| (held[i].chr, held[i].orig)), cur, want, own_team) {
+            let ours = cur.is_some_and(|(c, _)| wrote_has(p.id, c));
+            match replica_step(pos.map(|i| (held[i].chr, held[i].orig)), cur, want, own_team, enabled, ours) {
                 Step::Nothing => {}
                 Step::Hide { orig } => {
                     let Some((chr, _)) = cur else { continue };
                     if native::live_remote(chr) != Some(p.id) {
                         continue;
+                    }
+                    if !wrote_has(p.id, chr) {
+                        wrote().push((p.id, chr));
                     }
                     write::<u32>(chr + CHR_TEAM, HIDDEN_TEAM);
                     held.push(Held { peer: p.id, chr, orig });
@@ -332,12 +371,19 @@ impl Corpse {
                     if let Some((chr, _)) = cur
                         && native::live_remote(chr) == Some(p.id)
                     {
-                        write::<u32>(chr + CHR_TEAM, team);
-                        log::line(&format!(
-                            "corpse: peer {}'s native remote {chr:#x} was on team {HIDDEN_TEAM} without our hold: team {team} restored ({})",
-                            p.id.slot(),
-                            if team == PVP_TEAM { "friendly fire on it" } else { "its own team" }
-                        ));
+                        let ok = write::<u32>(chr + CHR_TEAM, team);
+                        if ok {
+                            unmark(p.id, chr);
+                        }
+                        if log_due(self.unhide_log_at.get(&p.id).copied(), now, UNHIDE_LOG_GAP) {
+                            self.unhide_log_at.insert(p.id, now);
+                            log::line(&format!(
+                                "corpse: peer {}'s native remote {chr:#x} was on our team {HIDDEN_TEAM} without a hold: team {team} {} ({})",
+                                p.id.slot(),
+                                if ok { "restored" } else { "write failed, retried" },
+                                if team == PVP_TEAM { "friendly fire on it" } else { "its own team" }
+                            ));
+                        }
                     }
                 }
                 Step::Rewrite => {
@@ -357,6 +403,7 @@ impl Corpse {
                 Step::Forget => {
                     if let Some(i) = pos {
                         let h = held.remove(i);
+                        unmark(h.peer, h.chr);
                         log::line(&format!(
                             "corpse: peer {}'s native remote {:#x} was replaced or removed: nothing to restore",
                             h.peer.slot(),
@@ -374,6 +421,7 @@ impl Corpse {
             }
             here
         });
+        wrote().retain(|(id, _)| peers.iter().any(|p| p.id == *id));
     }
 }
 
@@ -410,58 +458,86 @@ mod tests {
     const A: usize = 0x1000;
     const B: usize = 0x2000;
 
+    /// The feature on and every team 0 on `cur` written by us.
+    fn step(held: Option<(usize, u32)>, cur: Option<(usize, u32)>, want: bool, own_team: u32) -> Step {
+        replica_step(held, cur, want, own_team, true, true)
+    }
+
+    /// Review (test6 final): a team 0 we did not write, or any with the feature off, is
+    /// never "restored"; held replicas behave as before either way.
+    #[test]
+    fn stray_restore_only_for_our_own_team_0() {
+        assert_eq!(replica_step(None, Some((A, 0)), false, 2, true, false), Step::Nothing, "not written by us");
+        assert_eq!(replica_step(None, Some((A, 0)), false, 2, false, true), Step::Nothing, "dead_players_untargetable = 0");
+        assert_eq!(replica_step(None, Some((A, 0)), false, 2, false, false), Step::Nothing);
+        assert_eq!(replica_step(None, Some((A, 0)), false, 28, true, true), Step::Unhide { team: 28 });
+        // Held: unchanged by the new gate.
+        assert_eq!(replica_step(Some((A, 2)), Some((A, 0)), false, 2, false, false), Step::Restore { team: 2 });
+        assert_eq!(replica_step(Some((A, 2)), Some((A, 28)), true, 2, true, false), Step::Rewrite);
+        assert_eq!(replica_step(Some((A, 2)), Some((B, 0)), true, 2, true, false), Step::Forget);
+        assert_eq!(replica_step(None, Some((A, 0)), true, 2, true, false), Step::Hide { orig: 2 });
+    }
+
+    #[test]
+    fn unhide_log_once_per_10_s() {
+        let t = Instant::now();
+        assert!(log_due(None, t, UNHIDE_LOG_GAP));
+        assert!(!log_due(Some(t), t + Duration::from_millis(9_999), UNHIDE_LOG_GAP));
+        assert!(log_due(Some(t), t + UNHIDE_LOG_GAP, UNHIDE_LOG_GAP));
+    }
+
     /// Friend dies -> hidden; resurrects (Sekiro's own) -> restored.
     #[test]
     fn dead_then_revived() {
-        assert_eq!(replica_step(None, Some((A, 2)), false, 2), Step::Nothing);
-        assert_eq!(replica_step(None, Some((A, 2)), true, 2), Step::Hide { orig: 2 });
-        assert_eq!(replica_step(Some((A, 2)), Some((A, 0)), true, 2), Step::Nothing);
-        assert_eq!(replica_step(Some((A, 2)), Some((A, 0)), false, 2), Step::Restore { team: 2 });
+        assert_eq!(step(None, Some((A, 2)), false, 2), Step::Nothing);
+        assert_eq!(step(None, Some((A, 2)), true, 2), Step::Hide { orig: 2 });
+        assert_eq!(step(Some((A, 2)), Some((A, 0)), true, 2), Step::Nothing);
+        assert_eq!(step(Some((A, 2)), Some((A, 0)), false, 2), Step::Restore { team: 2 });
     }
 
     /// Friend respawns at the idol: the remote is deleted / recreated: never write the old one.
     #[test]
     fn respawn_or_recreated_replica_is_forgotten() {
-        assert_eq!(replica_step(Some((A, 2)), None, true, 2), Step::Forget);
-        assert_eq!(replica_step(Some((A, 2)), None, false, 2), Step::Forget);
-        assert_eq!(replica_step(Some((A, 2)), Some((B, 2)), false, 2), Step::Forget);
-        assert_eq!(replica_step(Some((A, 2)), Some((B, 2)), true, 2), Step::Forget);
+        assert_eq!(step(Some((A, 2)), None, true, 2), Step::Forget);
+        assert_eq!(step(Some((A, 2)), None, false, 2), Step::Forget);
+        assert_eq!(step(Some((A, 2)), Some((B, 2)), false, 2), Step::Forget);
+        assert_eq!(step(Some((A, 2)), Some((B, 2)), true, 2), Step::Forget);
         // Next frame the new one is judged on its own.
-        assert_eq!(replica_step(None, Some((B, 2)), true, 2), Step::Hide { orig: 2 });
-        assert_eq!(replica_step(None, Some((B, 2)), false, 2), Step::Nothing);
+        assert_eq!(step(None, Some((B, 2)), true, 2), Step::Hide { orig: 2 });
+        assert_eq!(step(None, Some((B, 2)), false, 2), Step::Nothing);
     }
 
     /// Friendly fire on: the dead copy had pvp's 28; it comes back as 2 (pvp sets 28 again).
     #[test]
     fn friendly_fire_on_and_off() {
-        assert_eq!(replica_step(None, Some((A, 28)), true, 2), Step::Hide { orig: 28 });
-        assert_eq!(replica_step(Some((A, 28)), Some((A, 0)), false, 2), Step::Restore { team: 2 });
+        assert_eq!(step(None, Some((A, 28)), true, 2), Step::Hide { orig: 28 });
+        assert_eq!(step(Some((A, 28)), Some((A, 0)), false, 2), Step::Restore { team: 2 });
         // Something wrote a team while we hold it: hidden again, original kept.
-        assert_eq!(replica_step(Some((A, 2)), Some((A, 28)), true, 2), Step::Rewrite);
-        assert_eq!(replica_step(Some((A, 2)), Some((A, 2)), true, 2), Step::Rewrite);
+        assert_eq!(step(Some((A, 2)), Some((A, 28)), true, 2), Step::Rewrite);
+        assert_eq!(step(Some((A, 2)), Some((A, 2)), true, 2), Step::Rewrite);
     }
 
     /// A hub rebuilt after a panic finds team 0 on a remote: its own team is 2.
     #[test]
     fn found_hidden_after_a_reset() {
-        assert_eq!(replica_step(None, Some((A, 0)), true, 2), Step::Hide { orig: 2 });
+        assert_eq!(step(None, Some((A, 0)), true, 2), Step::Hide { orig: 2 });
     }
 
     #[test]
     fn no_remote_nothing_to_do() {
-        assert_eq!(replica_step(None, None, true, 2), Step::Nothing);
-        assert_eq!(replica_step(None, None, false, 2), Step::Nothing);
+        assert_eq!(step(None, None, true, 2), Step::Nothing);
+        assert_eq!(step(None, None, false, 2), Step::Nothing);
     }
 
     /// Review m2: a remote left on team 0 without our hold goes back to its own team (2), or to
     /// pvp's 28 while friendly fire is on it; a held one or a wanted one is not touched here.
     #[test]
     fn stray_hidden_team_is_restored() {
-        assert_eq!(replica_step(None, Some((A, 0)), false, 2), Step::Unhide { team: 2 });
-        assert_eq!(replica_step(None, Some((A, 0)), false, 28), Step::Unhide { team: 28 });
-        assert_eq!(replica_step(None, Some((A, 2)), false, 28), Step::Nothing, "pvp sets 28 itself");
-        assert_eq!(replica_step(None, Some((A, 0)), true, 2), Step::Hide { orig: 2 });
-        assert_eq!(replica_step(Some((A, 2)), Some((A, 0)), true, 2), Step::Nothing);
+        assert_eq!(step(None, Some((A, 0)), false, 2), Step::Unhide { team: 2 });
+        assert_eq!(step(None, Some((A, 0)), false, 28), Step::Unhide { team: 28 });
+        assert_eq!(step(None, Some((A, 2)), false, 28), Step::Nothing, "pvp sets 28 itself");
+        assert_eq!(step(None, Some((A, 0)), true, 2), Step::Hide { orig: 2 });
+        assert_eq!(step(Some((A, 2)), Some((A, 0)), true, 2), Step::Nothing);
     }
 
     #[test]
