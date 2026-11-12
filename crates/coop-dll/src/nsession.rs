@@ -8012,13 +8012,24 @@ pub(crate) mod aiview {
 /// v8.46 diagnostics: what became of the enemy a throw (type 18) was aimed at. A friend's deathblow on a
 /// last-life boss twice left it at 1 HP on both machines (live 2026-10-26, enemy 1110850, third throw
 /// killed it); this logs the defender's HP / lives / owner at +1 s, +3 s and +6 s after every throw, sent or
-/// received, so the next time shows which machine did not take the kill. Game thread only; at most 400 lines.
+/// received, so the next time shows which machine did not take the kill (test6: also +0 s). Game thread
+/// only; at most `MAX_LINES` (134 throws' worth).
 mod throw_probe {
     use super::*;
 
     /// test6: +0 = the first frame after the throw packet (posture / AI state at the throw).
     const AFTER_MS: [u64; 4] = [0, 1000, 3000, 6000];
-    const MAX_LINES: u32 = 400;
+    /// Throws whose lines fit the budget (the old 400 lines at 3 lines a throw, rounded up).
+    const MAX_THROWS: u32 = 134;
+    /// Review m6: the budget grows with the added `+0 s` line (134 throws x 4 = 536 lines).
+    pub(super) const MAX_LINES: u32 = MAX_THROWS * AFTER_MS.len() as u32;
+
+    #[cfg(test)]
+    #[test]
+    fn line_budget_keeps_the_throw_count() {
+        assert_eq!(MAX_LINES, 536);
+        assert!(MAX_LINES >= 400 * AFTER_MS.len() as u32 / 3);
+    }
 
     struct Probe {
         defender: u16,
