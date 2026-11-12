@@ -45,7 +45,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `pvp_dry_run` | DEBUG | 0 | Friendly fire |
 | `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | Friendly fire |
 | `wardrobe`, `wardrobe_key`, `wardrobe_pad`, `wardrobe_pad_button`, `wardrobe_reload` | DISPLAY | 1, 113 (F2), 1, none, 0 | Wardrobe |
-| `wardrobe_all_parts` | DISPLAY | 0 (1 = also the combinations that render wrong: Sculptor skin/legs, Shura head/legs off the Shura skin, Tengu skin with other legs) | Wardrobe, `docs/RE-REMOTE-FX.md` |
+| `wardrobe_all_parts` | DISPLAY | 0 (1 = also the combinations that render wrong: Shura head/legs off the Shura skin, Tengu skin with other legs) | Wardrobe, `docs/RE-REMOTE-FX.md` |
 | `wardrobe_skin`, `wardrobe_head`, `wardrobe_legs`, `wardrobe_original`, `wardrobe_added`, `wardrobe_owner` | DISPLAY | game, skin, skin, empty, empty, empty (written by the panel) | Wardrobe |
 | `fx_speffect_mirror` | DEBUG | 1 (0 off, 2 = also enchant states) | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 | `native_full_parts` | DEBUG | 1 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
@@ -555,8 +555,10 @@ choice other than "As in game" is made. The native Co-op Settings page has no ro
 the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
 
 - **Choices.** Skin (torso + prosthetic arm + default head / legs): Wolf, Shura, Ashina,
-  Tengu, Sculptor (the cutscene set; its arm 202000 has no left arm, so the Wolf's 102000).
-  Head: as skin or any of the five (Shura brings its hair 304000 in protector slot 16). Legs:
+  Tengu. The Sculptor's skin, head and legs are no longer offered (test5, user decision: the
+  body is not rigged right, the head barely differs); `sculptor` in the ini acts as game / skin,
+  and "As in game" still removes its added rows 200000-203000.
+  Head: as skin or any of the four (Shura brings its hair 304000 in protector slot 16). Legs:
   as skin or the ones that fit the torso: Shura / Tengu torsos carry the bare body and the
   param has no hide flags, so only 303000 / 503000; the others 103000, 153000, 403000, 203000.
   A skin change that makes the legs unfit sets them back to "as skin". The torso keeps the

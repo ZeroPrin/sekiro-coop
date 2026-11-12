@@ -787,9 +787,10 @@ wardrobe_pad = 1
 wardrobe_pad_button = none
 ; Written by the panel (you may edit them with the game closed):
 ; skin: game (= as in game; restores what you wore before the wardrobe), wolf, shura, ashina,
-; tengu, sculptor. head: skin (= as the skin), wolf, shura, ashina, tengu, sculptor.
-; legs: skin, wolf, wolf_tabi, shura, ashina, tengu, sculptor (Shura / Tengu skins take only
-; shura / tengu legs, the others only wolf / wolf_tabi / ashina / sculptor).
+; tengu. head: skin (= as the skin), wolf, shura, ashina, tengu.
+; legs: skin, wolf, wolf_tabi, shura, ashina, tengu (Shura / Tengu skins take only
+; shura / tengu legs, the others only wolf / wolf_tabi / ashina). The Sculptor's parts are
+; no longer offered: sculptor (from an older build) acts as game / skin.
 wardrobe_skin = game
 wardrobe_head = skin
 wardrobe_legs = skin
@@ -804,9 +805,9 @@ wardrobe_owner =
 ;     on your own character, may crash). 0 = only change the equipment, as the game's own
 ;     event script does; the look may then update only after the next load screen.
 wardrobe_reload = 0
-; 0 = only combinations that render right: no Sculptor skin / legs (dark, untextured), Shura's
-;     head and legs only with the Shura skin, the Tengu skin only with Tengu legs (these parts
-;     borrow textures from each other). 1 = everything, also the broken-looking ones.
+; 0 = only combinations that render right: Shura's head and legs only with the Shura skin,
+;     the Tengu skin only with Tengu legs (these parts borrow textures from each other).
+;     1 = also those broken-looking combinations (the Sculptor's parts never).
 wardrobe_all_parts = 0
 
 [ADVANCED]
