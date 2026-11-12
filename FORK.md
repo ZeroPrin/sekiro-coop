@@ -54,6 +54,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `log_per_run` | DISPLAY | 1 (next start) | Base fixes from 1.0.11 |
 | `send_logs_key` | DISPLAY | 118 (F7; 0 = off) | Base fixes from 1.0.11 |
 | `fix_debug_item_unlocks` | DEBUG | 1 | Co-op items unlocked diving |
+| `ai_retarget` | DEBUG | 1 (0 off; 1 observe and log, scores never changed) | Enemy target choice, observed |
 | `sync_objact` | GAMEPLAY | 1 (0 off; 1 every kind: doors, gates, chests, levers / lift, bells, rotating walls, windows; 2 = 1) | ObjAct sync |
 | `objact_debug` | DEBUG | 0 | ObjAct sync |
 | `objact_sender` | DEBUG | hook (or poll) | ObjAct sync |
@@ -897,6 +898,36 @@ or float (Ghidra typed it float).
    deflected / dodged hits, behavior ids and melee / bullet of tools), the 10 s counters, any crash.rs breadcrumb.
 6. End the session (Severed Thread): `pvp: player-vs-player damage off (no link)`; a remote
    that is still there gets `team ... restored`.
+
+## Enemy target choice, observed (`[DEBUG] ai_retarget`, default 1; test7, NOT verified live)
+
+Groundwork for a later "who does the enemy fight" model; this build changes nothing in the game.
+The engine scores every target record of an AI each frame and fights the highest
+(`docs/RE-AI-TARGET.md` §3): `targetPriority + (1 - dist/1000) * hitF * topF + 50` for the current
+target, except on replan frames. `aitarget.rs` detours the score function `0x61DE40`, calls the
+original and returns its value unchanged. With `ai_retarget = 1` it samples the records whose target
+is a player (ours or a friend's native remote, matched by chr handle) into a fixed table; the frame
+task writes the `aitarget:` lines. It runs only where the enemy's AI runs (the owner); NetAI copies
+have no targeting system. `ai_retarget = 0`: the hook returns at once (0 at start: not installed;
+switching to 1 later installs it). Offsets and their sources are in the module header.
+
+Log lines (only enemies that know both players, or events that involve the friend):
+- `aitarget: <cNNNN id E (ptr, hp)> TARGET me -> peer1 (on a replan frame | NOT a replan frame; old
+  held 12.4s): new ... | old ...`: the top record changed. Each candidate is written as `score S =
+  dist D m x hitF H (hit Xs ago, w W) x topF T + bonus B [top] resid R; rec state N seen|unseen`.
+  `resid` = score minus our reconstruction (targetPriority, or a stale distance).
+- `aitarget: ... HIT by peer1 (hp N) registered on this PC's AI (top me): ...`: the hit timer of
+  that player's record went back to 10 s. A `HIT by peer1` on the owner answers RE-AI-TARGET §9.3
+  (the friend's hits reach the owner's AI).
+- `aitarget: ... knows peer1 (hp N) now: ...`: a record for that player appeared.
+- `aitarget: ... replan frame (no +50): <both candidates> | best X , top Y for Ns` or `... hold: ...`,
+  at most once a second per enemy: the raw choice on the latest replan frame, else the current scores.
+- `aitarget: ... last 10s: N replan frame(s) (M with 2+ players), K top change(s), hits seen me 2,
+  peer1 1`: how often the engine replans (§9.1).
+- `aitarget: score calls N/s, M/s about a player, K sample(s) dropped (table busy)`: cost check.
+
+Not seen: records frozen above 100 and records about non-players. Damage share per player is not
+tracked by the crate; the hit timer per record (seconds since that player's last hit) stands in.
 
 ## Working on this fork
 
