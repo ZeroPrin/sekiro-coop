@@ -546,7 +546,9 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
             log::line(&format!(
                 "boss: DEFEATED entity {} netId {n:#x} (lives {lives_read}/{lives0}, max HP {max_hp}, seen here: {})",
                 chr.entity_id().unwrap_or(-1),
-                if nsession::owned_here(n) { "owned here" } else { "owned by another player" }
+                // Label only (test6): the owner answer can already be gone at the death (the boss
+                // was ours, forced, a frame earlier), so "another player" was misleading.
+                if nsession::owned_here(n) { "owner answer here" } else { "owner answer not here now (it may have run here until its death)" }
             ));
         }
         let mut refilled_now = false;

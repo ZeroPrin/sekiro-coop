@@ -318,7 +318,9 @@ pub fn note_enemy_death(id: i32, ours: bool) {
     };
     log::line(&format!(
         "resurrect: enemy {id} died ({}): our lock {before:.1} (3 s ago) -> {:.1} now, we are {}; {}",
-        if ours { "our kill" } else { "not our kill" },
+        // Label only (test6): `ours` = the game paid the kill to us itself; a deathblow of ours
+        // whose kill credit the game gave elsewhere read "not our kill".
+        if ours { "kill paid to us by the game" } else { "kill not paid to us by the game" },
         s.lock,
         if s.alive { "alive" } else { "dead" },
         nodes_text()
