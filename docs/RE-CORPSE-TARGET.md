@@ -150,3 +150,29 @@ follows the owner's HP, so the copy can reach HP 0).
 Open [I]: whether the battle slot of a boss times out quickly once the corpse is not
 perceived (NpcThinkParam `+0x80` per boss); whether team 0 on a remote player has an effect
 outside the AI search, lock-on and hit matrices (none found in the callers read here).
+
+## 6. What gates a stealth deathblow (second incident, elite 1500495)
+
+- The player's throw search (`0xBE0E50` -> finder `0xBDF930` -> `0xBDE5C0` -> candidates
+  `0xBE2A30` -> defender gate `0xBE3810`, RE-BACKSTAB.md) has no awareness or AI-state test
+  of its own [VAR, upstream IDA]. The defender side is the enemy's own throwable state
+  (ThrowModule `+0x7A` from TAE event 932, else `+0x7B` from HKS act 161) checked against the
+  kind's category (`0xBE0A40`, table `0x2A8DE90`), plus `defAliveCheck`.
+- ThrowParam rows for the PC stealth kinds 0 / 100 / 10000 / 10100 need no SpEffect on either
+  side (`additionalConditionSpecialEffect_forAtk/forDef` = -1 on all 98 rows) [VAR, param CSV].
+- So "unaware" is decided by the enemy's behaviour script / animations, which are not in the
+  executable. The AI state the script can query is per AI, not per target: Lua
+  `IsBattleState` = `[AiThink+0x7B30]+0x158 == 3`, `IsFindState` == 2 (`0x5E4F40`,
+  `0x5E5370`); the state lives on the TargetingSystem (`0x61FF40` writes `+0x158`). Its
+  battle target is the NormalEnemy slot (§1). Whether the scripts open the "behind" window
+  while in battle with someone else could not be read [ARV: they do in vanilla when enemies
+  fight NPCs; the incident fits "AI fought the friend's copy"].
+- Implemented as an option only, `[GAMEPLAY] stealth_deathblow_needs_no_combat = 0`
+  (dblock `stealth_vetoed`): category 0 / 1 kind, AI running here, state 3, a player as the
+  battle target, posture > 0 and HP > 1 -> refused at `0xBE3810`. Trade-off: it also ends
+  "one player distracts, the other deathblows from behind". Posture (category 4), plunging
+  (6 / 7) and Ninjutsu-after-posture kinds (41201-41203, category 4) are never touched.
+- Live check: the new `throwprobe: +0 s ...` line shows `posture p/max` and
+  `AI here|elsewhere state N (battle|find|other) target 0x.. (us|a peer's copy|not a
+  player)` at every deathblow; a stealth deathblow with `state 3 ... (a peer's copy)` is the
+  incident's pattern.

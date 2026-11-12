@@ -37,6 +37,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 |---|---|---|---|
 | `share_pickups` | GAMEPLAY | 1 | Shared map pickups (pickups.1-.3) |
 | `dead_players_untargetable` | GAMEPLAY | 1 (local per PC) | test6: `docs/RE-CORPSE-TARGET.md` |
+| `stealth_deathblow_needs_no_combat` | GAMEPLAY | 0 (experimental) | test6: `docs/RE-CORPSE-TARGET.md` §6 |
 | `shop_stock_per_player` | GAMEPLAY | 1 (next start) | Base fixes from 1.0.11 |
 | `getup_deathblow_veto` | GAMEPLAY | 1 | Base fixes from 1.0.11 |
 | `persist_wait_for_down` | GAMEPLAY | 1 | Base fixes from 1.0.11 |
