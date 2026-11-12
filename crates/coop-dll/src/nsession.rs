@@ -3146,8 +3146,20 @@ pub(crate) mod ownfill {
     /// Drop a held enemy because the game's own IsOwnedHere answer turned nonzero? Never for a
     /// host boss (v8.25a: our forced bit and a nonzero native answer both return 1 through the
     /// detour, so dropping only made the boss flip-flop and warp on the friend).
-    pub fn drop_on_native(me: u8, is_boss: bool) -> bool {
-        !(me == 0 && is_boss)
+    /// test6: nor for a client's boss while another player waits dead in the fight
+    /// (`rival_down`): live 2026-11-12 (miniboss 1500490, host down) the client dropped the
+    /// forced bit each time the game's answer turned 1, re-took it when the answer fell back
+    /// to 0 (the downed host is out of `boss_rivals`), three times in 45 s; every move gave the
+    /// boss a fresh AI and the client a stealth deathblow at 73 % HP. The client keeps it
+    /// until the rival is back; then the normal rules (host within `BOSS_HOST_BACK_M`) apply.
+    pub fn drop_on_native(me: u8, is_boss: bool, rival_down: bool) -> bool {
+        !(is_boss && (me == 0 || rival_down))
+    }
+
+    /// Is one of the engaged players (`slots`) waiting dead (`down`: bit per slot, world.rs
+    /// `down_slots`)?
+    pub fn rival_down(slots: impl IntoIterator<Item = u8>, down: u32) -> bool {
+        slots.into_iter().any(|s| s < 32 && down & (1 << s) != 0)
     }
 
     /// Minimum gap between two native-change log lines per boss.
@@ -3226,6 +3238,7 @@ pub(crate) mod ownfill {
             // We wait dead in a boss fight: a living player owns the boss (it gets the deathblow).
             let me_down = crate::bossrules::spectating();
             let down = crate::world::down_slots();
+            let others_down = rival_down(others.iter().map(|&(s, _)| s), down);
             let mut alive_ids = HashMap::new();
             for c in enemies() {
                 let Some(n) = netai::net_id(c) else { continue };
@@ -3251,9 +3264,15 @@ pub(crate) mod ownfill {
                         && self.diag_at.get(&n).is_none_or(|t| now.duration_since(*t) >= BOSS_DIAG_GAP)
                     {
                         self.diag_at.insert(n, now);
+                        let kept = !(go != 0 && drop_on_native(me, boss, others_down));
                         diag.push(format!(
-                            "ownfill: BOSS (boss) netId {n:#x} native owner answer {}->{go} while forced (sticky: kept)",
-                            old.unwrap_or(0)
+                            "ownfill: BOSS (boss) netId {n:#x} native owner answer {}->{go} while forced ({})",
+                            old.unwrap_or(0),
+                            if kept {
+                                "forced bit kept"
+                            } else {
+                                "forced bit dropped: the game's own answer runs it here now"
+                            }
                         ));
                     }
                 }
@@ -3261,7 +3280,7 @@ pub(crate) mod ownfill {
                     drop.push((n, "we are dead (spectating): a living player takes it"));
                     continue;
                 }
-                if go != 0 && drop_on_native(me, boss) {
+                if go != 0 && drop_on_native(me, boss, others_down) {
                     drop.push((n, "the game gives it to us now"));
                     continue;
                 }
@@ -3344,6 +3363,11 @@ pub(crate) mod ownfill {
                 set(n, true);
                 let e = c.entity_id().unwrap_or(-1);
                 if boss {
+                    // The boss's AI moves here fresh (no "noticed the player" state): no
+                    // deathblow that its posture / HP does not open for a while.
+                    if others_down {
+                        super::dblock::boss_taken(n, e);
+                    }
                     self.native.insert(n, game_owned(w, n));
                     self.log(format!(
                         "ownfill: BOSS (boss) netId {n:#x} ent {e} take why=wanted_boss game_owned={} forced={} d_me={d_me:.0} others={:?} pos={p:?} hp={:?} owners=[]",
@@ -3906,6 +3930,71 @@ pub(crate) mod dblock {
         ));
     }
 
+    // --- Fresh-take veto (test6) -------------------------------------------------------
+
+    /// After ownfill takes a boss while another player waits dead in the fight, its AI starts
+    /// fresh here (live 2026-11-12: retaken at 21:02:18, a stealth deathblow, throw 59972, at
+    /// 21:02:19 with 73 % HP and posture not broken). For this long our player's throws on it
+    /// are refused at the gate unless the boss is open to one (`justified`).
+    pub const TAKE_VETO_MS: u64 = 10_000;
+    /// Slots: `netId << 48 | until_ms` (0 = free).
+    static TAKEN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static ANY_TAKEN: AtomicBool = AtomicBool::new(false);
+    static TAKEN_VETOES: AtomicU32 = AtomicU32::new(0);
+    /// `PENDING_LOG` entries with this bit are fresh-take vetoes.
+    const PENDING_TAKEN: u32 = 0x4_0000;
+    const UNTIL_MASK: u64 = (1 << 48) - 1;
+
+    /// Pure: a deathblow / throw the boss itself opens: posture broken (`<= 0`, it counts
+    /// down) or HP at the "cannot die" floor (`<= 1`). Unknown = allowed (never block blind).
+    pub fn justified(hp: Option<i32>, posture: Option<i32>) -> bool {
+        match (hp, posture) {
+            (Some(h), Some(p)) => h <= 1 || p <= 0,
+            _ => true,
+        }
+    }
+
+    /// Pure: slot word for `net` until `until`, and whether `word` vetoes `net` at `now`.
+    pub fn take_word(net: u16, until: u64) -> u64 {
+        (net as u64) << 48 | (until & UNTIL_MASK)
+    }
+
+    pub fn take_active(word: u64, net: u16, now: u64) -> bool {
+        word != 0 && (word >> 48) as u16 == net && word & UNTIL_MASK > now
+    }
+
+    /// ownfill: boss `n` (entity `entity`) taken while a rival is down.
+    pub fn boss_taken(n: u16, entity: i32) {
+        let now = crate::game::now_ms();
+        let w = take_word(n, now + TAKE_VETO_MS);
+        // The same netId's slot, else a free / expired one, else the oldest.
+        let i = TAKEN
+            .iter()
+            .position(|a| (a.load(Ordering::Relaxed) >> 48) as u16 == n)
+            .or_else(|| TAKEN.iter().position(|a| a.load(Ordering::Relaxed) & UNTIL_MASK <= now))
+            .unwrap_or_else(|| (0..TAKEN.len()).min_by_key(|&i| TAKEN[i].load(Ordering::Relaxed) & UNTIL_MASK).unwrap_or(0));
+        TAKEN[i].store(w, Ordering::Relaxed);
+        ANY_TAKEN.store(true, Ordering::Release);
+        log::line(&format!(
+            "deathblow: boss {entity} netId {n:#x} taken while another player is down: for {} s our deathblows on it need broken posture or HP at 1 (fresh AI here)",
+            TAKE_VETO_MS / 1000
+        ));
+    }
+
+    fn taken_locked(n: u16) -> bool {
+        if !ANY_TAKEN.load(Ordering::Acquire) {
+            return false;
+        }
+        let now = crate::game::now_ms();
+        TAKEN.iter().any(|a| take_active(a.load(Ordering::Relaxed), n, now))
+    }
+
+    /// The defender's HP and posture (data module `[[chr+0x1FF8]+0x18]` `+0x130` / `+0x148`).
+    fn hp_posture(def: usize) -> (Option<i32>, Option<i32>) {
+        let data = crate::game::read_ptr(def + 0x1FF8).and_then(|m| crate::game::read_ptr(m + 0x18));
+        (data.and_then(|d| crate::game::read::<i32>(d + 0x130)), data.and_then(|d| crate::game::read::<i32>(d + 0x148)))
+    }
+
     // --- Live state ---------------------------------------------------------------------
 
     static TABLE: Mutex<Table> = Mutex::new(Table::new());
@@ -3980,7 +4069,7 @@ pub(crate) mod dblock {
         // SAFETY: the trampoline (or the original once unhooked) has this signature.
         let f: extern "C" fn(usize, usize, usize) -> u64 = unsafe { std::mem::transmute(if t != 0 { t } else { module_base() + GATE_RVA }) };
         let r = f(atk, def, kind);
-        let any = ANY.load(Ordering::Acquire) || ANY_FRESH.load(Ordering::Acquire);
+        let any = ANY.load(Ordering::Acquire) || ANY_FRESH.load(Ordering::Acquire) || ANY_TAKEN.load(Ordering::Acquire);
         if r & 0xFF == 0 || !any || atk == 0 || atk != PLAYER.load(Ordering::Relaxed) || def < 0x10000 || !crate::mod_alive() {
             return r;
         }
@@ -3994,6 +4083,13 @@ pub(crate) mod dblock {
         } else if fresh_locked(n) {
             FRESH_VETOES.fetch_add(1, Ordering::Relaxed);
             (FRESH_LOGGED[i].fetch_or(m, Ordering::Relaxed) & m == 0).then_some(PENDING_FRESH)
+        } else if taken_locked(n) && !{
+            let (hp, posture) = hp_posture(def);
+            justified(hp, posture)
+        } {
+            // One line per veto burst (the gate runs every frame while the marker is near).
+            TAKEN_VETOES.fetch_add(1, Ordering::Relaxed);
+            (TAKEN_VETOES.load(Ordering::Relaxed) == 1).then_some(PENDING_TAKEN)
         } else {
             return r;
         };
@@ -4164,9 +4260,18 @@ pub(crate) mod dblock {
                 ANY_FRESH.store(false, Ordering::Release);
             }
         }
+        if ANY_TAKEN.load(Ordering::Acquire) && TAKEN.iter().all(|a| a.load(Ordering::Relaxed) & UNTIL_MASK <= now) {
+            ANY_TAKEN.store(false, Ordering::Release);
+        }
         for s in &PENDING_LOG {
             let v = s.swap(0, Ordering::Relaxed);
-            if v & PENDING_FRESH != 0 {
+            if v & PENDING_TAKEN != 0 {
+                log_limited(format!(
+                    "deathblow: our attempt on {:#x} refused: taken from a downed player's machine less than {} s ago, posture not broken and HP above 1 (fresh-take veto)",
+                    v & 0xFFFF,
+                    TAKE_VETO_MS / 1000
+                ));
+            } else if v & PENDING_FRESH != 0 {
                 log_limited(format!(
                     "deathblow: our attempt on {:#x} refused: it lost a life less than {} s ago and gets up (fresh-life veto)",
                     v & 0xFFFF,
@@ -4181,10 +4286,10 @@ pub(crate) mod dblock {
             STATS_AT.store(now, Ordering::Relaxed);
         } else if now.saturating_sub(at) >= STATS_MS {
             STATS_AT.store(now, Ordering::Relaxed);
-            let c = [&OURS_NEW, &PEERS_NEW, &VETOES, &DROPPED, &GAVE_WAY, &MISSED, &FRESH_VETOES].map(|a| a.swap(0, Ordering::Relaxed));
+            let c = [&OURS_NEW, &PEERS_NEW, &VETOES, &DROPPED, &GAVE_WAY, &MISSED, &FRESH_VETOES, &TAKEN_VETOES].map(|a| a.swap(0, Ordering::Relaxed));
             if c.iter().any(|&x| x > 0) {
                 log::line(&format!(
-                    "deathblow: 10 s: locks ours {} / other players' {}, gate vetoes {}, their throws not applied {}, ours gave way {}, ours started during another's lock {}, fresh-life vetoes {} (gate {})",
+                    "deathblow: 10 s: locks ours {} / other players' {}, gate vetoes {}, their throws not applied {}, ours gave way {}, ours started during another's lock {}, fresh-life vetoes {}, fresh-take vetoes {} (gate {})",
                     c[0],
                     c[1],
                     c[2],
@@ -4192,6 +4297,7 @@ pub(crate) mod dblock {
                     c[4],
                     c[5],
                     c[6],
+                    c[7],
                     if TRAMP.load(Ordering::Acquire) != 0 { "hooked" } else { "not hooked" }
                 ));
             }
@@ -7170,10 +7276,28 @@ mod tests {
     #[test]
     fn a_host_boss_is_not_dropped_on_a_native_owner_answer() {
         use super::ownfill::drop_on_native;
-        assert!(!drop_on_native(0, true));
-        assert!(drop_on_native(0, false));
-        assert!(drop_on_native(1, true));
-        assert!(drop_on_native(1, false));
+        assert!(!drop_on_native(0, true, false));
+        assert!(drop_on_native(0, false, false));
+        assert!(drop_on_native(1, true, false));
+        assert!(drop_on_native(1, false, false));
+    }
+
+    /// test6, live 2026-11-12 (miniboss 1500490): with the host down the client kept dropping
+    /// and re-taking the boss on the game's flapping answer. While a rival is down the living
+    /// player's machine keeps a boss; ordinary enemies and the rival's return are unchanged.
+    #[test]
+    fn a_boss_stays_with_the_living_player_while_a_rival_is_down() {
+        use super::ownfill::{drop_on_native, rival_down};
+        assert!(!drop_on_native(1, true, true));
+        assert!(!drop_on_native(0, true, true));
+        assert!(drop_on_native(1, false, true), "ordinary enemies follow the game's answer");
+        assert!(drop_on_native(1, true, false), "rival back: as before");
+        // down bits per slot (world.rs down_slots): host (0) down, seen from the client.
+        assert!(rival_down([0u8], 0b1));
+        assert!(!rival_down([0u8], 0b10));
+        assert!(rival_down([0u8, 2], 0b100));
+        assert!(!rival_down([], 0b1), "nobody engaged");
+        assert!(!rival_down([40u8], u32::MAX), "out-of-range slot never counts");
     }
 
     #[test]
@@ -7334,6 +7458,30 @@ mod tests {
 mod dblock_tests {
     use super::dblock::*;
     use super::{NO_NET_ID, THROW_ATTACKER, THROW_DEFENDER, THROW_ID, WIRE_SLOT, put_u16};
+
+    /// test6 fresh-take veto: a posture or HP deathblow always passes; the stealth one on a
+    /// boss with posture and HP left does not (live: 73 % HP, posture not broken).
+    #[test]
+    fn fresh_take_veto_lets_real_deathblows_through() {
+        assert!(justified(Some(1), Some(500)), "HP at the cannot-die floor");
+        assert!(justified(Some(0), Some(500)));
+        assert!(justified(Some(6000), Some(0)), "posture broken (counts down)");
+        assert!(justified(Some(6000), Some(-3)));
+        assert!(!justified(Some(6263), Some(400)), "the live stealth deathblow");
+        assert!(justified(None, Some(400)), "unknown: never block blind");
+        assert!(justified(Some(6263), None));
+    }
+
+    #[test]
+    fn fresh_take_window() {
+        let w = take_word(0x380d, 11_000);
+        assert!(take_active(w, 0x380d, 1_000));
+        assert!(take_active(w, 0x380d, 10_999));
+        assert!(!take_active(w, 0x380d, 11_000), "window over");
+        assert!(!take_active(w, 0x380e, 1_000), "another enemy");
+        assert!(!take_active(0, 0, 0), "free slot");
+        assert_eq!(TAKE_VETO_MS, 10_000);
+    }
 
     #[test]
     fn first_come_and_the_host_tie_break() {
