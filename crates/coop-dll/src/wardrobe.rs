@@ -889,8 +889,9 @@ struct Calls {
     add: extern "C" fn(usize, u32, *const u32, i32, u64, u8, u8) -> i32,
     release: extern "C" fn(*mut u32),
     /// `0x79ECA0(egd, index, u8 release_handle, u8 refresh)`: unequips the entry where worn
-    /// (`0x79E750` / `0x79D100`), drops it (`0x7A8550`); the returned value is always false.
-    remove: extern "C" fn(usize, i32, u8, u8) -> bool,
+    /// (`0x79E750` / `0x79D100`), drops it (`0x7A8550`); the returned value is always 0. A u8,
+    /// not a bool: only al is set, and a bool must be 0 or 1 to be valid in Rust.
+    remove: extern "C" fn(usize, i32, u8, u8) -> u8,
     holder_from_pgd: extern "C" fn(usize, usize),
 }
 
@@ -1013,8 +1014,11 @@ fn clean_added(pgd: usize, added: &mut Vec<i32>, keep: &[i32]) {
             if left < 0 {
                 log::line(&format!("wardrobe: {row} removed from the inventory (entry {idx}, gone)"));
             } else {
-                log::line(&format!("wardrobe: {row} NOT removed from the inventory (entry {idx}, still at {left})"));
+                // Still there: stays tracked, so a later clean (or the next run's
+                // `wardrobe_added`) tries again instead of leaving it behind for good.
+                log::line(&format!("wardrobe: {row} NOT removed from the inventory (entry {idx}, still at {left}): kept tracked"));
             }
+            return left >= 0;
         }
         false
     });
