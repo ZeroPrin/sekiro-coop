@@ -135,6 +135,8 @@ pub struct Puppet {
     net: Option<Option<net::Net>>,
     /// PvP on the game's hit packet (pvp.rs, `friendly_fire`).
     pvp: crate::pvp::Pvp,
+    /// Dead players are not enemy targets (corpse.rs, `dead_players_untargetable`).
+    corpse: crate::corpse::Corpse,
     fps_frames: u32,
     fps_since: Option<std::time::Instant>,
     fps: f32,
@@ -534,6 +536,7 @@ impl Puppet {
             self.stuck.on_loading();
             crate::talklock::on_loading();
             self.scaling.reset();
+            crate::corpse::on_loading();
             // Own world (ownworld.rs): an armed restore is written during this loading screen.
             crate::ownworld::on_loading();
             return;
@@ -548,6 +551,7 @@ impl Puppet {
             self.stuck.on_loading();
             crate::talklock::on_loading();
             self.scaling.reset();
+            crate::corpse::on_loading();
         }
         self.last_player = Some(player);
         // At most one line per 10 s (per-frame logging cost FPS, 2026-10-22).
@@ -902,6 +906,11 @@ impl Puppet {
         }
         // PvP on the game's own hit packet (pvp.rs): nothing while friendly_fire is off (the
         // host's value on a client).
+        // Dead players are not enemy targets (corpse.rs); before pvp, which leaves a held
+        // remote's team alone.
+        crash::breadcrumb("corpse");
+        let linked = self.net.as_ref().and_then(Option::as_ref).is_some_and(|n| n.connected());
+        self.corpse.tick(player, &self.peers, linked);
         crash::breadcrumb("pvp");
         let host_ff = self.scale_remote.and_then(|c| c.friendly_fire);
         if let Some(Some(n)) = self.net.as_mut() {

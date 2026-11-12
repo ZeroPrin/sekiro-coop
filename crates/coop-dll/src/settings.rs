@@ -370,6 +370,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::doctor::ALLOW_CROSS_CYCLE.store(ini.flag("allow_cross_cycle", false, warn), Relaxed);
     crate::pvp::FRIENDLY_FIRE.store(ini.flag("friendly_fire", false, warn), Relaxed);
     crate::pvp::IN_BOSS_FIGHTS.store(ini.flag("friendly_fire_in_boss_fights", false, warn), Relaxed);
+    crate::corpse::ENABLED.store(ini.flag("dead_players_untargetable", true, warn), Relaxed);
     crate::nopause::ENABLED.store(ini.flag("no_pause_in_coop", true, warn), Relaxed);
     crate::livesync::ENABLED.store(ini.flag("native_lives_sync", true, warn), Relaxed);
     crate::nsession::dblock::FRESH_LIFE_VETO.store(ini.flag("getup_deathblow_veto", true, warn), Relaxed);
@@ -698,6 +699,11 @@ friendly_fire = 0
 ; With friendly_fire: 0 = while a boss health bar is shown, your hits do not reach each other.
 ;     1 = friendly fire also there.
 friendly_fire_in_boss_fights = 0
+; 1 = while a player is dead (also while spectating or choosing to Resurrect) and another
+;     player lives, enemies stop noticing the dead one and turn to the living; they notice
+;     the player again after Resurrect or the return from the idol. Each PC decides for
+;     its own enemies. 0 = as before (enemies may keep on a corpse).
+dead_players_untargetable = 1
 ; 1 = while a companion is connected, menus, the inventory, item pickup messages and the
 ;     co-op yes/no boxes do not pause the game (as in FromSoft's online play): both worlds
 ;     keep running. Solo the game pauses as usual. 0 = menus pause as in single player.

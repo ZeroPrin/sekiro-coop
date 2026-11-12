@@ -14,6 +14,7 @@ mod bossgate;
 mod bosses;
 mod bossrules;
 mod anim;
+mod corpse;
 mod crash;
 mod cutscene;
 mod debuff;
@@ -330,6 +331,7 @@ fn init(hmodule: usize) {
                         let _ = panic::catch_unwind(remotefx::shutdown);
                         let _ = panic::catch_unwind(nsession::shutdown);
                         let _ = panic::catch_unwind(pvp::shutdown);
+                        let _ = panic::catch_unwind(corpse::shutdown);
                     }
                     // Dropping the puppet drops BossRules, but the statics its detours
                     // read (held death reload, phase B, free cam) would stay set:

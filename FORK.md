@@ -2,9 +2,9 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test5`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test6`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test5`: nothing in the sections below marked experimental or
+> **Test build `1.0.9-pickups.3-test6`: nothing in the sections below marked experimental or
 > "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
 > onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
@@ -24,7 +24,9 @@ Version string: `1.0.9-pickups.3-test5`. Everybody in a session needs the same b
 > (`persist_wait_for_down = 1`): when the host dies first and spectates and the client dies
 > last, the client keeps the host's old-world HP 0 off its fresh enemies until the host has
 > reloaded (plus a 1.5 s tail); log `enemies: death hold on` / `death hold off: N host HP
-> writes kept off`. The oracle is a playtest with both logs.
+> writes kept off`. `test6` adds `dead_players_untargetable` (enemies stop noticing a dead player while
+> another lives; `docs/RE-CORPSE-TARGET.md`, log `corpse:`) and keeps a boss with the living player while
+> the other is down (no ownership see-saw; 10 s fresh-take deathblow veto). The oracle is a playtest with both logs.
 
 ## New settings in this build
 
@@ -34,6 +36,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | Setting | Section | Default | Feature (section below) |
 |---|---|---|---|
 | `share_pickups` | GAMEPLAY | 1 | Shared map pickups (pickups.1-.3) |
+| `dead_players_untargetable` | GAMEPLAY | 1 (local per PC) | test6: `docs/RE-CORPSE-TARGET.md` |
 | `shop_stock_per_player` | GAMEPLAY | 1 (next start) | Base fixes from 1.0.11 |
 | `getup_deathblow_veto` | GAMEPLAY | 1 | Base fixes from 1.0.11 |
 | `persist_wait_for_down` | GAMEPLAY | 1 | Base fixes from 1.0.11 |

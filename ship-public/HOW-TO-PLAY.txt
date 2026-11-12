@@ -1,4 +1,4 @@
-SEKIRO TOGETHER 1.0.9-pickups.3-test5 - quick guide
+SEKIRO TOGETHER 1.0.9-pickups.3-test6 - quick guide
 =============================================
 
 Unofficial build: Sekiro Together 1.0.9 beta plus shared map pickups

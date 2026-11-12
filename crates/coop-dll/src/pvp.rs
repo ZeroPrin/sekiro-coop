@@ -967,7 +967,12 @@ fn restore(c: &Changed, why: &str) {
         log::line(&format!("pvp: peer {}'s native remote {:#x} is gone ({why}): nothing to restore", c.peer.slot(), c.chr));
         return;
     }
-    write(c.chr + CHR_TEAM, c.team);
+    // corpse.rs holds a dead friend's copy at team 0 and puts the chr type's team back itself.
+    if crate::corpse::holds(c.chr) {
+        log::line(&format!("pvp: peer {}'s native remote {:#x}: team left to corpse.rs (dead copy, team 0)", c.peer.slot(), c.chr));
+    } else {
+        write(c.chr + CHR_TEAM, c.team);
+    }
     if let Some(d) = data_of(c.chr)
         && let Some(fl) = read::<u8>(d + DATA_FLAGS)
     {
@@ -1156,6 +1161,12 @@ impl Pvp {
                 }
                 continue;
             }
+            // corpse.rs holds a dead friend's copy at team 0: no team read / write here (the
+            // "cannot die" bit below still follows the owner's HP).
+            let held = crate::corpse::holds(chr);
+            if held && pos.is_none() {
+                continue;
+            }
             let Some(team) = read::<u32>(chr + CHR_TEAM) else { continue };
             let data = data_of(chr);
             let flags = data.and_then(|d| read::<u8>(d + DATA_FLAGS));
@@ -1174,7 +1185,7 @@ impl Pvp {
                     b
                 }
             };
-            if team != PVP_TEAM {
+            if team != PVP_TEAM && !held {
                 write(chr + CHR_TEAM, PVP_TEAM);
             }
             if let (Some(d), Some(fl)) = (data, flags) {
