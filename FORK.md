@@ -16,8 +16,15 @@ Version string: `1.0.9-pickups.3-test5`. Everybody in a session needs the same b
 > reverted (session engage / remote creation as in test2; its spectate wait hint stays), the
 > friend's character updates every frame at any distance (`remote_every_frame`), objact flag /
 > fx mirror log spam capped, friendly fire in the Co-op Settings page and the panel,
-> `rest_refills_partner`, Cyrillic glyphs in the overlay font. Enemy sync is unchanged from test2.
-> The oracle is a playtest with both logs.
+> `rest_refills_partner`, Cyrillic glyphs in the overlay font. Merged from `fx2`: the forced
+> SpEffect mirror (`fx_speffect_mirror`: the art-gate SpEffects 106000 / 140310 / 140510 /
+> 140610, pure stateInfo flag carriers, are applied to the friend's replica), the TAE debug
+> hook fix (slot 2), real part loads only and the wardrobe combination rules (the Sculptor's
+> skin, head and legs are no longer offered). Enemy sync is as in test2 except the death hold
+> (`persist_wait_for_down = 1`): when the host dies first and spectates and the client dies
+> last, the client keeps the host's old-world HP 0 off its fresh enemies until the host has
+> reloaded (plus a 1.5 s tail); log `enemies: death hold on` / `death hold off: N host HP
+> writes kept off`. The oracle is a playtest with both logs.
 
 ## New settings in this build
 
