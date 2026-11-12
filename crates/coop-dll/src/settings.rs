@@ -401,6 +401,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
         crate::wardrobe::PAD_BUTTON.store([0u16, 0x0020, 0x0010, 0x0040, 0x0080][i as usize], Relaxed);
     }
     crate::wardrobe::RELOAD.store(ini.flag("wardrobe_reload", false, warn), Relaxed);
+    crate::wardrobe::ALL_PARTS.store(ini.flag("wardrobe_all_parts", false, warn), Relaxed);
     crate::wardrobe::load_ini(
         crate::wardrobe::IniValues {
             enabled: ini.flag("wardrobe", true, warn),
@@ -797,6 +798,10 @@ wardrobe_owner =
 ;     on your own character, may crash). 0 = only change the equipment, as the game's own
 ;     event script does; the look may then update only after the next load screen.
 wardrobe_reload = 0
+; 0 = only combinations that render right: no Sculptor skin / legs (dark, untextured), Shura's
+;     head and legs only with the Shura skin, the Tengu skin only with Tengu legs (these parts
+;     borrow textures from each other). 1 = everything, also the broken-looking ones.
+wardrobe_all_parts = 0
 
 [ADVANCED]
 ; Changing anything here (or the password / name) restarts the connection.
