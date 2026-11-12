@@ -920,11 +920,21 @@ Log lines (only enemies that know both players, or events that involve the frien
   that player's record went back to 10 s. A `HIT by peer1` on the owner answers RE-AI-TARGET §9.3
   (the friend's hits reach the owner's AI).
 - `aitarget: ... knows peer1 (hp N) now: ...`: a record for that player appeared.
-- `aitarget: ... replan frame (no +50): <both candidates> | best X , top Y for Ns` or `... hold: ...`,
-  at most once a second per enemy: the raw choice on the latest replan frame, else the current scores.
+- `aitarget: ... replan frame (no +50): <both candidates> | best X, top Y for Ns`: only on a replan
+  frame with both players scored, at most once a second per enemy: the raw choice without the +50.
 - `aitarget: ... last 10s: N replan frame(s) (M with 2+ players), K top change(s), hits seen me 2,
-  peer1 1`: how often the engine replans (§9.1).
-- `aitarget: score calls N/s, M/s about a player, K sample(s) dropped (table busy)`: cost check.
+  peer1 1 (at least)`: how often the engine replans (§9.1); only for enemies with a replan frame, a
+  hit or a top change in the window and the friend in their list (an idle boss stays silent). Hits
+  are every rise of the record's hit timer; two hits between two samples count once.
+- `aitarget: score calls N/s, M/s about a player; ... dropped (table busy), ... skipped (owner vtable
+  not 0x142961690), ... with the replan state unknown`: cost and sanity check every 10 s.
+- All `aitarget:` lines share a budget of 10 a second; the rest is counted in one
+  `aitarget: N line(s) suppressed` line at most every 10 s (the same for dropped events).
+
+Players are keyed by peer id (`me`, `peerN` = session slot N); the friend's distance is measured
+to the native replica's own position, as the AI does. The hook is installed in two phases (the
+trampoline is published before the jump is written); switching 0 -> 1 in the world installs it
+with the native session's 250 ms freeze budget and retries a busy install on a later frame.
 
 Not seen: records frozen above 100 and records about non-players. Damage share per player is not
 tracked by the crate; the hit timer per record (seconds since that player's last hit) stands in.

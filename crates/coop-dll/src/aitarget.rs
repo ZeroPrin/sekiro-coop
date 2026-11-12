@@ -19,6 +19,12 @@
 //! frames come (the +50 is dropped only then) and whether a friend's hit on the enemy shows on
 //! this machine's record of the friend's replica (hitF 2).
 //!
+//! Log volume (review): per-enemy lines only on a replan frame with both players sampled (at
+//! most one a second per enemy) and on a top change; 10 s summaries only for enemies with a
+//! replan frame, a hit or a top change in the window and a friend in their list; every
+//! `aitarget:` line shares a budget of `LineBudget::PER_SEC` a second, the rest is counted
+//! and reported at most once per 10 s.
+//!
 //! Offsets (all RVAs / offsets for 1.06; [VAR] = read in the decompiled code):
 //! - `0x61DE40` prologue `48 89 5C 24 18 48 89 74 24 20 57 48 83 EC 60` (15 bytes, read from
 //!   the 2026-11-11 dump; mov/mov/push/sub, nothing RIP-relative). Returns via
@@ -33,22 +39,29 @@
 //! - ChrIns `+0x08` = its handle: `0x6130C0` (accessor vt+0xA0, "handle") returns
 //!   `*(u32*)(ChrIns + 8)` of the ChrIns from vt+0x100 [VAR].
 //! - Ctx (`0x62BA70`): `+0x00` the AI's own position (vec3, read by the distance term
-//!   `0x62BC30`), `+0x28` the targeting-system owner [VAR]. Owner `+0x08` = AiThink, `+0x10` =
-//!   the AI's ChrIns (RE-AI-TARGET §1.1); AiThink `+0x7B30` = targeting system, TS `+0x34` = the
-//!   replanning byte (`0x60EAC0`, owner vt+0xD8, reads `[[owner+8]+0x7B30]+0x34`) [VAR].
+//!   `0x62BC30`), `+0x28` the targeting-system owner [VAR]. Owner vtable `0x142961690`
+//!   (`SprjAiTargetingSystemOwner`, the vtable whose `+0xD8` is `0x60EAC0`, dump), owner `+0x08`
+//!   = AiThink, `+0x10` = the AI's ChrIns (RE-AI-TARGET §1.1); AiThink `+0x7B30` = targeting
+//!   system, TS `+0x34` = the replanning byte (`0x60EAC0` reads `[[owner+8]+0x7B30]+0x34`) [VAR].
+//!   The owner is followed only when its vtable matches.
 //! - Constants checked in the dump: 1000.0 @`0x1432893A4`, 10.0 @`0x1432892A0`, 14.0
 //!   @`0x14296327C`, 0.1 @`0x1432890CC`, 50.0 @`0x1432892F0`, 1.0 @`0x14328919C`; the caller
 //!   `0x61DB10` stores the result only while the score is <= 100.0 (@`0x14328931C`).
 //!
 //! Not seen by the hook: records with a score > 100 (frozen; reasons 3 / 5), and records
 //! whose target is not a player (NPC allies / enemies).
+//!
+//! `FRAME` is counted by the frame task, not by the AI update. If the game runs AI updates on
+//! worker threads that overlap our frame task, one AI frame can straddle two `FRAME` values;
+//! the replan counts are then off by a frame now and then (diagnostics only, review note).
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use crate::game::{Chr, read};
+use crate::hook::{PreparedDetour, freeze};
 use crate::log;
 use crate::peers::{MAX_PLAYERS, PeerSet};
 
@@ -75,6 +88,8 @@ const KIND_CHR: u32 = 1;
 /// ChrIns + 8: handle (`0x6130C0`).
 const CHR_HANDLE: usize = 0x08;
 const CTX_OWNER: usize = 0x28;
+/// `SprjAiTargetingSystemOwner` vtable RVA (its `+0xD8` = `0x60EAC0`, dump 2026-11-11).
+const OWNER_VTABLE_RVA: usize = 0x2961690;
 const OWNER_THINK: usize = 0x08;
 const OWNER_CHR: usize = 0x10;
 const THINK_TS: usize = 0x7B30;
@@ -87,6 +102,9 @@ pub const HIT_TIME: f32 = 10.0;
 pub const TOP_TIME: f32 = 14.0;
 pub const TOP_GAIN: f32 = 0.1;
 pub const TOP_BONUS: f32 = 50.0;
+
+/// Candidate slots: `[0]` = our player, `[1 + peer id]` = that peer's native remote.
+pub const SLOTS: usize = MAX_PLAYERS + 1;
 
 // ===================================================================== pure, unit-tested
 
@@ -109,11 +127,14 @@ pub fn residual(score: f32, d: f32, hit_f: f32, top_f: f32, bonus: f32) -> f32 {
     score - dist_term(d) * hit_f * top_f - bonus
 }
 
-/// A new hit by this target: the hit timer is set to 10 s on each hit and only decays
-/// otherwise (`0x61DA40`, `0x61DB10`). A record that appears with a fresh timer counts too.
+/// A new hit by this target. The hit timer is set back to 10 s on each hit and otherwise only
+/// decays (`0x61DA40`, `0x61DB10`; a merge `0x61CE10` keeps the larger), so any increase
+/// between two samples is a hit, a re-hit 0.1 s later included. Two hits between two
+/// samples (one frame, or a sample dropped while the table was busy) count once: the counts
+/// are a lower bound. A record that appears with a fresh timer counts too.
 pub fn hit_rose(prev: Option<f32>, cur: f32) -> bool {
     match prev {
-        Some(p) => cur > p + 0.5,
+        Some(p) => cur > p + 1e-3,
         None => cur > HIT_TIME - 0.5,
     }
 }
@@ -121,6 +142,43 @@ pub fn hit_rose(prev: Option<f32>, cur: f32) -> bool {
 /// Rate limit in milliseconds: due when nothing was logged yet or `gap` has passed.
 pub fn due(last: u64, now: u64, gap: u64) -> bool {
     last == 0 || now.saturating_sub(last) >= gap
+}
+
+/// Shared budget of every `aitarget:` line: `PER_SEC` a second, the rest counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LineBudget {
+    sec_start: u64,
+    used: u32,
+    pub suppressed: u32,
+    last_note: u64,
+}
+
+impl LineBudget {
+    pub const PER_SEC: u32 = 10;
+    pub const NOTE_GAP_MS: u64 = 10_000;
+
+    pub fn allow(&mut self, now: u64) -> bool {
+        if self.sec_start == 0 || now.saturating_sub(self.sec_start) >= 1_000 {
+            self.sec_start = now;
+            self.used = 0;
+        }
+        if self.used < Self::PER_SEC {
+            self.used += 1;
+            true
+        } else {
+            self.suppressed += 1;
+            false
+        }
+    }
+
+    /// The "N suppressed" count to log now (at most once per `NOTE_GAP_MS`), reset.
+    pub fn note(&mut self, now: u64) -> Option<u32> {
+        if self.suppressed == 0 || !due(self.last_note, now, Self::NOTE_GAP_MS) {
+            return None;
+        }
+        self.last_note = now;
+        Some(std::mem::take(&mut self.suppressed))
+    }
 }
 
 /// One record's latest sample (one per enemy and player).
@@ -138,7 +196,8 @@ pub struct Sample {
     pub state: u32,
     pub perceived: bool,
     pub is_top: bool,
-    pub replan: bool,
+    /// The replanning byte; None = not readable (no targeting system behind the owner).
+    pub replan: Option<bool>,
 }
 
 impl Sample {
@@ -154,8 +213,12 @@ impl Sample {
         state: 0,
         perceived: false,
         is_top: false,
-        replan: false,
+        replan: Some(false),
     };
+
+    fn replanning(&self) -> bool {
+        self.replan == Some(true)
+    }
 }
 
 pub const NO_SLOT: u8 = u8::MAX;
@@ -163,9 +226,13 @@ pub const NO_SLOT: u8 = u8::MAX;
 pub const PRESENT_MS: u64 = 500;
 /// An enemy entry is reused after this long without a sample.
 pub const STALE_MS: u64 = 5_000;
-/// Per-enemy line gap and summary window.
+/// Per-enemy replan line gap and summary window.
 pub const LINE_GAP_MS: u64 = 1_000;
 pub const SUMMARY_MS: u64 = 10_000;
+
+fn is_friend(slot: usize) -> bool {
+    (1..SLOTS).contains(&slot)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Enemy {
@@ -180,24 +247,21 @@ pub struct Enemy {
     /// Last frame with the replanning byte set, and the frames counted in this window.
     pub replan_frame: u64,
     pub replans: u32,
-    /// Replan frames with 2+ players in the list (this window).
+    /// Replan frames with 2+ players scored on them (this window).
     pub replans_multi: u32,
     pub switches: u32,
-    pub hits: [u32; MAX_PLAYERS],
-    pub cands: [Sample; MAX_PLAYERS],
+    pub hits: [u32; SLOTS],
+    /// A friend's record was sampled in this window.
+    pub friend_window: bool,
+    pub cands: [Sample; SLOTS],
     /// The candidates as sampled on the latest replan frame (the raw choice, no +50).
-    pub on_replan: [Sample; MAX_PLAYERS],
+    pub on_replan: [Sample; SLOTS],
     pub line_ms: u64,
     pub logged_replan: u64,
     pub window_ms: u64,
 }
 
 impl Enemy {
-    /// Player slots whose record was sampled within `PRESENT_MS` of `now`.
-    pub fn present(&self, now: u64) -> Vec<usize> {
-        (0..MAX_PLAYERS).filter(|&k| self.cands[k].ms != 0 && now.saturating_sub(self.cands[k].ms) <= PRESENT_MS).collect()
-    }
-
     pub const FREE: Enemy = Enemy {
         ai: 0,
         last_ms: 0,
@@ -208,21 +272,49 @@ impl Enemy {
         replans: 0,
         replans_multi: 0,
         switches: 0,
-        hits: [0; MAX_PLAYERS],
-        cands: [Sample::NONE; MAX_PLAYERS],
-        on_replan: [Sample::NONE; MAX_PLAYERS],
+        hits: [0; SLOTS],
+        friend_window: false,
+        cands: [Sample::NONE; SLOTS],
+        on_replan: [Sample::NONE; SLOTS],
         line_ms: 0,
         logged_replan: 0,
         window_ms: 0,
     };
+
+    /// Player slots whose record was sampled within `PRESENT_MS` of `now`.
+    pub fn present(&self, now: u64) -> Vec<usize> {
+        (0..SLOTS).filter(|&k| self.cands[k].ms != 0 && now.saturating_sub(self.cands[k].ms) <= PRESENT_MS).collect()
+    }
+
+    /// Slots scored on the latest replan frame.
+    pub fn on_latest_replan(&self) -> Vec<usize> {
+        (0..SLOTS).filter(|&k| self.replan_frame != 0 && self.on_replan[k].ms != 0 && self.on_replan[k].frame == self.replan_frame).collect()
+    }
+
+    /// A replan line is due: a replan frame not logged yet with 2+ players scored on it, and
+    /// none for this enemy within `LINE_GAP_MS`.
+    pub fn replan_line_due(&self, now: u64) -> bool {
+        self.replan_frame != self.logged_replan && self.on_latest_replan().len() >= 2 && due(self.line_ms, now, LINE_GAP_MS)
+    }
+
+    /// The summary window is over: `Some(log it)`. Logged only with something to say (a
+    /// replan frame, a hit or a top change) and a friend in the list: bosses never forget a
+    /// player, so an idle enemy stays silent.
+    pub fn summary_due(&self, now: u64) -> Option<bool> {
+        if now.saturating_sub(self.window_ms) < SUMMARY_MS {
+            return None;
+        }
+        let active = self.replans > 0 || self.switches > 0 || self.hits.iter().any(|&h| h > 0);
+        Some(active && self.friend_window)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event {
-    /// The top record moved between players (or to / from a non-player): `replan` = it
-    /// happened on a replan frame (no +50 that frame).
-    Top { ai: usize, from: u8, to: u8, replan: bool, held_ms: u64, s_from: Sample, s_to: Sample },
-    /// A hit by this player registered on this machine's record (hit timer back to 10 s).
+    /// A player record gained the top flag. `from` = the player that had it (`NO_SLOT` = a
+    /// non-player or nothing); `replan` = on a replan frame (no +50 that frame).
+    Top { ai: usize, from: u8, to: u8, replan: Option<bool>, held_ms: u64, s_from: Sample, s_to: Sample },
+    /// A hit by this player registered on this machine's record (hit timer back up).
     Hit { ai: usize, slot: u8, cur: Sample, top: u8 },
     /// A player's record appeared (or came back after `STALE_MS`).
     Appear { ai: usize, slot: u8, cur: Sample },
@@ -236,10 +328,10 @@ impl Event {
     }
 }
 
-/// Keep the log small: an event is logged when a friend (slot >= 1) is in it, or the enemy has
-/// both players in its list (`multi`). Our own solo noticing / losing / hits are not logged.
+/// Keep the log small: an event is logged when a friend is in it, or the enemy has both
+/// players in its list (`multi`). Our own solo noticing / losing / hits are not logged.
 pub fn worth_logging(ev: &Event, multi: bool) -> bool {
-    let friend = |s: u8| (1..MAX_PLAYERS).contains(&(s as usize));
+    let friend = |s: u8| is_friend(s as usize);
     multi
         || match *ev {
             Event::Top { from, to, .. } => friend(from) || friend(to),
@@ -292,9 +384,14 @@ impl Table {
         i
     }
 
-    /// One sample from the hook. `frame` / `now` from the frame task.
+    /// Anything for the frame task: an event, or an enemy sampled within `PRESENT_MS`.
+    pub fn active(&self, now: u64) -> bool {
+        self.n_events > 0 || self.dropped > 0 || self.enemies.iter().any(|e| e.ai != 0 && now.saturating_sub(e.last_ms) <= PRESENT_MS)
+    }
+
+    /// One sample from the hook.
     pub fn record(&mut self, ai: usize, slot: usize, s: Sample) {
-        if slot >= MAX_PLAYERS {
+        if slot >= SLOTS {
             return;
         }
         let now = s.ms;
@@ -303,6 +400,9 @@ impl Table {
         {
             let e = &mut self.enemies[i];
             e.last_ms = now;
+            if is_friend(slot) {
+                e.friend_window = true;
+            }
             let prev = e.cands[slot];
             let fresh = prev.ms == 0 || now.saturating_sub(prev.ms) > STALE_MS;
             if fresh {
@@ -312,7 +412,7 @@ impl Table {
                 e.hits[slot] += 1;
                 events[1] = Some(Event::Hit { ai, slot: slot as u8, cur: s, top: e.top });
             }
-            if s.replan {
+            if s.replanning() {
                 if e.replan_frame != s.frame {
                     e.replan_frame = s.frame;
                     e.replans += 1;
@@ -328,11 +428,7 @@ impl Table {
             // the player that had it (also when its loss was seen first, earlier this frame).
             let was = e.top;
             if s.is_top && was != slot as u8 {
-                let (from, s_from, since) = if (was as usize) < MAX_PLAYERS {
-                    (was, e.cands[was as usize], e.top_since_ms)
-                } else {
-                    e.lost
-                };
+                let (from, s_from, since) = if (was as usize) < SLOTS { (was, e.cands[was as usize], e.top_since_ms) } else { e.lost };
                 events[2] = Some(Event::Top { ai, from, to: slot as u8, replan: s.replan, held_ms: now.saturating_sub(since), s_from, s_to: s });
                 e.top = slot as u8;
                 e.top_since_ms = now;
@@ -340,7 +436,7 @@ impl Table {
                 e.switches += 1;
             } else if !s.is_top && was == slot as u8 {
                 // Lost to the other player (its record comes later this frame) or to a
-                // non-player / nothing (shown as "top other/none" in the next line).
+                // non-player / nothing (no event).
                 e.lost = (was, s, e.top_since_ms);
                 e.top = NO_SLOT;
                 e.top_since_ms = now;
@@ -368,16 +464,17 @@ impl Default for Table {
 
 /// Log text of one candidate: native score and its parts.
 pub fn describe(label: &str, s: &Sample) -> String {
-    let (hit_f, top_f, bonus) = factors(s.hit_timer, s.hit_weight, s.top_timer, s.is_top, s.replan);
+    let (hit_f, top_f, bonus) = factors(s.hit_timer, s.hit_weight, s.top_timer, s.is_top, s.replanning());
     let hit_ago = if s.hit_timer > 0.0 { format!("{:.1}s ago", HIT_TIME - s.hit_timer) } else { "none".to_string() };
     format!(
-        "{label} score {:.3} = dist {:.1} m x hitF {:.2} (hit {hit_ago}, w {:.2}) x topF {:.3} + bonus {:.0}{} resid {:+.2}; rec state {} {}{}",
+        "{label} score {:.3} = dist {:.1} m x hitF {:.2} (hit {hit_ago}, w {:.2}) x topF {:.3} + bonus {:.0}{}{} resid {:+.2}; rec state {} {}{}",
         s.score,
         s.dist,
         hit_f,
         s.hit_weight,
         top_f,
         bonus,
+        if s.replan.is_none() { " (replan state unknown)" } else { "" },
         if s.is_top { " [top]" } else { "" },
         residual(s.score, s.dist, hit_f, top_f, bonus),
         s.state,
@@ -386,21 +483,44 @@ pub fn describe(label: &str, s: &Sample) -> String {
     )
 }
 
+fn replan_text(r: Option<bool>) -> &'static str {
+    match r {
+        Some(true) => "on a replan frame",
+        Some(false) => "NOT a replan frame",
+        None => "replan state unknown",
+    }
+}
+
 // ===================================================================== game side
 
-/// Player chr handles this frame: `[0]` ours, `[1..]` the peers' native remotes (`NO_HANDLE`
-/// = none). Positions as f32 bits. Written by the frame task, read by the hook.
-static HANDLES: [AtomicU32; MAX_PLAYERS] = [const { AtomicU32::new(NO_HANDLE) }; MAX_PLAYERS];
-static POS: [[AtomicU32; 3]; MAX_PLAYERS] = [const { [const { AtomicU32::new(0) }; 3] }; MAX_PLAYERS];
+/// Player chr handles this frame (`SLOTS` layout, `NO_HANDLE` = none) and positions as f32
+/// bits. Written by the frame task, read by the hook.
+static HANDLES: [AtomicU32; SLOTS] = [const { AtomicU32::new(NO_HANDLE) }; SLOTS];
+static POS: [[AtomicU32; 3]; SLOTS] = [const { [const { AtomicU32::new(0) }; 3] }; SLOTS];
 static NOW_MS: AtomicU64 = AtomicU64::new(0);
 static FRAME: AtomicU64 = AtomicU64::new(0);
+/// The trampoline: published before the site is patched (`install`), so it is never 0 in
+/// the detour.
 static TRAMP: AtomicUsize = AtomicUsize::new(0);
-/// Install attempted (success or not): never twice.
-static TRIED: AtomicBool = AtomicBool::new(false);
+/// `module base + OWNER_VTABLE_RVA`, set before the patch.
+static OWNER_VT: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static PLAYER_CALLS: AtomicU64 = AtomicU64::new(0);
 static BUSY: AtomicU64 = AtomicU64::new(0);
+static BAD_OWNER: AtomicU64 = AtomicU64::new(0);
+static NO_REPLAN: AtomicU64 = AtomicU64::new(0);
 static TABLE: Mutex<Table> = Mutex::new(Table::new());
+
+enum Install {
+    NotTried,
+    /// Trampoline built and published, site not patched yet (a busy engage, retried).
+    Prepared(PreparedDetour),
+    Done,
+    Failed,
+}
+
+static INSTALL: Mutex<Install> = Mutex::new(Install::NotTried);
+static BUSY_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
 type ScoreFn = extern "C" fn(usize, usize) -> f32;
 
@@ -411,6 +531,10 @@ fn table() -> MutexGuard<'static, Table> {
 fn start() -> Instant {
     static T: OnceLock<Instant> = OnceLock::new();
     *T.get_or_init(Instant::now)
+}
+
+fn now_ms() -> u64 {
+    (start().elapsed().as_millis() as u64).max(1)
 }
 
 fn slot_of(handle: u32) -> Option<usize> {
@@ -427,15 +551,8 @@ unsafe fn field<T: Copy>(addr: usize) -> T {
 }
 
 extern "C" fn score_detour(rec: usize, ctx: usize) -> f32 {
-    let mut t = TRAMP.load(Relaxed);
-    // Installed from the frame task while AI threads run: the stub may be reached before the
-    // installer stored the trampoline (it does right after the patch).
-    while t == 0 {
-        std::hint::spin_loop();
-        std::thread::yield_now();
-        t = TRAMP.load(Relaxed);
-    }
-    let orig: ScoreFn = unsafe { std::mem::transmute::<usize, ScoreFn>(t) };
+    // Published before the jump to this detour was written (install).
+    let orig: ScoreFn = unsafe { std::mem::transmute::<usize, ScoreFn>(TRAMP.load(Acquire)) };
     let score = orig(rec, ctx);
     if MODE.load(Relaxed) == 0 || !crate::mod_alive() {
         return score;
@@ -451,7 +568,8 @@ fn observe(rec: usize, ctx: usize, score: f32) {
         return;
     }
     // SAFETY: the original just read these record fields (0x61DE40) and the ctx fields
-    // (0x62BC30, 0x62BCA0); the owner chain is the one 0x60EAC0 dereferences.
+    // (0x62BC30, 0x62BCA0); the owner is followed only with its vtable checked, and then the
+    // chain 0x60EAC0 dereferences.
     unsafe {
         if field::<u32>(rec + REC_KIND) != KIND_CHR {
             return;
@@ -459,16 +577,21 @@ fn observe(rec: usize, ctx: usize, score: f32) {
         let Some(slot) = slot_of(field::<u32>(rec + REC_HANDLE)) else { return };
         PLAYER_CALLS.fetch_add(1, Relaxed);
         let owner = field::<usize>(ctx + CTX_OWNER);
-        if owner < 0x10000 {
+        if owner < 0x10000 || field::<usize>(owner) != OWNER_VT.load(Relaxed) {
+            BAD_OWNER.fetch_add(1, Relaxed);
             return;
         }
         let ai = field::<usize>(owner + OWNER_CHR);
-        let think = field::<usize>(owner + OWNER_THINK);
-        if ai < 0x10000 || think < 0x10000 {
+        if ai < 0x10000 {
+            BAD_OWNER.fetch_add(1, Relaxed);
             return;
         }
-        let ts = field::<usize>(think + THINK_TS);
-        let replan = ts >= 0x10000 && field::<u8>(ts + TS_REPLAN) != 0;
+        let think = field::<usize>(owner + OWNER_THINK);
+        let ts = if think >= 0x10000 { field::<usize>(think + THINK_TS) } else { 0 };
+        let replan = (ts >= 0x10000).then(|| field::<u8>(ts + TS_REPLAN) != 0);
+        if replan.is_none() {
+            NO_REPLAN.fetch_add(1, Relaxed);
+        }
         let own: [f32; 3] = field(ctx);
         let tp = [0, 1, 2].map(|k| f32::from_bits(POS[slot][k].load(Relaxed)));
         let s = Sample {
@@ -496,17 +619,49 @@ fn observe(rec: usize, ctx: usize, score: f32) {
     }
 }
 
-fn install() {
-    if TRIED.swap(true, Relaxed) {
+/// Builds the trampoline, publishes it, then patches the site (two phases: the detour never
+/// runs without its trampoline). `budget_ms` 0 at start; in the world a busy engage (a thread
+/// inside the prologue, or the suspend phase over budget) is retried on a later frame.
+fn install(budget_ms: u64) {
+    let mut g = INSTALL.lock().unwrap_or_else(PoisonError::into_inner);
+    if matches!(*g, Install::Done | Install::Failed) {
         return;
     }
-    let detour: ScoreFn = score_detour;
-    match crate::hook::install_detour(SCORE_RVA, &SCORE_PROLOGUE, detour as usize, "aitarget: target score (0x61DE40)") {
-        Some(page) => {
-            TRAMP.store(page, Relaxed);
-            log::line("aitarget: observing enemy target scores (ai_retarget = 1; scores are never changed in this build)");
+    if matches!(*g, Install::NotTried) {
+        OWNER_VT.store(crate::game::module_base() + OWNER_VTABLE_RVA, Relaxed);
+        let detour: ScoreFn = score_detour;
+        match crate::hook::prepare_detour(SCORE_RVA, &SCORE_PROLOGUE, detour as usize, "aitarget: target score (0x61DE40)") {
+            Some(p) => {
+                TRAMP.store(p.page, Release);
+                *g = Install::Prepared(p);
+            }
+            None => {
+                *g = Install::Failed;
+                log::line("aitarget: score hook not installed: no target observation this run");
+                return;
+            }
         }
-        None => log::line("aitarget: score hook not installed: no target observation this run"),
+    }
+    let Install::Prepared(p) = &*g else { return };
+    let (site, page) = (p.site, p.page);
+    match crate::hook::engage_detour(p, budget_ms) {
+        Ok(()) => {
+            *g = Install::Done;
+            log::line(&format!(
+                "hook: aitarget: target score (0x61DE40) at {site:#x} detoured (trampoline {page:#x}); aitarget: observing enemy target scores (ai_retarget = 1; scores are never changed in this build)"
+            ));
+        }
+        Err(freeze::Error::Busy(rip)) => {
+            let now = now_ms();
+            if due(BUSY_LOG_MS.load(Relaxed), now, 10_000) {
+                BUSY_LOG_MS.store(now, Relaxed);
+                log::line(&format!("aitarget: score hook busy (thread at {rip:#x}, 0 = over the {budget_ms} ms budget): retried on a later frame"));
+            }
+        }
+        Err(e) => {
+            *g = Install::Failed;
+            log::line(&format!("aitarget: score hook not installed ({e:?}): no target observation this run"));
+        }
     }
 }
 
@@ -514,37 +669,34 @@ fn install() {
 /// from 0 installs it from the frame task.
 pub fn install_at_start() {
     if MODE.load(Relaxed) >= 1 {
-        install();
+        install(0);
     }
 }
 
-/// Per-player facts for the lines (from what the hub already has: no new reads).
+/// Per-player facts for the lines (from what the hub already has).
 #[derive(Default)]
-pub struct Frame {
-    labels: [String; MAX_PLAYERS],
-    hp: [Option<i32>; MAX_PLAYERS],
+struct Frame {
+    labels: [String; SLOTS],
+    hp: [Option<i32>; SLOTS],
 }
 
 /// Owned by the puppet hub.
+#[derive(Default)]
 pub struct AiTarget {
     frame: Frame,
+    budget: LineBudget,
+    dropped: u32,
+    dropped_log_ms: u64,
     last_perf_ms: u64,
-    last_calls: u64,
-    last_player_calls: u64,
-    last_busy: u64,
+    last: [u64; 5],
 }
 
-impl Default for AiTarget {
-    fn default() -> Self {
-        AiTarget { frame: Frame::default(), last_perf_ms: 0, last_calls: 0, last_player_calls: 0, last_busy: 0 }
-    }
-}
-
-/// puppet.rs: a loading screen: no handle is valid any more.
+/// puppet.rs: a loading screen: no handle is valid any more, every enemy is gone.
 pub fn on_loading() {
     for h in &HANDLES {
         h.store(NO_HANDLE, Relaxed);
     }
+    *table() = Table::new();
 }
 
 fn enemy_name(ai: usize) -> String {
@@ -569,171 +721,200 @@ impl AiTarget {
         format!("{} (hp {})", self.label(slot as u8), hp.map_or_else(|| "?".to_string(), |h| h.to_string()))
     }
 
+    /// Every `aitarget:` line except the budget's own notes goes through here.
+    fn line(&mut self, now: u64, msg: &str) {
+        if self.budget.allow(now) {
+            log::line(msg);
+        }
+    }
+
     /// Every in-world frame, after the native remotes were refreshed.
     pub fn tick(&mut self, player: Chr, peers: &PeerSet) {
         let mode = MODE.load(Relaxed);
-        let now = (start().elapsed().as_millis() as u64).max(1);
+        let now = now_ms();
         NOW_MS.store(now, Relaxed);
         FRAME.fetch_add(1, Relaxed);
 
-        // Handles and positions for the hook (index 0 = us, then the peers in id order).
+        // Handles and positions for the hook: slot 0 = us, 1 + id = a peer's native remote
+        // (its own position: what the AI measures).
         let mut frame = Frame::default();
-        let mut set = |i: usize, chr: Option<Chr>, pos: Option<[f32; 3]>, label: String, hp: Option<i32>| {
+        let mut used = [false; SLOTS];
+        let mut set = |i: usize, chr: Option<Chr>, label: String, hp: Option<i32>| {
             let h = chr.and_then(|c| read::<u32>(c.0 + CHR_HANDLE)).unwrap_or(NO_HANDLE);
             HANDLES[i].store(h, Relaxed);
-            if let Some(p) = pos {
+            if let Some(p) = chr.and_then(|c| c.position()) {
                 for k in 0..3 {
                     POS[i][k].store(p[k].to_bits(), Relaxed);
                 }
             }
             frame.labels[i] = label;
             frame.hp[i] = hp;
+            used[i] = true;
         };
-        set(0, Some(player), player.position(), "me".to_string(), player.hp());
-        let mut i = 1;
+        set(0, Some(player), "me".to_string(), player.hp());
         for p in peers.iter() {
-            if i >= MAX_PLAYERS {
-                break;
+            let i = 1 + p.id.index();
+            if i < SLOTS {
+                set(i, p.native, format!("peer{}", p.id.slot()), p.hp());
             }
-            set(i, p.native, p.view.map(|v| v.0).or(p.snapshot.map(|s| s.pos)), format!("peer{}", p.id.slot()), p.hp());
-            i += 1;
         }
-        for h in HANDLES.iter().skip(i) {
-            h.store(NO_HANDLE, Relaxed);
+        for (i, h) in HANDLES.iter().enumerate() {
+            if !used[i] {
+                h.store(NO_HANDLE, Relaxed);
+            }
         }
         self.frame = frame;
 
         if mode == 0 {
             return;
         }
-        install();
+        install(freeze::ENGAGE_BUDGET_MS);
         self.drain(now);
     }
 
     fn drain(&mut self, now: u64) {
-        // Copy out under the lock, format after (the hook only try-locks).
-        let (events, n, dropped, snapshot) = {
+        // Copy out under the lock (only the enemies seen lately), format after: the hook only
+        // try-locks. Nothing to do: no copy at all.
+        let got = {
             let mut t = table();
-            let (ev, n, d) = t.take_events();
-            (ev, n, d, t.enemies)
+            if t.active(now) {
+                let (ev, n, d) = t.take_events();
+                let live: Vec<Enemy> = t.enemies.iter().filter(|e| e.ai != 0 && now.saturating_sub(e.last_ms) <= PRESENT_MS).copied().collect();
+                Some((ev, n, d, live))
+            } else {
+                None
+            }
         };
-        for ev in events.iter().take(n).flatten() {
-            let multi = snapshot.iter().find(|e| e.ai == ev.ai()).is_some_and(|e| e.present(now).len() >= 2);
-            if worth_logging(ev, multi) {
-                self.log_event(ev);
-            }
-        }
-        if dropped > 0 {
-            log::line(&format!("aitarget: {dropped} event(s) dropped (more than {EVENTS} in one frame)"));
-        }
-
-        let mut marks: Vec<(usize, u64, bool)> = Vec::new();
-        for e in snapshot.iter().filter(|e| e.ai != 0 && now.saturating_sub(e.last_ms) <= PRESENT_MS) {
-            let present = e.present(now);
-            if present.len() >= 2 && due(e.line_ms, now, LINE_GAP_MS) {
-                // Prefer the latest replan frame (the raw choice) when there was one since the last line.
-                let rp = e.replan_frame != 0 && e.replan_frame != e.logged_replan && present.iter().filter(|&&k| e.on_replan[k].frame == e.replan_frame).count() >= 2;
-                let (kind, src) = if rp { ("replan frame (no +50)", &e.on_replan) } else { ("hold", &e.cands) };
-                let parts: Vec<String> = present.iter().map(|&k| describe(&self.who(k), &src[k])).collect();
-                let winner = present.iter().copied().max_by(|&a, &b| src[a].score.total_cmp(&src[b].score)).map_or(NO_SLOT, |k| k as u8);
-                log::line(&format!(
-                    "aitarget: {} {kind}: {} | best {} , top {} for {:.1}s",
-                    enemy_name(e.ai),
-                    parts.join(" | "),
-                    self.label(winner),
-                    self.label(e.top),
-                    now.saturating_sub(e.top_since_ms) as f32 / 1000.0,
-                ));
-                marks.push((e.ai, if rp { e.replan_frame } else { e.logged_replan }, true));
-            }
-            if now.saturating_sub(e.window_ms) < SUMMARY_MS {
-                continue;
-            }
-            // The window restarts either way; it is logged only with both players involved.
-            marks.push((e.ai, 0, false));
-            let friend_hits = e.hits.iter().skip(1).any(|&h| h > 0);
-            if present.len() >= 2 || e.replans_multi > 0 || friend_hits {
-                let hits: Vec<String> = (0..MAX_PLAYERS).filter(|&k| e.hits[k] > 0).map(|k| format!("{} {}", self.label(k as u8), e.hits[k])).collect();
-                log::line(&format!(
-                    "aitarget: {} last {:.0}s: {} replan frame(s) ({} with 2+ players), {} top change(s), hits seen {}",
-                    enemy_name(e.ai),
-                    now.saturating_sub(e.window_ms) as f32 / 1000.0,
-                    e.replans,
-                    e.replans_multi,
-                    e.switches,
-                    if hits.is_empty() { "none".to_string() } else { hits.join(", ") },
-                ));
-            }
-        }
-        if !marks.is_empty() {
-            let mut t = table();
-            for (ai, logged, line) in marks {
-                if let Some(e) = t.enemies.iter_mut().find(|e| e.ai == ai) {
-                    if line {
-                        e.line_ms = now;
-                        e.logged_replan = logged;
-                    } else {
-                        e.window_ms = now;
-                        e.replans = 0;
-                        e.replans_multi = 0;
-                        e.switches = 0;
-                        e.hits = [0; MAX_PLAYERS];
-                    }
+        if let Some((events, n, dropped, live)) = got {
+            self.dropped += dropped;
+            for ev in events.iter().take(n).flatten() {
+                let multi = live.iter().find(|e| e.ai == ev.ai()).is_some_and(|e| e.present(now).len() >= 2);
+                if worth_logging(ev, multi) {
+                    let text = self.event_text(ev);
+                    self.line(now, &text);
                 }
             }
+            self.enemy_lines(now, &live);
         }
+        self.notes(now);
+    }
 
-        if due(self.last_perf_ms, now, SUMMARY_MS) {
-            let (c, p, b) = (CALLS.load(Relaxed), PLAYER_CALLS.load(Relaxed), BUSY.load(Relaxed));
-            if self.last_perf_ms != 0 && c > self.last_calls {
-                let secs = now.saturating_sub(self.last_perf_ms) as f32 / 1000.0;
-                log::line(&format!(
-                    "aitarget: score calls {:.0}/s, {:.0}/s about a player, {} sample(s) dropped (table busy) in {secs:.0}s",
-                    (c - self.last_calls) as f32 / secs,
-                    (p - self.last_player_calls) as f32 / secs,
-                    b - self.last_busy,
-                ));
+    fn enemy_lines(&mut self, now: u64, live: &[Enemy]) {
+        let mut marks: Vec<(usize, Option<u64>, bool)> = Vec::new();
+        for e in live {
+            if e.replan_line_due(now) {
+                let on = e.on_latest_replan();
+                let parts: Vec<String> = on.iter().map(|&k| describe(&self.who(k), &e.on_replan[k])).collect();
+                let best = on.iter().copied().max_by(|&a, &b| e.on_replan[a].score.total_cmp(&e.on_replan[b].score)).map_or(NO_SLOT, |k| k as u8);
+                let text = format!(
+                    "aitarget: {} replan frame (no +50): {} | best {}, top {} for {:.1}s",
+                    enemy_name(e.ai),
+                    parts.join(" | "),
+                    self.label(best),
+                    self.label(e.top),
+                    now.saturating_sub(e.top_since_ms) as f32 / 1000.0,
+                );
+                self.line(now, &text);
+                marks.push((e.ai, Some(e.replan_frame), false));
             }
-            self.last_perf_ms = now;
-            self.last_calls = c;
-            self.last_player_calls = p;
-            self.last_busy = b;
+            if let Some(log_it) = e.summary_due(now) {
+                if log_it {
+                    let hits: Vec<String> = (0..SLOTS).filter(|&k| e.hits[k] > 0).map(|k| format!("{} {}", self.label(k as u8), e.hits[k])).collect();
+                    let text = format!(
+                        "aitarget: {} last {:.0}s: {} replan frame(s) ({} with 2+ players), {} top change(s), hits seen {} (at least)",
+                        enemy_name(e.ai),
+                        now.saturating_sub(e.window_ms) as f32 / 1000.0,
+                        e.replans,
+                        e.replans_multi,
+                        e.switches,
+                        if hits.is_empty() { "none".to_string() } else { hits.join(", ") },
+                    );
+                    self.line(now, &text);
+                }
+                marks.push((e.ai, None, true));
+            }
+        }
+        if marks.is_empty() {
+            return;
+        }
+        let mut t = table();
+        for (ai, logged, window) in marks {
+            if let Some(e) = t.enemies.iter_mut().find(|e| e.ai == ai) {
+                if let Some(f) = logged {
+                    e.line_ms = now;
+                    e.logged_replan = f;
+                }
+                if window {
+                    e.window_ms = now;
+                    e.replans = 0;
+                    e.replans_multi = 0;
+                    e.switches = 0;
+                    e.hits = [0; SLOTS];
+                    e.friend_window = false;
+                }
+            }
         }
     }
 
-    fn log_event(&self, ev: &Event) {
+    /// Rate-limited notes outside the line budget (each at most once per 10 s).
+    fn notes(&mut self, now: u64) {
+        if self.dropped > 0 && due(self.dropped_log_ms, now, SUMMARY_MS) {
+            log::line(&format!("aitarget: {} event(s) dropped (more than {EVENTS} in one frame) in the last 10 s or so", self.dropped));
+            self.dropped = 0;
+            self.dropped_log_ms = now;
+        }
+        if let Some(n) = self.budget.note(now) {
+            log::line(&format!("aitarget: {n} line(s) suppressed (more than {} a second)", LineBudget::PER_SEC));
+        }
+        if due(self.last_perf_ms, now, SUMMARY_MS) {
+            let cur = [&CALLS, &PLAYER_CALLS, &BUSY, &BAD_OWNER, &NO_REPLAN].map(|a| a.load(Relaxed));
+            if self.last_perf_ms != 0 && cur[0] > self.last[0] {
+                let secs = now.saturating_sub(self.last_perf_ms) as f32 / 1000.0;
+                log::line(&format!(
+                    "aitarget: score calls {:.0}/s, {:.0}/s about a player; in {secs:.0}s {} sample(s) dropped (table busy), {} skipped (owner vtable not 0x142961690), {} with the replan state unknown",
+                    (cur[0] - self.last[0]) as f32 / secs,
+                    (cur[1] - self.last[1]) as f32 / secs,
+                    cur[2] - self.last[2],
+                    cur[3] - self.last[3],
+                    cur[4] - self.last[4],
+                ));
+            }
+            self.last_perf_ms = now;
+            self.last = cur;
+        }
+    }
+
+    fn event_text(&self, ev: &Event) -> String {
         match *ev {
             Event::Top { ai, from, to, replan, held_ms, s_from, s_to } => {
-                let mut parts = Vec::new();
-                if (to as usize) < MAX_PLAYERS {
-                    parts.push(describe(&format!("new {}", self.who(to as usize)), &s_to));
-                }
-                if (from as usize) < MAX_PLAYERS && s_from.ms != 0 {
+                let mut parts = vec![describe(&format!("new {}", self.who(to as usize)), &s_to)];
+                let first = !((from as usize) < SLOTS && s_from.ms != 0);
+                if !first {
                     parts.push(describe(&format!("old {}", self.who(from as usize)), &s_from));
                 }
-                log::line(&format!(
-                    "aitarget: {} TARGET {} -> {} ({}; old held {:.1}s): {}",
+                let held = if first { "first player target".to_string() } else { format!("old held {:.1}s", held_ms as f32 / 1000.0) };
+                format!(
+                    "aitarget: {} TARGET {} -> {} ({}; {held}): {}",
                     enemy_name(ai),
                     self.label(from),
                     self.label(to),
-                    if replan { "on a replan frame" } else { "NOT a replan frame" },
-                    held_ms as f32 / 1000.0,
+                    replan_text(replan),
                     parts.join(" | "),
-                ));
+                )
             }
-            Event::Hit { ai, slot, cur, top } => log::line(&format!(
+            Event::Hit { ai, slot, cur, top } => format!(
                 "aitarget: {} HIT by {} registered on this PC's AI (top {}): {}",
                 enemy_name(ai),
                 self.who(slot as usize),
                 self.label(top),
                 describe(&self.label(slot), &cur),
-            )),
-            Event::Appear { ai, slot, cur } => log::line(&format!(
+            ),
+            Event::Appear { ai, slot, cur } => format!(
                 "aitarget: {} knows {} now: {}",
                 enemy_name(ai),
                 self.who(slot as usize),
                 describe(&self.label(slot), &cur),
-            )),
+            ),
         }
     }
 }
@@ -744,6 +925,10 @@ mod tests {
 
     fn s(ms: u64, frame: u64, score: f32) -> Sample {
         Sample { ms, frame, score, hit_weight: 1.0, ..Sample::NONE }
+    }
+
+    fn rp(ms: u64, frame: u64, score: f32) -> Sample {
+        Sample { replan: Some(true), ..s(ms, frame, score) }
     }
 
     #[test]
@@ -764,7 +949,6 @@ mod tests {
         assert!((dist_term(10.0) - 0.99).abs() < 1e-6);
         assert_eq!(dist_term(1000.0), 0.0);
         assert_eq!(dist_term(5000.0), 0.0);
-        // score of a top record 10 m away, hit just now, no priority: residual 0.
         let (h, t, b) = factors(10.0, 1.0, 14.0, true, false);
         let score = dist_term(10.0) * h * t + b;
         assert!(residual(score, 10.0, h, t, b).abs() < 1e-4);
@@ -775,7 +959,9 @@ mod tests {
     #[test]
     fn hit_detection() {
         assert!(hit_rose(Some(3.0), 10.0));
+        assert!(hit_rose(Some(9.9), 10.0), "a re-hit 0.1 s after the last one");
         assert!(!hit_rose(Some(9.99), 9.98), "decay is no hit");
+        assert!(!hit_rose(Some(10.0), 10.0), "no change");
         assert!(!hit_rose(Some(0.0), 0.0));
         assert!(hit_rose(None, 10.0), "a record created by a hit");
         assert!(!hit_rose(None, 0.0), "a record created by sight");
@@ -792,7 +978,7 @@ mod tests {
     fn appear_hit_and_top_change_events() {
         let mut t = Table::new();
         let a = 0x5000;
-        // Enemy sees us (top), then the friend appears with a hit.
+        // Enemy sees us (top), then the friend (slot 1) appears with a hit.
         t.record(a, 0, Sample { is_top: true, ..s(100, 1, 51.0) });
         t.record(a, 1, Sample { hit_timer: 10.0, ..s(100, 1, 1.9) });
         let (ev, n, d) = t.take_events();
@@ -802,29 +988,40 @@ mod tests {
         assert!(matches!(ev[2], Some(Event::Appear { slot: 1, .. })));
         assert!(matches!(ev[3], Some(Event::Hit { slot: 1, top: 0, .. })));
         // Replan frame: the friend wins, we lose the top flag.
-        t.record(a, 0, Sample { replan: true, ..s(200, 2, 1.0) });
-        t.record(a, 1, Sample { replan: true, is_top: true, hit_timer: 9.0, ..s(200, 2, 2.0) });
+        t.record(a, 0, rp(200, 2, 1.0));
+        t.record(a, 1, Sample { is_top: true, hit_timer: 9.0, ..rp(200, 2, 2.0) });
         let (ev, n, _) = t.take_events();
         assert_eq!(n, 1, "one switch, one event, whichever record is scored first");
-        assert!(matches!(ev[0], Some(Event::Top { from: 0, to: 1, replan: true, held_ms: 100, .. })));
+        assert!(matches!(ev[0], Some(Event::Top { from: 0, to: 1, replan: Some(true), held_ms: 100, .. })));
         // The other order: the new top is scored before the old one loses its flag.
         t.record(a, 0, Sample { is_top: true, ..s(300, 3, 2.0) });
         t.record(a, 1, s(300, 3, 2.0));
         let (ev, n, _) = t.take_events();
         assert_eq!(n, 1);
-        assert!(matches!(ev[0], Some(Event::Top { from: 1, to: 0, replan: false, .. })));
+        assert!(matches!(ev[0], Some(Event::Top { from: 1, to: 0, replan: Some(false), .. })));
         let e = t.enemies[t.entry(a, 300)];
         assert_eq!((e.replans, e.replans_multi, e.top, e.hits[1], e.switches), (1, 1, 0, 1, 3));
+        assert!(e.friend_window);
         assert_eq!(e.on_replan[0].frame, 2);
         assert_eq!(e.on_replan[1].score, 2.0);
+    }
+
+    #[test]
+    fn unknown_replan_state_is_not_counted() {
+        let mut t = Table::new();
+        t.record(9, 0, Sample { replan: None, ..s(10, 1, 1.0) });
+        t.record(9, 1, Sample { replan: None, ..s(10, 1, 1.0) });
+        let e = t.enemies[t.entry(9, 10)];
+        assert_eq!((e.replans, e.replans_multi), (0, 0));
+        assert!(describe("me", &e.cands[0]).contains("replan state unknown"));
     }
 
     #[test]
     fn replan_counted_once_per_frame() {
         let mut t = Table::new();
         for f in 1..=3 {
-            t.record(7, 0, Sample { replan: true, ..s(f * 10, f, 1.0) });
-            t.record(7, 1, Sample { replan: true, ..s(f * 10, f, 1.0) });
+            t.record(7, 0, rp(f * 10, f, 1.0));
+            t.record(7, 1, rp(f * 10, f, 1.0));
         }
         t.record(7, 0, s(40, 4, 1.0));
         let e = t.enemies[t.entry(7, 40)];
@@ -835,13 +1032,12 @@ mod tests {
     #[test]
     fn table_reuses_stale_and_never_grows() {
         let mut t = Table::new();
-        for ai in 1..=(ENEMIES as usize + 10) {
+        for ai in 1..=(ENEMIES + 10) {
             t.record(ai, 0, s(ai as u64, 1, 1.0));
         }
         assert_eq!(t.enemies.iter().filter(|e| e.ai != 0).count(), ENEMIES);
         // Bad slot: ignored.
-        t.record(1, MAX_PLAYERS, s(1, 1, 1.0));
-        // A stale entry is reused for a new enemy.
+        t.record(1, SLOTS, s(1, 1, 1.0));
         let mut t = Table::new();
         t.record(1, 0, s(1, 1, 1.0));
         let i = t.entry(2, 1 + STALE_MS + 1);
@@ -862,27 +1058,105 @@ mod tests {
     }
 
     #[test]
+    fn idle_table_needs_no_copy() {
+        let mut t = Table::new();
+        assert!(!t.active(1_000));
+        t.record(3, 0, s(1_000, 1, 1.0));
+        assert!(t.active(1_000), "an event waits");
+        t.take_events();
+        assert!(t.active(1_400), "seen within PRESENT_MS");
+        assert!(!t.active(1_000 + PRESENT_MS + 1));
+    }
+
+    #[test]
     fn describe_has_the_parts() {
-        let line = describe("peer1", &Sample { dist: 4.0, hit_timer: 10.0, is_top: true, replan: true, ..s(1, 1, 1.992) });
+        let line = describe("peer1", &Sample { dist: 4.0, hit_timer: 10.0, is_top: true, ..rp(1, 1, 1.992) });
         assert!(line.contains("hitF 2.00") && line.contains("bonus 0") && line.contains("[top]") && line.contains("hit 0.0s ago"), "{line}");
     }
 
     #[test]
     fn solo_events_stay_out_of_the_log() {
-        let top = |from, to| Event::Top { ai: 1, from, to, replan: false, held_ms: 0, s_from: Sample::NONE, s_to: Sample::NONE };
+        let top = |from, to| Event::Top { ai: 1, from, to, replan: Some(false), held_ms: 0, s_from: Sample::NONE, s_to: Sample::NONE };
         assert!(!worth_logging(&top(NO_SLOT, 0), false), "an enemy noticing only us");
         assert!(!worth_logging(&Event::Hit { ai: 1, slot: 0, cur: Sample::NONE, top: 0 }, false));
         assert!(!worth_logging(&Event::Appear { ai: 1, slot: 0, cur: Sample::NONE }, false));
         assert!(worth_logging(&top(0, 1), false));
         assert!(worth_logging(&top(1, NO_SLOT), false));
+        assert!(worth_logging(&top(0, SLOTS as u8 - 1), false), "peer id 5 = slot 6");
         assert!(worth_logging(&Event::Hit { ai: 1, slot: 1, cur: Sample::NONE, top: 0 }, false), "the friend's hit: open point 3");
         assert!(worth_logging(&Event::Appear { ai: 1, slot: 0, cur: Sample::NONE }, true));
         assert_eq!(top(0, 1).ai(), 1);
     }
 
+    /// Review: the global budget holds every second, the rest is counted and reported at
+    /// most once per 10 s.
     #[test]
-    fn prologue_is_position_independent() {
-        assert_eq!(SCORE_PROLOGUE.len(), 15);
-        assert_eq!(&SCORE_PROLOGUE[..5], &[0x48, 0x89, 0x5C, 0x24, 0x18]);
+    fn line_budget_bounds() {
+        let mut b = LineBudget::default();
+        let mut logged = 0;
+        // 100 lines a second for 30 s (every 10 ms).
+        let mut notes = Vec::new();
+        for ms in (1..=30_000u64).step_by(10) {
+            if b.allow(ms) {
+                logged += 1;
+            }
+            if let Some(n) = b.note(ms) {
+                notes.push((ms, n));
+            }
+        }
+        assert!(logged <= 31 * LineBudget::PER_SEC as usize, "{logged}");
+        assert!(logged >= 29 * LineBudget::PER_SEC as usize, "{logged}");
+        assert!(notes.len() <= 4, "{notes:?}");
+        for w in notes.windows(2) {
+            assert!(w[1].0 - w[0].0 >= LineBudget::NOTE_GAP_MS);
+        }
+        // Everything over budget is accounted for.
+        let total: u32 = notes.iter().map(|n| n.1).sum::<u32>() + b.suppressed;
+        assert_eq!(total as usize + logged, 3_000);
+        // Quiet: no note.
+        let mut q = LineBudget::default();
+        assert!(q.allow(5));
+        assert_eq!(q.note(20_000), None);
+    }
+
+    /// Review: per-enemy lines only on a new replan frame with 2+ players, at most one a
+    /// second; summaries only with activity and a friend in the list.
+    #[test]
+    fn enemy_line_bounds() {
+        let mut t = Table::new();
+        let a = 0x77;
+        // Only us on replan frames: no replan line.
+        t.record(a, 0, rp(10, 1, 1.0));
+        let i = t.entry(a, 10);
+        assert!(!t.enemies[i].replan_line_due(10));
+        // Both players on replan frames every frame for 3 s (60 fps): one line a second.
+        let mut lines = 0;
+        for f in 2..=181u64 {
+            let ms = f * 16;
+            t.record(a, 0, rp(ms, f, 1.0));
+            t.record(a, 1, rp(ms, f, 1.0));
+            let e = &mut t.enemies[i];
+            if e.replan_line_due(ms) {
+                lines += 1;
+                e.line_ms = ms;
+                e.logged_replan = e.replan_frame;
+            }
+        }
+        assert!((2..=4).contains(&lines), "{lines}");
+        // Hold frames (no replan): no line even when due by time.
+        let e = &mut t.enemies[i];
+        e.line_ms = 0;
+        e.logged_replan = e.replan_frame;
+        t.record(a, 0, s(5_000, 300, 51.0));
+        t.record(a, 1, s(5_000, 300, 1.0));
+        assert!(!t.enemies[i].replan_line_due(5_000));
+        // Summary: idle (a boss that just remembers both players) stays silent.
+        let idle = Enemy { ai: 1, window_ms: 0, friend_window: true, ..Enemy::FREE };
+        assert_eq!(idle.summary_due(SUMMARY_MS - 1), None);
+        assert_eq!(idle.summary_due(SUMMARY_MS), Some(false));
+        let busy = Enemy { replans: 2, ..idle };
+        assert_eq!(busy.summary_due(SUMMARY_MS), Some(true));
+        let solo = Enemy { friend_window: false, ..busy };
+        assert_eq!(solo.summary_due(SUMMARY_MS), Some(false));
     }
 }

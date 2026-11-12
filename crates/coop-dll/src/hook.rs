@@ -814,6 +814,49 @@ pub fn install_detour_caller_r8(rva: usize, expected_prologue: &[u8], detour: us
 }
 
 fn install_detour_inner(rva: usize, expected_prologue: &[u8], detour: usize, name: &str, caller_r8: bool) -> Option<usize> {
+    let page = build_detour(rva, expected_prologue, detour, name, caller_r8)?;
+    let site = crate::game::module_base() + rva;
+    let len = expected_prologue.len();
+    // Game threads may already run this function: write with them suspended.
+    if !patch_jmp_frozen(site, page + DETOUR_STUB, len) {
+        log::line(&format!("hook: {name} at {site:#x} patch failed"));
+        return None;
+    }
+    log::line(&format!("hook: {name} at {site:#x} detoured (trampoline {page:#x}, {len} bytes relocated)"));
+    Some(page)
+}
+
+/// A detour whose trampoline and stub are built but whose site is not patched yet
+/// (`prepare_detour` / `engage_detour`): the caller publishes `page` (the trampoline) to its
+/// detour first, so the detour never runs without it, and can retry a busy engage later.
+pub struct PreparedDetour {
+    pub page: usize,
+    pub site: usize,
+    old: Vec<u8>,
+    new: Vec<u8>,
+}
+
+/// Checks the prologue and builds the trampoline and stub; patches nothing. Logs a failure.
+pub fn prepare_detour(rva: usize, expected_prologue: &[u8], detour: usize, name: &str) -> Option<PreparedDetour> {
+    let page = build_detour(rva, expected_prologue, detour, name, false)?;
+    let site = crate::game::module_base() + rva;
+    let len = expected_prologue.len();
+    let rel = rel32(site + 5, page + DETOUR_STUB)?;
+    let mut new = vec![0xCCu8; len];
+    new[0] = 0xE9;
+    new[1..5].copy_from_slice(&rel);
+    Some(PreparedDetour { page, site, old: expected_prologue.to_vec(), new })
+}
+
+/// Patches the site of a prepared detour with every other thread suspended and none inside
+/// the prologue. `budget_ms` as `write_frozen_budget` (0 = none); `Busy` = retry later.
+/// Logs nothing itself.
+pub fn engage_detour(p: &PreparedDetour, budget_ms: u64) -> Result<(), freeze::Error> {
+    write_frozen_budget(&[(p.site, &p.old[..], &p.new[..])], budget_ms)
+}
+
+/// Checks the prologue, allocates the near page and writes the trampoline and stub.
+fn build_detour(rva: usize, expected_prologue: &[u8], detour: usize, name: &str, caller_r8: bool) -> Option<usize> {
     let len = expected_prologue.len();
     if !(5..=32).contains(&len) {
         log::line(&format!("hook: {name} prologue length {len} is not usable, not hooking"));
@@ -851,12 +894,6 @@ fn install_detour_inner(rva: usize, expected_prologue: &[u8], detour: usize, nam
         std::ptr::copy_nonoverlapping(stub.as_ptr(), (page + DETOUR_STUB) as *mut u8, stub.len());
         FlushInstructionCache(GetCurrentProcess(), page as *const c_void, DETOUR_STUB + stub.len());
     }
-    // Game threads may already run this function: write with them suspended.
-    if !patch_jmp_frozen(site, page + DETOUR_STUB, len) {
-        log::line(&format!("hook: {name} at {site:#x} patch failed"));
-        return None;
-    }
-    log::line(&format!("hook: {name} at {site:#x} detoured (trampoline {page:#x}, {len} bytes relocated)"));
     Some(page)
 }
 
