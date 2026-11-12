@@ -140,6 +140,43 @@ pub fn decode(data: &[u8]) -> Option<Vec<i32>> {
 /// What to do on a replica: (apply, remove). `want` = the owner's ids (already filtered by the
 /// local level), `applied` = what we applied earlier, `has` = present on the replica now.
 /// Only ids we applied are ever removed.
+/// Tries of one SpEffect on one replica that left it absent, in a row, before the mirror
+/// gives up on it (test5: live test4 logged `+106000(ret 0, present false)` ~6400 times).
+pub const MIRROR_GIVE_UP: u32 = 5;
+
+/// One try's outcome into the per-replica failure counts. Some(n) = this try made it give up.
+/// A success resets the count; an id the owner no longer has is forgotten (`forget_unwanted`),
+/// so its next activation gets fresh tries.
+pub fn note_try(fails: &mut Vec<(i32, u32)>, id: i32, present: bool) -> Option<u32> {
+    let at = fails.iter().position(|(f, _)| *f == id);
+    if present {
+        if let Some(at) = at {
+            fails.swap_remove(at);
+        }
+        return None;
+    }
+    let n = match at {
+        Some(at) => {
+            fails[at].1 += 1;
+            fails[at].1
+        }
+        None => {
+            fails.push((id, 1));
+            1
+        }
+    };
+    (n == MIRROR_GIVE_UP).then_some(n)
+}
+
+/// Given up on (`MIRROR_GIVE_UP` failures in a row).
+pub fn given_up(fails: &[(i32, u32)], id: i32) -> bool {
+    fails.iter().any(|&(f, n)| f == id && n >= MIRROR_GIVE_UP)
+}
+
+pub fn forget_unwanted(fails: &mut Vec<(i32, u32)>, want: &[i32]) {
+    fails.retain(|(id, _)| want.contains(id));
+}
+
 pub fn plan(want: &[i32], applied: &[i32], has: impl Fn(i32) -> bool) -> (Vec<i32>, Vec<i32>) {
     let add = want.iter().copied().filter(|&id| !has(id)).collect();
     let del = applied.iter().copied().filter(|id| !want.contains(id) && has(*id)).collect();
@@ -234,6 +271,8 @@ struct State {
     mirror_at: Option<Instant>,
     /// Per peer index: (replica chr, ids we applied to it).
     applied: [(usize, Vec<i32>); MAX_PLAYERS],
+    /// Per peer index: (SpEffect id, tries in a row that left it absent) on that replica.
+    fails: [Vec<(i32, u32)>; MAX_PLAYERS],
     mirror_logs: u32,
     /// fx_debug: last SpEffect id set and status line per watched chr.
     seen_sp: Vec<(usize, Vec<i32>)>,
@@ -308,6 +347,7 @@ fn tick_inner(player: Option<Chr>, peers: &PeerSet) {
         last_sent: None,
         mirror_at: None,
         applied: [const { (0, Vec::new()) }; MAX_PLAYERS],
+        fails: [const { Vec::new() }; MAX_PLAYERS],
         mirror_logs: 0,
         seen_sp: Vec::new(),
         seen_status: Vec::new(),
@@ -366,6 +406,7 @@ fn mirror(s: &mut State, now: Instant) {
         let chr = REPLICA_CHR[i].load(Relaxed);
         if s.applied[i].0 != chr {
             s.applied[i] = (chr, Vec::new());
+            s.fails[i].clear();
         }
         if chr == 0 {
             continue;
@@ -386,7 +427,9 @@ fn mirror(s: &mut State, now: Instant) {
             continue;
         }
         let has_f: extern "C" fn(usize, i32) -> u8 = unsafe { std::mem::transmute(base + HAS_RVA) };
-        let (add, del) = plan(&want, &s.applied[i].1, |id| has_f(list, id) != 0);
+        forget_unwanted(&mut s.fails[i], &want);
+        let (mut add, del) = plan(&want, &s.applied[i].1, |id| has_f(list, id) != 0);
+        add.retain(|&id| !given_up(&s.fails[i], id));
         if add.is_empty() && del.is_empty() {
             continue;
         }
@@ -397,7 +440,13 @@ fn mirror(s: &mut State, now: Instant) {
         let mut done = Vec::new();
         for &id in &add {
             let r = apply(chr, id, chr, 0, 0, &ONE4, 1.0, 0, 0, 0);
-            done.push(format!("+{id}(ret {r}, present {})", has_f(list, id) != 0));
+            let present = has_f(list, id) != 0;
+            done.push(format!("+{id}(ret {r}, present {present})"));
+            if let Some(n) = note_try(&mut s.fails[i], id, present) {
+                log::line(&format!(
+                    "fx: mirror: replica of slot {i} chr {chr:#x}: SpEffect {id} still absent after {n} tries in a row (last ret {r}): no more tries on this replica until the owner loses it"
+                ));
+            }
             if !s.applied[i].1.contains(&id) {
                 s.applied[i].1.push(id);
             }
@@ -716,6 +765,28 @@ mod tests {
         assert_eq!(decode(&short), None);
         assert_eq!(decode(&encode(&[-1])), None);
         assert!(encode(&many).len() <= coop_net::MAX_PLAYER_RAW);
+    }
+
+    #[test]
+    fn the_mirror_gives_up_after_failures_in_a_row() {
+        let mut f = Vec::new();
+        for _ in 1..MIRROR_GIVE_UP {
+            assert_eq!(note_try(&mut f, 106000, false), None);
+            assert!(!given_up(&f, 106000));
+        }
+        assert_eq!(note_try(&mut f, 106000, false), Some(MIRROR_GIVE_UP), "one summary line");
+        assert!(given_up(&f, 106000));
+        assert_eq!(note_try(&mut f, 106000, false), None, "never logged twice");
+        // Another id is counted on its own.
+        assert!(!given_up(&f, 140310));
+        // A success resets the count.
+        let mut g = Vec::new();
+        note_try(&mut g, 5, false);
+        note_try(&mut g, 5, true);
+        assert!(g.is_empty());
+        // The owner lost it: forgotten, its next activation gets fresh tries.
+        forget_unwanted(&mut f, &[140310]);
+        assert!(!given_up(&f, 106000));
     }
 
     #[test]

@@ -855,6 +855,9 @@ struct State {
     /// Map flag writes of the last `FLAG_WINDOW` (when, id, value).
     flags: VecDeque<(Instant, u32, bool)>,
     flag_window_until: Option<Instant>,
+    /// The value last logged per map flag (test5: a script rewriting the same value every
+    /// frame, `objact: flag 11125671 = true`, filled the log); cleared when a window starts.
+    flag_logged: HashMap<u32, bool>,
     last_own_anim: i32,
     own_objact: Option<(i32, Instant)>,
     seq: u32,
@@ -974,6 +977,10 @@ pub fn flag_write(id: u32, on: bool, bank: u8) {
             s.flags.pop_front();
         }
         s.flags.push_back((now, id, on));
+        // Logged only when the value changes (the window list above keeps every write).
+        if s.flag_logged.insert(id, on) == Some(on) {
+            return;
+        }
         if debug {
             log::line(&format!("objact: flag {id} = {on}"));
         } else if s.flag_window_until.is_some_and(|t| now <= t) {
@@ -1348,6 +1355,7 @@ fn watch_after_send(s: &mut State, now: Instant, at: Instant, b: &Block, i: &Inf
         log::line(&format!("objact: map flags written from {} s before it until now: [{}]", FLAG_WINDOW.as_secs(), before.join(", ")));
     }
     s.flag_window_until = Some(now + FLAG_WINDOW);
+    s.flag_logged.clear();
     if s.looks.len() < 64 {
         s.looks.push(Look {
             due: at + SENDER_LOOK,
