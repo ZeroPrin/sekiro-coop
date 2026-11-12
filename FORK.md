@@ -2,9 +2,9 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test4`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test5`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test4`: nothing in the sections below marked experimental or
+> **Test build `1.0.9-pickups.3-test5`: nothing in the sections below marked experimental or
 > "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
 > onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
@@ -12,6 +12,11 @@ Version string: `1.0.9-pickups.3-test4`. Everybody in a session needs the same b
 > native remote, `docs/IMPLEMENTATION-NOTES.md`), `objact-doors2` (one-loop doors at mode 1)
 > and `pvp-ff` (friendly fire, team 28). `test3` was never played live. `test4` adds `remote-fx`
 > (the friend's art slashes / sounds and full-detail parts, `docs/RE-REMOTE-FX.md`) and `wardrobe`.
+> `test5` follows the test4 live test (2026-11-12): the `zone-flicker` block-border grace is
+> reverted (session engage / remote creation as in test2; its spectate wait hint stays), the
+> friend's character updates every frame at any distance (`remote_every_frame`), objact flag /
+> fx mirror log spam capped, friendly fire in the Co-op Settings page and the panel,
+> `rest_refills_partner`, Cyrillic glyphs in the overlay font. Enemy sync is unchanged from test2.
 > The oracle is a playtest with both logs.
 
 ## New settings in this build
