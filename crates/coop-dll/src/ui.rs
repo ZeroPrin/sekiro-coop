@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hudhook::hooks::dx11::ImguiDx11Hooks;
-use hudhook::imgui::{Condition, Context, FontConfig, FontSource, Io, Key, Ui};
+use hudhook::imgui::{Condition, Context, FontConfig, FontGlyphRanges, FontSource, Io, Key, Ui};
 use hudhook::windows::Win32::Foundation::HINSTANCE;
 use hudhook::{Hudhook, ImguiRenderLoop, MessageFilter, RenderContext};
 
@@ -632,6 +632,10 @@ impl Overlay {
     }
 }
 
+/// Atlas glyphs of the overlay font (pairs of first, last; 0-terminated): Latin incl. Latin-1 and
+/// Extended-A/B, general punctuation, Cyrillic (Steam names). Segoe UI and Arial have all of them.
+static GLYPH_RANGES: &[u32] = &[0x0020, 0x024F, 0x0400, 0x052F, 0x2000, 0x206F, 0];
+
 impl ImguiRenderLoop for Overlay {
     // ImGui's built-in 13 px bitmap font looked pixelated on a friend's screen
     // (2026-10-22). Use Windows' Segoe UI, sized to the screen; Proton has no Segoe UI
@@ -651,7 +655,9 @@ impl ImguiRenderLoop for Overlay {
         ctx.fonts().add_font(&[FontSource::TtfData {
             data,
             size_pixels: size,
-            config: Some(FontConfig { oversample_h: 2, ..FontConfig::default() }),
+            // test5: ImGui's default range is Latin-1 only: a Cyrillic Steam name ("рваный
+            // пацанчик") showed as "?????? ????????" in the status line and above the head.
+            config: Some(FontConfig { oversample_h: 2, glyph_ranges: FontGlyphRanges::from_slice(GLYPH_RANGES), ..FontConfig::default() }),
         }]);
         log::line(&format!("ui: font {file} {size:.0} px"));
     }
