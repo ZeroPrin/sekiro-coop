@@ -215,6 +215,51 @@ pub fn down_wait_end(waited: Duration, still_down: usize, wiped: bool) -> Option
     }
 }
 
+/// Death hold (client, enemies.rs): our death reload is newer than the host's world. Live
+/// test4 18:21 (client log 2026-11-12_17-53-02): the host died first and spectated, we died
+/// last and reloaded first (482460); its OLD world kept sending HP 0 for enemies dead there
+/// until its own load (482465), and those zeros killed our fresh copies for good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DeathHold {
+    #[default]
+    Off,
+    /// `down_wait` runs: the down peer may get up (its world goes on) or die (wipe).
+    Waiting,
+    /// Wipe: until the dead peer reloaded (`peer ... is back after its death`).
+    AfterWipe,
+    /// Since the peer is back: its old-world records still in `enemies.latest` expire.
+    Tail(Instant),
+}
+
+/// Covers `enemies::STALE_AFTER` (1 s, an old-world record kept until a fresh one replaces
+/// it) plus packets in flight. Live: the host's last old-world frame came at its load
+/// (482465), "back" one second later (482466).
+pub const DEATH_HOLD_TAIL: Duration = Duration::from_millis(1500);
+
+/// One frame. `waiting` = `down_wait` is set, `ended` = how it ended this frame, `peer_down` =
+/// a peer of the ended wait still counts as dead (not reloaded).
+pub fn death_hold_step(h: DeathHold, waiting: bool, ended: Option<DownEnd>, peer_down: bool, now: Instant) -> DeathHold {
+    match (h, ended) {
+        _ if waiting => DeathHold::Waiting,
+        (_, Some(DownEnd::Wipe)) | (DeathHold::AfterWipe, _) if peer_down => DeathHold::AfterWipe,
+        (_, Some(DownEnd::Wipe)) | (DeathHold::AfterWipe, _) => DeathHold::Tail(now),
+        // A lone death (the peer got up: its world, its kills) or the cap: the kills apply.
+        (_, Some(_)) => DeathHold::Off,
+        (DeathHold::Tail(t), _) if now.duration_since(t) < DEATH_HOLD_TAIL => h,
+        _ => DeathHold::Off,
+    }
+}
+
+/// enemies.rs: a host HP the hold keeps off a living local copy (0 or lower).
+pub fn death_hold_blocks(hold: bool, local: i32, host: i32) -> bool {
+    hold && local > 0 && host < local
+}
+
+/// enemies.rs, client: the hold is on.
+pub fn death_hold() -> bool {
+    with(|st| st.death_hold != DeathHold::Off).unwrap_or(false)
+}
+
 /// Boss records are restored only on a load that follows a death of ours, and only for the
 /// load's initial set: `first_seen_gap` = time since the first member of its encounter
 /// was seen in this load (None = this is the first).
@@ -346,6 +391,9 @@ struct State {
     /// Our death reload came while these peers were down (`WAIT_FOR_DOWN`): since when, and
     /// `wipes` then. Our death keeps counting for a wipe meanwhile.
     down_wait: Option<(Instant, Vec<PeerId>, u32)>,
+    /// `death_hold_step` and the peers of the last wait.
+    death_hold: DeathHold,
+    hold_peers: Vec<PeerId>,
     /// Wipe clears so far (the wait ends on a new one).
     wipes: u32,
     stats: Stats,
@@ -567,10 +615,13 @@ pub fn tick(c: Ctx) {
             log::line("persist: we are back after our death: it no longer counts for a wipe");
         }
     }
+    let mut ended = None;
     if let Some((since, ids, wipes)) = st.down_wait.clone() {
         let still = ids.iter().filter(|id| c.peers.by_id(**id).is_some_and(|p| down(p, &st.peer_dead_at))).count();
         if let Some(end) = down_wait_end(now.duration_since(since), still, st.wipes != wipes) {
             st.down_wait = None;
+            st.hold_peers = ids;
+            ended = Some(end);
             // Lone death or the cap: our death is over now. A wipe already cleared it all.
             st.our_dead_at = None;
             log::line(&format!(
@@ -590,6 +641,8 @@ pub fn tick(c: Ctx) {
             log::line(&format!("persist: peer {} is back after its death: it no longer counts for a wipe", p.id.slot()));
         }
     }
+    let peer_down = st.hold_peers.iter().any(|id| st.peer_dead_at.contains_key(id));
+    st.death_hold = death_hold_step(st.death_hold, st.down_wait.is_some(), ended, peer_down, now);
     if st.our_dead_at.is_some_and(|x| now.duration_since(x) > WIPE_WINDOW) {
         st.our_dead_at = None;
     }
@@ -868,6 +921,49 @@ mod tests {
         // Never longer than the cap.
         assert_eq!(down_wait_end(DOWN_WAIT_MAX - Duration::from_millis(1), 2, false), None);
         assert_eq!(down_wait_end(DOWN_WAIT_MAX, 2, false), Some(DownEnd::Timeout));
+    }
+
+    #[test]
+    fn death_hold_keeps_the_hosts_old_world_off() {
+        use super::{DEATH_HOLD_TAIL, DeathHold as H, DownEnd, death_hold_blocks, death_hold_step as step};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let on = |h: H| h != H::Off;
+
+        // Host died first and spectates, we died last and reloaded first (live test4 18:21):
+        // its HP 0 records are kept off our living copies until it reloaded, plus the tail.
+        let h = step(H::Off, true, None, true, ms(0));
+        assert_eq!(h, H::Waiting);
+        assert!(death_hold_blocks(on(h), 512, 0) && death_hold_blocks(on(h), 512, 300));
+        assert!(!death_hold_blocks(on(h), 512, 512) && !death_hold_blocks(on(h), 300, 512), "equal / higher HP still copied");
+        assert!(!death_hold_blocks(on(h), 0, 0), "dead here: nothing to protect");
+        let h = step(h, false, Some(DownEnd::Wipe), true, ms(3836));
+        assert_eq!(h, H::AfterWipe);
+        let h = step(h, false, None, true, ms(4500));
+        assert_eq!(h, H::AfterWipe, "the host still runs its old world");
+        let h = step(h, false, None, false, ms(5000));
+        assert_eq!(h, H::Tail(ms(5000)));
+        assert!(on(step(h, false, None, false, ms(5000) + DEATH_HOLD_TAIL - Duration::from_millis(1))));
+        // Hold expiry.
+        assert_eq!(step(h, false, None, false, ms(5000) + DEATH_HOLD_TAIL), H::Off);
+
+        // Our lone death with the host alive: no wait, no hold; its kills are copied at once.
+        let h = step(H::Off, false, None, false, ms(0));
+        assert_eq!(h, H::Off);
+        assert!(!death_hold_blocks(on(h), 512, 0));
+
+        // Our lone death while the host resurrects: held while it is down, then its world
+        // (and its kills) is the truth again (dead set / type 5 / HP 0 apply as before).
+        let h = step(H::Off, true, None, true, ms(0));
+        assert!(on(h));
+        let h = step(h, false, Some(DownEnd::LoneDeath), false, ms(3336));
+        assert_eq!(h, H::Off);
+        assert!(!death_hold_blocks(on(h), 512, 0));
+        // The cap: kills run as well.
+        assert_eq!(step(H::Waiting, false, Some(DownEnd::Timeout), true, ms(30_000)), H::Off);
+        // A wipe whose dead peer already reloaded goes straight to the tail.
+        assert_eq!(step(H::Waiting, false, Some(DownEnd::Wipe), false, ms(10)), H::Tail(ms(10)));
     }
 
     #[test]

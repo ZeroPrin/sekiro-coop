@@ -223,6 +223,9 @@ pub struct Enemies {
     /// were left alive, and how many such lines were logged.
     rest_held: HashSet<i32>,
     rest_logs: u32,
+    /// Client, death hold (persist.rs `DeathHold`): on last frame, host records kept off.
+    death_hold_on: bool,
+    death_hold_ignored: u32,
     /// Native session: stealth ownership claims (entity -> netId, last time the approach
     /// held, reason), and whether the enemy was seen on its local AI since the claim.
     claims: HashMap<i32, (u16, Instant, &'static str, bool)>,
@@ -789,6 +792,16 @@ impl Enemies {
             }
         }
 
+        let death_hold = crate::persist::death_hold();
+        if death_hold != self.death_hold_on {
+            self.death_hold_on = death_hold;
+            if death_hold {
+                self.death_hold_ignored = 0;
+                log::line("enemies: death hold on: our death reload is newer than the host's world; its lower / 0 HP is kept off our living enemies");
+            } else {
+                log::line(&format!("enemies: death hold off: {} host HP writes kept off; the host's HP decides again", self.death_hold_ignored));
+            }
+        }
         let smoothing = tuning::enemy_smoothing();
         self.owned.clear();
         let ids: Vec<i32> = self.latest.keys().copied().collect();
@@ -898,6 +911,13 @@ impl Enemies {
             // is a corpse. Held like a rest-held enemy: no host HP (0 killed it), its own AI,
             // no position from the host (puppetguard.rs covers the native session's type 5).
             let rest_hold = rest_hold || crate::puppetguard::mode4_hold(chr.0, id, local, s.hp);
+            // Death hold: the host's old world (it died first and spectated) must not kill our
+            // fresh copies; the copy runs here like a rest-held one until the wait resolves.
+            let death_held = !rest_hold && crate::persist::death_hold_blocks(death_hold, local, s.hp);
+            if death_held {
+                self.death_hold_ignored += 1;
+            }
+            let rest_hold = rest_hold || death_held;
             if corpse || rest_hold {
                 self.last_written_hp.insert(id, local);
             } else if !holding {
