@@ -585,7 +585,13 @@ impl Puppet {
             Vec::new()
         };
         crate::activation::set_peers(&peers_here);
-        let forced: Vec<usize> = if spectating { self.native.remotes().map(|(_, c)| c.0).collect() } else { Vec::new() };
+        // Spectating, and (test5, `remote_every_frame`, default on) always: the friends' native
+        // remotes run every frame at any distance (activation.rs). Player remotes only.
+        let forced: Vec<usize> = if spectating || crate::activation::REMOTE_EVERY_FRAME.load(std::sync::atomic::Ordering::Relaxed) {
+            self.native.remotes().map(|(_, c)| c.0).collect()
+        } else {
+            Vec::new()
+        };
         crate::activation::set_forced_remotes(&forced);
         if (hosting || spectating) && self.activation_log_at.is_none_or(|t| t.elapsed().as_secs() >= 10) {
             self.activation_log_at = Some(std::time::Instant::now());

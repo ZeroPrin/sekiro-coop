@@ -479,6 +479,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::remotefx::MIRROR.store(ini.num("fx_speffect_mirror", 1, 0, 2, warn) as u8, Relaxed);
     crate::remotefx::FULL_PARTS.store(ini.flag("native_full_parts", true, warn), Relaxed);
     crate::remotefx::FX_DEBUG.store(ini.flag("fx_debug", false, warn), Relaxed);
+    crate::activation::REMOTE_EVERY_FRAME.store(ini.flag("remote_every_frame", true, warn), Relaxed);
     // Log categories switched off (log.rs). Missing key = the default list; an empty value = none.
     log::set_muted(log::parse_categories(ini.get("log_off").map_or(DEFAULT_LOG_OFF, String::as_str)));
     // Read once at start: the observation hooks stay once installed.
@@ -946,6 +947,10 @@ native_full_parts = 1
 ; 1 = log effect / sound diagnostics (fx: lines: SpEffects, animation effect and sound events
 ; with their conditions, parts) for you and the friend's character. Long logs. 0 = off.
 fx_debug = 0
+; 1 = the friend's character on your screen updates every frame at any distance (the game
+; slows other players' characters down with distance: the friend stuttered beyond ~10 m).
+; 0 = the game's rule (every frame only while you spectate). Enemies are not affected.
+remote_every_frame = 1
 ; v7.7 behaviours, switchable for testing (0 = as in v7.6). Same value on both machines.
 ; Claims / contests force the game's ownership hand-out at once (max once per second).
 ns_force_distribution = 1

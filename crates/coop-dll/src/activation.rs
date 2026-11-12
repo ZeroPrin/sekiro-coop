@@ -14,7 +14,7 @@
 //! friend. -1 (map entity passive) and -2 are left alone and only counted:
 //! if they show up near the friend, this is not enough (see the report).
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::game::{module_base, read, read_ptr};
 use crate::log;
@@ -59,10 +59,29 @@ pub fn set_peers(pos: &[[f32; 3]]) {
 /// Native remote player chrs forced to every-frame updates (0 = empty slot).
 static REMOTES: [AtomicUsize; MAX_PEERS] = [const { AtomicUsize::new(0) }; MAX_PEERS];
 
-/// Every frame: the native remotes to force (empty = none; set while we spectate).
+/// `[DEBUG] remote_every_frame` (default on, test5): the friends' native remotes update every
+/// frame at any distance, not only while we spectate. The game throttles them by the distance
+/// to our player like any chr (live test4 host: "update every 30 frames"; the friend's frames
+/// consumed per second < 10 m ~29, 10-20 m 15-24, 20-40 m ~12, > 40 m 2-7: the replica
+/// stuttered beyond ~10 m). Only the remote player chrs listed in `REMOTES` are touched:
+/// enemies keep the game's interval and the host's enemy rule below (its own budget), so enemy
+/// AI rate and ownership do not change.
+pub static REMOTE_EVERY_FRAME: AtomicBool = AtomicBool::new(true);
+/// The interval the game wanted for a remote the first time we overrode it (0 = not yet).
+static REMOTE_FORCED_FROM: AtomicI32 = AtomicI32::new(0);
+static REMOTE_FORCED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Every frame: the native remotes to force (empty = none).
 pub fn set_forced_remotes(chrs: &[usize]) {
     for (i, slot) in REMOTES.iter().enumerate() {
         slot.store(chrs.get(i).copied().unwrap_or(0), Ordering::Relaxed);
+    }
+    let from = REMOTE_FORCED_FROM.load(Ordering::Relaxed);
+    if from != 0 && !REMOTE_FORCED_LOGGED.swap(true, Ordering::Relaxed) {
+        log::line(&format!(
+            "activation: the friend's native remote forced to every-frame updates (the game wanted every {from} frames; remote_every_frame = {})",
+            u8::from(REMOTE_EVERY_FRAME.load(Ordering::Relaxed))
+        ));
     }
 }
 
@@ -111,6 +130,9 @@ extern "C" fn set_interval(chr: usize, n: i32) {
     // Spectating: the watched players' native remotes run every frame too (v8.6: the
     // friend held one pose for 3-5 frames on the spectator camera, live 2026-10-25).
     if n > 0 && REMOTES.iter().any(|r| r.load(Ordering::Relaxed) == chr) {
+        if REMOTE_FORCED_FROM.load(Ordering::Relaxed) == 0 {
+            REMOTE_FORCED_FROM.store(n, Ordering::Relaxed);
+        }
         n = 0;
     }
     let count = PEER_COUNT.load(Ordering::Acquire);
