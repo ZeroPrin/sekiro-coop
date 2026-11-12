@@ -1182,7 +1182,14 @@ pub fn tick(net: &mut Net, in_world_for: Duration, ready: bool) {
     //    client's transfer reaches the other clients through coop-net's host relay.
     while let Some((from, d)) = net.take_bulk_from(BULK_OBJACT) {
         match decode(&d) {
-            Ok(m) => with(|s| receive(s, from, m, mode, now)),
+            Ok(m) => {
+                let param = m.param;
+                with(|s| receive(s, from, m, mode, now));
+                // test6: doors.rs's fallback door-flag window opens only for a door / chest
+                // ObjAct; a lever, bell, wall... closes it (Senpou lift, live 2026-11-12).
+                // Review m7: after our lock, so doors.rs's lock is never taken inside ours.
+                doors::friend_objact(param);
+            }
             Err(why) => log::line(&format!("objact: message from peer {} ({} bytes) ignored: {why}", from.slot(), d.len())),
         }
     }
@@ -1613,9 +1620,6 @@ fn decide(s: &mut State, now: Instant, mode: u8, debug: bool, by_hook: bool) -> 
 
 fn receive(s: &mut State, from: PeerId, m: Msg, mode: u8, now: Instant) {
     s.received += 1;
-    // test6: doors.rs's fallback door-flag window opens only for a door / chest ObjAct; a lever,
-    // bell, wall... closes it (Senpou lift, live 2026-11-12).
-    doors::friend_objact(m.param);
     let queued = mode != 0 && s.incoming.len() < MAX_INCOMING;
     if mode != 0 && !queued {
         s.dropped += 1;

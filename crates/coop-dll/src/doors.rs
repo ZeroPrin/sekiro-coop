@@ -490,21 +490,48 @@ fn known_door(s: &State, id: u32) -> bool {
     s.door_flags.contains(&id) || s.candidates.contains_key(&id)
 }
 
-/// `ObjActParam.playerAnimId` of every row (once the params are loaded).
-pub(crate) fn objact_anims() -> Option<&'static HashSet<u32>> {
+/// test6 (review m8): the ObjActParam rows placed in Sekiro's maps (E:\RE\sekiro-data\objacts.md:
+/// the 30 rows an MSB ObjAct names, plus 109950 / 205010 / 205100 that MSB ObjActs with param
+/// -1 take from their model o109950 / o205010 / o205100 [ARV: param = model id]). The other 116
+/// rows are Dark Souls III leftovers (m30-m40, m93, m96, test rows) whose player animations
+/// (60000, 60200...) must not count as an ObjAct of a player.
+pub(crate) const PLACED_OBJACT_PARAMS: [i32; 33] = [
+    90060, 90061, 90071, 90075, 90076, 101050, 109950, 205010, 205011, 205100, 205101, 252555, 999900, 999901, 999910, 999911,
+    999920, 999921, 999922, 999940, 999941, 999945, 999946, 999950, 999960, 999970, 999971, 999975, 999976, 999980, 999985,
+    999990, 1100000,
+];
+
+/// Pure: (row id, playerAnimId) of the ObjActParam rows -> (door / chest anims, other anims),
+/// placed rows only.
+fn split_anims(rows: impl Iterator<Item = (i32, u32)>) -> (HashSet<u32>, HashSet<u32>) {
+    let (mut door, mut other) = (HashSet::new(), HashSet::new());
+    for (id, a) in rows {
+        if a == 0 || a == u32::MAX || !PLACED_OBJACT_PARAMS.contains(&id) {
+            continue;
+        }
+        if reopens(id) { door.insert(a) } else { other.insert(a) };
+    }
+    (door, other)
+}
+
+/// (row id, playerAnimId) of every ObjActParam row, None before the params are loaded.
+fn objact_param_anims() -> Option<Vec<(i32, u32)>> {
     use fromsoftware_shared::FromStatic;
     use sekiro::param::{OBJ_ACT_PARAM_ST, ParamDef};
     use sekiro::sprj::SoloParamRepository;
+    let repo = unsafe { SoloParamRepository::instance() }.ok()?;
+    let file = repo.params().find(|p| p.struct_name() == OBJ_ACT_PARAM_ST::NAME).map(|p| &*p.data)?;
+    Some(unsafe { file.rows::<OBJ_ACT_PARAM_ST>() }.map(|(id, r)| (id as i32, r.player_anim_id())).collect())
+}
+
+/// `ObjActParam.playerAnimId` of every row placed in a map (once the params are loaded).
+pub(crate) fn objact_anims() -> Option<&'static HashSet<u32>> {
     static ANIMS: OnceLock<HashSet<u32>> = OnceLock::new();
     if let Some(a) = ANIMS.get() {
         return Some(a);
     }
-    let repo = unsafe { SoloParamRepository::instance() }.ok()?;
-    let file = repo.params().find(|p| p.struct_name() == OBJ_ACT_PARAM_ST::NAME).map(|p| &*p.data)?;
-    let set: HashSet<u32> = unsafe { file.rows::<OBJ_ACT_PARAM_ST>() }
-        .map(|(_, r)| r.player_anim_id())
-        .filter(|&a| a > 0 && a != u32::MAX)
-        .collect();
+    let (door, other) = split_anims(objact_param_anims()?.into_iter());
+    let set: HashSet<u32> = door.union(&other).copied().collect();
     if set.is_empty() {
         return None;
     }
@@ -512,25 +539,14 @@ pub(crate) fn objact_anims() -> Option<&'static HashSet<u32>> {
 }
 
 /// test6: `ObjActParam.playerAnimId` split by the row's kind: (door / chest rows, every other
-/// row). Levers 205010 / 205011, bells, walls, floors, windows... are "other".
+/// row), placed rows only (review m8). Levers 205010 / 205011, bells, walls, floors,
+/// windows... are "other".
 pub(crate) fn objact_kind_anims() -> Option<(&'static HashSet<u32>, &'static HashSet<u32>)> {
-    use fromsoftware_shared::FromStatic;
-    use sekiro::param::{OBJ_ACT_PARAM_ST, ParamDef};
-    use sekiro::sprj::SoloParamRepository;
     static ANIMS: OnceLock<(HashSet<u32>, HashSet<u32>)> = OnceLock::new();
     if let Some((d, o)) = ANIMS.get() {
         return Some((d, o));
     }
-    let repo = unsafe { SoloParamRepository::instance() }.ok()?;
-    let file = repo.params().find(|p| p.struct_name() == OBJ_ACT_PARAM_ST::NAME).map(|p| &*p.data)?;
-    let (mut door, mut other) = (HashSet::new(), HashSet::new());
-    for (id, r) in unsafe { file.rows::<OBJ_ACT_PARAM_ST>() } {
-        let a = r.player_anim_id();
-        if a == 0 || a == u32::MAX {
-            continue;
-        }
-        if reopens(id as i32) { door.insert(a) } else { other.insert(a) };
-    }
+    let (door, other) = split_anims(objact_param_anims()?.into_iter());
     if door.is_empty() && other.is_empty() {
         return None;
     }
@@ -1251,6 +1267,26 @@ mod tests {
         s.candidates.insert(11100600, t);
         assert!(!release_if_cycled(&mut s, 11100600, t + Duration::from_secs(1), "our game"));
         assert!(cycled_off(t, t + CANDIDATE_CYCLE) && !cycled_off(t, t + CANDIDATE_CYCLE + Duration::from_secs(1)));
+    }
+
+    /// Review m8: only placed rows count; DS3 leftovers (60xxx animations) are ignored.
+    #[test]
+    fn anim_sets_from_placed_rows_only() {
+        let rows = [
+            (999940, 700200), // door, placed
+            (999980, 711100), // chest, placed
+            (205011, 710600), // lift lever, placed
+            (205010, 710600), // lift lever via its model
+            (300500, 60200),  // m30 lever: DS3 leftover
+            (310300, 60000),  // m31 door: DS3 leftover
+            (110, 60080),     // chest row not placed
+            (999990, 0),      // no animation
+        ];
+        let (door, other) = split_anims(rows.into_iter());
+        assert_eq!(door, HashSet::from([700200, 711100]));
+        assert_eq!(other, HashSet::from([710600]));
+        assert_eq!(anim_kind(60200, &door, &other), None, "a DS3 lever animation is no ObjAct");
+        assert_eq!(PLACED_OBJACT_PARAMS.len(), 33);
     }
 
     /// test6: the Senpou lift's flags are never door candidates, even right after a door.
