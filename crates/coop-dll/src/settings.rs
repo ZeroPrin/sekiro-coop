@@ -483,6 +483,7 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::remotefx::MIRROR.store(ini.num("fx_speffect_mirror", 1, 0, 2, warn) as u8, Relaxed);
     crate::remotefx::FULL_PARTS.store(ini.flag("native_full_parts", true, warn), Relaxed);
     crate::remotefx::FX_DEBUG.store(ini.flag("fx_debug", false, warn), Relaxed);
+    crate::aitarget::MODE.store(ini.num("ai_retarget", 1, 0, 1, warn) as u8, Relaxed);
     crate::activation::REMOTE_EVERY_FRAME.store(ini.flag("remote_every_frame", true, warn), Relaxed);
     // Log categories switched off (log.rs). Missing key = the default list; an empty value = none.
     log::set_muted(log::parse_categories(ini.get("log_off").map_or(DEFAULT_LOG_OFF, String::as_str)));
@@ -971,6 +972,11 @@ native_full_parts = 1
 ; 1 = log effect / sound diagnostics (fx: lines: SpEffects, animation effect and sound events
 ; with their conditions, parts) for you and the friend's character. Long logs. 0 = off.
 fx_debug = 0
+; How enemies on your PC choose between you and the companion (docs/RE-AI-TARGET.md). Only
+; enemies whose AI runs on your PC. 1 = observe: log their target scores, target changes,
+; replan moments and which player's hits they register (aitarget: lines); the game's choice
+; is never changed in this build. 0 = off (nothing observed; set at start = no hook at all).
+ai_retarget = 1
 ; 1 = the friend's character on your screen updates every frame at any distance (the game
 ; slows other players' characters down with distance: the friend stuttered beyond ~10 m).
 ; 0 = the game's rule (every frame only while you spectate). Enemies are not affected.

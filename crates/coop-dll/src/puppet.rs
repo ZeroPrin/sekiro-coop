@@ -137,6 +137,8 @@ pub struct Puppet {
     pvp: crate::pvp::Pvp,
     /// Dead players are not enemy targets (corpse.rs, `dead_players_untargetable`).
     corpse: crate::corpse::Corpse,
+    /// Enemy target scores observed (aitarget.rs, `ai_retarget`).
+    aitarget: crate::aitarget::AiTarget,
     fps_frames: u32,
     fps_since: Option<std::time::Instant>,
     fps: f32,
@@ -539,6 +541,7 @@ impl Puppet {
             crate::talklock::on_loading();
             self.scaling.reset();
             crate::corpse::on_loading();
+            crate::aitarget::on_loading();
             // Own world (ownworld.rs): an armed restore is written during this loading screen.
             crate::ownworld::on_loading();
             return;
@@ -554,6 +557,7 @@ impl Puppet {
             crate::talklock::on_loading();
             self.scaling.reset();
             crate::corpse::on_loading();
+            crate::aitarget::on_loading();
         }
         self.last_player = Some(player);
         // At most one line per 10 s (per-frame logging cost FPS, 2026-10-22).
@@ -916,6 +920,8 @@ impl Puppet {
         crash::breadcrumb("corpse");
         let linked = self.net.as_ref().and_then(Option::as_ref).is_some_and(|n| n.connected());
         self.corpse.tick(player, &self.peers, linked);
+        crash::breadcrumb("aitarget");
+        self.aitarget.tick(player, &self.peers);
         crash::breadcrumb("pvp");
         let host_ff = self.scale_remote.and_then(|c| c.friendly_fire);
         if let Some(Some(n)) = self.net.as_mut() {

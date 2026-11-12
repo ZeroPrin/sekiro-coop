@@ -7,6 +7,7 @@
 //! appearing while playing, and the game runs 10 minutes without crashing.
 
 mod activation;
+mod aitarget;
 mod artfx;
 mod audit;
 mod backups;
@@ -225,6 +226,8 @@ fn init(hmodule: usize) {
     nopause::install();
     talklock::install();
     speffect::install_hook();
+    // Enemy target scores, observed only (aitarget.rs, `[DEBUG] ai_retarget`).
+    aitarget::install_at_start();
     // v8.60: the owner's type-5 HP does not kill a Puppeteer puppet here (puppetguard.rs).
     puppetguard::install();
     fps::install();
