@@ -3946,8 +3946,9 @@ pub(crate) mod dblock {
 
     /// After ownfill takes a boss while another player waits dead in the fight, its AI starts
     /// fresh here (live 2026-11-12: retaken at 21:02:18, a stealth deathblow, throw 59972, at
-    /// 21:02:19 with 73 % HP and posture not broken). For this long our player's throws on it
-    /// are refused at the gate unless the boss is open to one (`justified`).
+    /// 21:02:19 with 73 % HP and posture not broken). For this long our player's STEALTH
+    /// deathblows on it are refused at the gate unless the boss is open to one (`take_vetoed`);
+    /// posture-break deathblows always pass.
     pub const TAKE_VETO_MS: u64 = 10_000;
     /// Slots: `netId << 48 | until_ms` (0 = free).
     static TAKEN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
@@ -3988,9 +3989,45 @@ pub(crate) mod dblock {
         TAKEN[i].store(w, Ordering::Relaxed);
         ANY_TAKEN.store(true, Ordering::Release);
         log::line(&format!(
-            "deathblow: boss {entity} netId {n:#x} taken while another player is down: for {} s our deathblows on it need broken posture or HP at 1 (fresh AI here)",
+            "deathblow: boss {entity} netId {n:#x} taken while another player is down: for {} s our stealth deathblows on it need broken posture or HP at 1 (fresh AI here; stealth = behind, crouching, plunging, wall hug, ledge hang; posture deathblows always pass)",
             TAKE_VETO_MS / 1000
         ));
+    }
+
+    /// ThrowKindParam `throwKindCategory` (kind row `+0x10`) of the deathblows whose vanilla
+    /// condition is an enemy unaware of the player, from the PC rows' names
+    /// (E:\RE\sekiro-data\params\csv\ThrowKindParam.csv): 0 背後 behind (also the roof rows
+    /// 500000-500203 and the stealth Ninjutsu follow-ups 201-203), 1 しゃがみ背後 crouching
+    /// behind, 6 落下 plunging (also roof 570000-570900), 7 制限なし落下 unrestricted fall,
+    /// 9 / 10 左 / 右壁張り付き wall hug left / right, 11 ぶら下がり ledge hang, 17 老化背後
+    /// "behind" of the 老化 state [ARV: a behind kind of another enemy state]. NOT stealth:
+    /// 2 deflect, 3 Mikiri, 4 崩し posture break (incl. 41201-41203 Ninjutsu after it, roof
+    /// 540000-541900, 270000 short range), 5 / 12 enemy special / event states, 8 anti-air,
+    /// 13 posture-break fall, 14 kick break, 15 wire break, 16 finishing, 18 / 19 aging break,
+    /// 20 break from behind, 21 underwater break. Which enemy state allows which category is
+    /// the table at `0x2A8DE90` (`0xBE0A40`) fed by the enemy's TAE / HKS (RE-BACKSTAB.md), so
+    /// "unaware" itself is not checkable here; the names are the evidence.
+    pub const STEALTH_CATEGORIES: [u8; 8] = [0, 1, 6, 7, 9, 10, 11, 17];
+
+    /// Pure: a stealth (awareness-gated) deathblow kind. Unreadable = no.
+    pub fn stealth_category(category: Option<u8>) -> bool {
+        category.is_some_and(|c| STEALTH_CATEGORIES.contains(&c))
+    }
+
+    /// Pure (review M2): the fresh-take veto refuses only a STEALTH deathblow
+    /// (`STEALTH_CATEGORIES`: behind, crouching behind, plunging, wall hug, ledge hang) on a
+    /// boss whose posture and HP do not open it. Posture-break (4) and its follow-ups, every
+    /// other kind and an unreadable category always pass.
+    pub fn take_vetoed(category: Option<u8>, hp: Option<i32>, posture: Option<i32>) -> bool {
+        stealth_category(category) && !justified(hp, posture)
+    }
+
+    /// The throw kind row's category (`kind+0x10`), None when the row pointer is not sane.
+    fn kind_category(kind: usize) -> Option<u8> {
+        if kind < 0x10000 {
+            return None;
+        }
+        crate::game::read::<u8>(kind + KIND_CATEGORY)
     }
 
     fn taken_locked(n: u16) -> bool {
@@ -4010,7 +4047,7 @@ pub(crate) mod dblock {
     // --- Stealth deathblow in combat (test6, experimental) -------------------------------
 
     /// `[GAMEPLAY] stealth_deathblow_needs_no_combat` (default 0): our player's stealth
-    /// deathblow (ThrowKindParam category 0 "behind" / 1 "crouching behind", kind row `+0x10`)
+    /// deathblow (`STEALTH_CATEGORIES`: behind, crouching behind, plunging, wall hug, ledge hang)
     /// is refused on an enemy whose AI runs here and is in battle (TargetingSystem state 3)
     /// with a player as its battle target, unless its posture is broken or HP at 1. Live
     /// 2026-11-12 (elite 1500495): the AI fought the friend's copy and the user, 2.5 m behind
@@ -4028,7 +4065,7 @@ pub(crate) mod dblock {
     /// `ai_here` / `target_is_player` from `aiview`.
     pub fn stealth_vetoed(enabled: bool, category: Option<u8>, ai_here: bool, state: i32, target_is_player: bool, hp: Option<i32>, posture: Option<i32>) -> bool {
         enabled
-            && matches!(category, Some(0 | 1))
+            && stealth_category(category)
             && ai_here
             && state == super::aiview::STATE_BATTLE
             && target_is_player
@@ -4036,11 +4073,11 @@ pub(crate) mod dblock {
     }
 
     fn stealth_check(def: usize, kind: usize) -> bool {
-        if !STEALTH_NEEDS_NO_COMBAT.load(Ordering::Relaxed) || kind < 0x10000 {
+        if !STEALTH_NEEDS_NO_COMBAT.load(Ordering::Relaxed) {
             return false;
         }
-        let category = crate::game::read::<u8>(kind + KIND_CATEGORY);
-        if !matches!(category, Some(0 | 1)) {
+        let category = kind_category(kind);
+        if !stealth_category(category) {
             return false;
         }
         let Some(v) = super::aiview::read_view(def) else { return false };
@@ -4140,9 +4177,9 @@ pub(crate) mod dblock {
         } else if fresh_locked(n) {
             FRESH_VETOES.fetch_add(1, Ordering::Relaxed);
             (FRESH_LOGGED[i].fetch_or(m, Ordering::Relaxed) & m == 0).then_some(PENDING_FRESH)
-        } else if taken_locked(n) && !{
+        } else if taken_locked(n) && {
             let (hp, posture) = hp_posture(def);
-            justified(hp, posture)
+            take_vetoed(kind_category(kind), hp, posture)
         } {
             // One line per veto burst (the gate runs every frame while the marker is near).
             TAKEN_VETOES.fetch_add(1, Ordering::Relaxed);
@@ -4331,7 +4368,7 @@ pub(crate) mod dblock {
                 ));
             } else if v & PENDING_TAKEN != 0 {
                 log_limited(format!(
-                    "deathblow: our attempt on {:#x} refused: taken from a downed player's machine less than {} s ago, posture not broken and HP above 1 (fresh-take veto)",
+                    "deathblow: our stealth deathblow on {:#x} refused: taken from a downed player's machine less than {} s ago, posture not broken and HP above 1 (fresh-take veto)",
                     v & 0xFFFF,
                     TAKE_VETO_MS / 1000
                 ));
@@ -7546,8 +7583,12 @@ mod dblock_tests {
         assert!(v(true, Some(1), true, 3, true, Some(5000), Some(300)), "crouching behind");
         assert!(!v(false, Some(0), true, 3, true, Some(5000), Some(300)), "setting off (default)");
         assert!(!v(true, Some(4), true, 3, true, Some(5000), Some(300)), "posture-break kind");
-        assert!(!v(true, Some(6), true, 3, true, Some(5000), Some(300)), "plunging");
-        assert!(!v(true, Some(7), true, 3, true, Some(5000), Some(300)), "unrestricted fall");
+        for c in [6, 7, 9, 10, 11, 17] {
+            assert!(v(true, Some(c), true, 3, true, Some(5000), Some(300)), "stealth kind {c}: plunging / wall hug / ledge hang");
+        }
+        for c in [2, 3, 5, 8, 13, 14, 16, 19, 20] {
+            assert!(!v(true, Some(c), true, 3, true, Some(5000), Some(300)), "non-stealth kind {c}");
+        }
         assert!(!v(true, None, true, 3, true, Some(5000), Some(300)), "kind unreadable");
         assert!(!v(true, Some(0), false, 3, true, Some(5000), Some(300)), "AI elsewhere: stale");
         assert!(!v(true, Some(0), true, 2, true, Some(5000), Some(300)), "searching (find): vanilla stealth");
@@ -7555,6 +7596,29 @@ mod dblock_tests {
         assert!(!v(true, Some(0), true, 3, false, Some(5000), Some(300)), "fighting a non-player");
         assert!(!v(true, Some(0), true, 3, true, Some(5000), Some(0)), "posture broken");
         assert!(!v(true, Some(0), true, 3, true, Some(1), Some(300)), "HP at the floor");
+    }
+
+    /// Review M2: the fresh-take veto refuses only awareness-gated (stealth) kinds; posture,
+    /// everything else and an unreadable category pass, whatever the boss's HP and posture.
+    #[test]
+    fn fresh_take_veto_only_for_stealth_kinds() {
+        let (hp, po) = (Some(6263), Some(400));
+        assert!(take_vetoed(Some(0), hp, po), "behind: the live case");
+        assert!(take_vetoed(Some(1), hp, po), "crouching behind");
+        assert!(take_vetoed(Some(6), hp, po), "plunging");
+        assert!(take_vetoed(Some(7), hp, po), "unrestricted fall");
+        assert!(take_vetoed(Some(9), hp, po) && take_vetoed(Some(10), hp, po), "wall hug");
+        assert!(take_vetoed(Some(11), hp, po), "ledge hang");
+        assert!(take_vetoed(Some(17), hp, po), "behind (aging state)");
+        assert!(!take_vetoed(Some(4), hp, po), "posture-break deathblow always passes");
+        assert!(!take_vetoed(Some(13), hp, po), "posture-break fall");
+        assert!(!take_vetoed(Some(19), hp, po) && !take_vetoed(Some(20), hp, po), "posture break from behind");
+        assert!(!take_vetoed(Some(2), hp, po), "any other kind");
+        assert!(!take_vetoed(Some(255), hp, po));
+        assert!(!take_vetoed(None, hp, po), "unknown category: pass");
+        assert!(!take_vetoed(Some(0), Some(6000), Some(0)), "stealth on broken posture");
+        assert!(!take_vetoed(Some(0), Some(1), Some(400)), "stealth at the HP floor");
+        assert!(!take_vetoed(Some(0), None, Some(400)), "unknown HP: never block blind");
     }
 
     #[test]

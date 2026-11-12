@@ -717,10 +717,10 @@ native_lives_sync = 1
 ;     for 10 seconds while it gets up (stops a second deathblow taking both lives in one
 ;     posture break when another player made the first one). 0 = off.
 getup_deathblow_veto = 1
-; EXPERIMENTAL. 1 = no stealth deathblow (from behind / crouching) on an enemy that is
-;     fighting a player and runs on your PC, unless its posture is broken or its health is
-;     gone: letting the companion distract it to deathblow it from behind no longer works. Posture,
-;     plunging and other deathblows are unchanged. 0 = as in the base game (default).
+; EXPERIMENTAL. 1 = no stealth deathblow (from behind, crouching, plunging, from a wall or a
+;     ledge) on an enemy that is fighting a player and runs on your PC, unless its posture is
+;     broken or its health is gone: letting the companion distract it to deathblow it from
+;     behind no longer works. Posture deathblows are unchanged. 0 = as in the base game (default).
 stealth_deathblow_needs_no_combat = 0
 ; 1 = a Puppeteer Ninjutsu puppet (an enemy you raised to fight for you) is not killed by
 ;     the host's copy of that enemy, which stays dead there (native session). 0 = off.

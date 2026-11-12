@@ -168,10 +168,17 @@ outside the AI search, lock-on and hit matrices (none found in the callers read 
   while in battle with someone else could not be read [ARV: they do in vanilla when enemies
   fight NPCs; the incident fits "AI fought the friend's copy"].
 - Implemented as an option only, `[GAMEPLAY] stealth_deathblow_needs_no_combat = 0`
-  (dblock `stealth_vetoed`): category 0 / 1 kind, AI running here, state 3, a player as the
+  (dblock `stealth_vetoed`): a stealth kind, AI running here, state 3, a player as the
   battle target, posture > 0 and HP > 1 -> refused at `0xBE3810`. Trade-off: it also ends
-  "one player distracts, the other deathblows from behind". Posture (category 4), plunging
-  (6 / 7) and Ninjutsu-after-posture kinds (41201-41203, category 4) are never touched.
+  "one player distracts, the other deathblows from behind". Posture (category 4) and
+  Ninjutsu-after-posture kinds (41201-41203, category 4) are never touched.
+- Stealth kinds (`dblock::STEALTH_CATEGORIES`, also the test6 fresh-take veto), from the PC
+  rows' names in ThrowKindParam.csv: 0 behind (incl. roof rows and the stealth Ninjutsu
+  201-203), 1 crouching behind, 6 plunging, 7 unrestricted fall, 9 / 10 wall hug left /
+  right, 11 ledge hang, 17 behind in the 老化 state [ARV]. Not stealth: 2 deflect, 3 Mikiri,
+  4 posture break, 5 / 12 special / event states, 8 anti-air, 13 posture-break fall, 14 kick
+  break, 15 wire break, 16 finishing, 18 / 19 aging break, 20 break from behind, 21
+  underwater break. The "unaware" condition itself lives in the enemy's TAE / HKS, not here.
 - Live check: the new `throwprobe: +0 s ...` line shows `posture p/max` and
   `AI here|elsewhere state N (battle|find|other) target 0x.. (us|a peer's copy|not a
   player)` at every deathblow; a stealth deathblow with `state 3 ... (a peer's copy)` is the
