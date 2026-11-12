@@ -809,10 +809,12 @@ fn pick_reload_idol(last: i32, rows: &[(i32, u32)], unlocked: impl Fn(u32) -> bo
     }
 }
 
-/// An animation is an ObjAct's player animation (TimeAct ids carry the anim category
-/// in the millions: compare both the full id and the id within its category).
-fn objact_anim(anim: i32, set: &HashSet<u32>) -> bool {
-    anim > 0 && (set.contains(&(anim as u32)) || set.contains(&(anim as u32 % 1_000_000)))
+/// What a newly started player animation does to the ObjAct merge window (test6, review M3):
+/// Some(true) = a door / chest ObjAct, opens it; Some(false) = any other ObjAct (a lever, a
+/// bell, a lift: its script's busy flags are not progress), closes it; None = no ObjAct.
+/// Same split as doors.rs (`anim_kind`; TimeAct ids carry the category in the millions).
+fn merge_window_anim(anim: i32, door: &HashSet<u32>, other: &HashSet<u32>) -> Option<bool> {
+    crate::doors::anim_kind(anim, door, other)
 }
 
 // ---------------------------------------------------------------- game data
@@ -823,14 +825,13 @@ struct Lists {
     /// (idol entity, unlock flag) of every BonfireWarpParam row.
     idol_rows: Vec<(i32, u32)>,
     progress: Vec<u32>,
-    objact_anims: HashSet<u32>,
 }
 
 static LISTS: OnceLock<Lists> = OnceLock::new();
 
 fn lists() -> Option<&'static Lists> {
     use fromsoftware_shared::FromStatic;
-    use sekiro::param::{BONFIRE_WARP_PARAM_ST, GAME_PROGRESS_PARAM_ST, OBJ_ACT_PARAM_ST, ParamDef};
+    use sekiro::param::{BONFIRE_WARP_PARAM_ST, GAME_PROGRESS_PARAM_ST, ParamDef};
     use sekiro::sprj::SoloParamRepository;
     if let Some(l) = LISTS.get() {
         return Some(l);
@@ -850,26 +851,21 @@ fn lists() -> Option<&'static Lists> {
     let progress: Vec<u32> = file(GAME_PROGRESS_PARAM_ST::NAME)
         .map(|f| unsafe { f.rows::<GAME_PROGRESS_PARAM_ST>() }.filter(|(_, r)| r.event_flag_id() > 0).map(|(_, r)| r.event_flag_id() as u32).collect())
         .unwrap_or_default();
-    let objact_anims: HashSet<u32> = file(OBJ_ACT_PARAM_ST::NAME)
-        .map(|f| {
-            unsafe { f.rows::<OBJ_ACT_PARAM_ST>() }
-                .map(|(_, r)| r.player_anim_id())
-                .filter(|&a| a > 0 && a != u32::MAX)
-                .collect()
-        })
-        .unwrap_or_default();
     let mut sample: Vec<u32> = progress.clone();
     sample.truncate(40);
-    let mut anims: Vec<u32> = objact_anims.iter().copied().collect();
-    anims.sort_unstable();
-    anims.truncate(40);
+    // test6 (review M3): only a door / chest ObjAct opens the merge window (doors.rs sets).
+    let (door, other) = crate::doors::objact_kind_anims().map_or((Vec::new(), 0), |(d, o)| {
+        let mut d: Vec<u32> = d.iter().copied().collect();
+        d.sort_unstable();
+        (d, o.len())
+    });
     log::line(&format!(
-        "own world: {} idol flags, {} game progress flags {sample:?}, {} ObjAct player anims {anims:?}",
+        "own world: {} idol flags, {} game progress flags {sample:?}; ObjAct merge window: {} door / chest player anims {door:?} ({other} other ObjAct anims close it)",
         idols.len(),
         progress.len(),
-        objact_anims.len()
+        door.len()
     ));
-    Some(LISTS.get_or_init(|| Lists { idols, idol_rows, progress, objact_anims }))
+    Some(LISTS.get_or_init(|| Lists { idols, idol_rows, progress }))
 }
 
 fn save_slot() -> Option<i32> {
@@ -1181,9 +1177,24 @@ fn fold(fm: usize, a: &mut Saved) -> usize {
     // Only shared records were replaced by the host's; per-player flags never count.
     cands.retain(|&id| world::should_sync(id) && !a.progress.contains(&id));
     let fresh = fresh_progress(cands, |id| world::get_flag(fm, id), &a.baseline, &a.backup);
-    let n = fresh.len();
+    let before = a.progress.len();
     a.progress.extend(fresh);
-    n
+    sanitize_saved(a, "fold");
+    a.progress.len().saturating_sub(before)
+}
+
+/// test6 (review M3 (b)): what the merge writes must leave every lift script working
+/// (lifts.rs): no busy / delay flag, the position / state pair only when the merged world ends
+/// consistent. Returns the flags dropped.
+fn sanitize_saved(a: &mut Saved, why: &str) -> Vec<u32> {
+    let own = index(&a.backup);
+    let dropped = crate::lifts::sanitize_progress(&mut a.progress, |id| flag_in(&own, id));
+    if !dropped.is_empty() {
+        log::line(&format!(
+            "own world: lift flags {dropped:?} dropped from the session progress ({why}): a lift's busy / delay flag or half of its position / state pair is never merged into our own world"
+        ));
+    }
+    dropped
 }
 
 /// Items, shops, skills and the death-penalty flags: never part of a quest unit.
@@ -1226,7 +1237,8 @@ impl State {
     }
 
     fn classify(&mut self, id: u32, cat: Category) {
-        if !merged(cat) {
+        // test6 (review M3): a lift's busy / delay flag is a ride in progress, never progress.
+        if !merged(cat) || crate::lifts::transient(id) {
             return;
         }
         let Some(a) = self.active.as_mut() else { return };
@@ -1326,6 +1338,39 @@ impl State {
         }
     }
 
+    /// A player's newly started animation (`kind` from `merge_window_anim`): a door / chest
+    /// ObjAct opens the ObjAct window, any other ObjAct (a lever, bell, lift...) closes it.
+    fn window_anim(&mut self, kind: Option<bool>, who: &str, anim: i32, now: Instant) {
+        match kind {
+            Some(true) => {
+                log::line(&format!("own world: {who} played door / chest ObjAct animation {anim}, flags right after it count as progress"));
+                self.open_window(Category::ObjAct, OBJACT_BEFORE, OBJACT_AFTER, now);
+            }
+            Some(false) => {
+                if self.objact_until.take().is_some_and(|t| now <= t) {
+                    log::line(&format!("own world: {who} played another ObjAct animation {anim} (lever / bell / lift...): the door window is closed"));
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// A shared map flag switched on (`window_eligible`, synced): remembered for a window
+    /// opened just after, classified by the windows open now. A lift's busy / delay flag is
+    /// never progress (lifts.rs).
+    fn window_flag(&mut self, id: u32, now: Instant) {
+        if crate::lifts::transient(id) {
+            return;
+        }
+        self.recent.push_back((id, now));
+        if self.defeat_until.is_some_and(|t| now <= t) {
+            self.classify(id, Category::BossDefeat);
+        }
+        if self.objact_until.is_some_and(|t| now <= t) {
+            self.classify(id, Category::ObjAct);
+        }
+    }
+
     /// Boss defeats, ObjActs and the flags switched on around them; quest flag writes
     /// (`settled`: past the first seconds after a load).
     fn pump(&mut self, player: Chr, anims: &[(Option<crate::peers::PeerId>, Option<i32>)], settled: bool, now: Instant) {
@@ -1347,15 +1392,14 @@ impl State {
             self.open_window(Category::BossDefeat, DEFEAT_BEFORE, DEFEAT_AFTER, now);
         }
         self.gauge = gauge;
-        if let Some(l) = lists() {
+        if let Some((door, other)) = crate::doors::objact_kind_anims() {
             // Ours (index 0) and every peer's (1 + slot): progress windows accept any player.
             for &(who, anim) in anims {
                 let i = who.map_or(0, |p| 1 + p.index());
                 let a = anim.unwrap_or(0);
-                if a != self.last_anims[i] && objact_anim(a, &l.objact_anims) {
+                if a != self.last_anims[i] {
                     let who = who.map_or_else(|| "we".to_owned(), |p| format!("peer {}", p.slot()));
-                    log::line(&format!("own world: {who} played ObjAct animation {a}, flags right after it count as progress"));
-                    self.open_window(Category::ObjAct, OBJACT_BEFORE, OBJACT_AFTER, now);
+                    self.window_anim(merge_window_anim(a, door, other), &who, a, now);
                 }
                 self.last_anims[i] = a;
             }
@@ -1375,13 +1419,7 @@ impl State {
                     }
                     self.idol_activation(id, on, settled, now);
                     if on && window_eligible(id) && world::should_sync(id) {
-                        self.recent.push_back((id, now));
-                        if self.defeat_until.is_some_and(|t| now <= t) {
-                            self.classify(id, Category::BossDefeat);
-                        }
-                        if self.objact_until.is_some_and(|t| now <= t) {
-                            self.classify(id, Category::ObjAct);
-                        }
+                        self.window_flag(id, now);
                     }
                 }
                 _ => {}
@@ -1486,6 +1524,9 @@ impl State {
         fold(fm, &mut a);
         let mode = crate::tuning::merge_quests();
         let (_, same) = fold_quests(fm, &mut a);
+        // test6 (review M3): never a lift's busy flag into our own world (`fold` skips this
+        // when the session has no baseline).
+        sanitize_saved(&mut a, "restore");
         let no_quests = BTreeMap::new();
         let quest = if mode == QUEST_OFF { &no_quests } else { &a.quest_taken };
         let quest_units: BTreeSet<u32> = quest.keys().filter_map(|&id| quest_unit(id, mode).map(|u| u.0)).collect();
@@ -2353,13 +2394,63 @@ mod tests {
     }
 
     #[test]
-    fn objact_anim_matches_full_or_category_id() {
-        let set: HashSet<u32> = [60_070, 60_120].into_iter().collect();
-        assert!(objact_anim(60_070, &set));
-        assert!(objact_anim(100_060_120, &set));
-        assert!(!objact_anim(60_071, &set));
-        assert!(!objact_anim(0, &set));
-        assert!(!objact_anim(-1, &set));
+    fn merge_window_only_for_door_and_chest_anims() {
+        // Door 700200 / chest 711100; the Senpou lift lever 710600 is "other".
+        let door: HashSet<u32> = [700_200, 711_100].into_iter().collect();
+        let other: HashSet<u32> = [710_600, 710_700].into_iter().collect();
+        assert_eq!(merge_window_anim(700_200, &door, &other), Some(true));
+        assert_eq!(merge_window_anim(100_711_100, &door, &other), Some(true), "full TimeAct id");
+        assert_eq!(merge_window_anim(710_600, &door, &other), Some(false), "lift lever closes it");
+        assert_eq!(merge_window_anim(60_071, &door, &other), None);
+        assert_eq!(merge_window_anim(0, &door, &other), None);
+        assert_eq!(merge_window_anim(-1, &door, &other), None);
+    }
+
+    /// Review M3 (b): whatever reached the progress set, the merge never writes a lift's busy /
+    /// delay flag; a consistent position / state pair is kept.
+    #[test]
+    fn the_merge_never_writes_lift_busy_flags() {
+        let mut back = sample();
+        for f in [12_000_655, 12_000_656, 12_000_657, 12_000_658] {
+            back.progress.insert(f);
+        }
+        let dropped = sanitize_saved(&mut back, "test");
+        assert_eq!(dropped, vec![12_000_657, 12_000_658]);
+        assert!(back.progress.contains(&12_000_655) && back.progress.contains(&12_000_656));
+        let (recs, ..) = merge(&back.backup, &back.progress, &BTreeMap::new(), &[], |_| Some(128));
+        let m = index(&recs);
+        assert!(flag_in(&m, 12_000_655) && flag_in(&m, 12_000_656));
+        assert!(!flag_in(&m, 12_000_657) && !flag_in(&m, 12_000_658));
+        // Idempotent.
+        assert!(sanitize_saved(&mut back, "test").is_empty());
+    }
+
+    /// Review M3 (live 2026-11-12): a lift lever, then the lift script's flags within 10 s,
+    /// must not become ObjAct progress; a door right before still counts its own flags.
+    #[test]
+    fn lift_lever_flags_are_not_objact_progress() {
+        let door: HashSet<u32> = [700_200].into_iter().collect();
+        let other: HashSet<u32> = [710_600].into_iter().collect();
+        let mut st = State::default();
+        st.active = Some(Saved::default());
+        let t = Instant::now();
+        // Door anim -> window open; its flag counts.
+        st.window_anim(merge_window_anim(700_200, &door, &other), "we", 700_200, t);
+        st.window_flag(11_100_500, t + Duration::from_secs(1));
+        // The lever right after: window closed, the lift's flags do not count.
+        st.window_anim(merge_window_anim(710_600, &door, &other), "peer 1", 710_600, t + Duration::from_secs(2));
+        for f in [12_000_655, 12_000_656, 12_000_657, 12_000_658] {
+            st.window_flag(f, t + Duration::from_secs(5));
+        }
+        let c = &st.active.as_ref().unwrap().classified;
+        assert_eq!(c.get(&11_100_500), Some(&(Category::ObjAct as u8)));
+        assert!([12_000_655, 12_000_656, 12_000_657, 12_000_658].iter().all(|f| !c.contains_key(f)));
+        // Even inside a door's window, a lift busy / delay flag is never classified.
+        st.window_anim(Some(true), "we", 700_200, t + Duration::from_secs(10));
+        st.window_flag(12_000_657, t + Duration::from_secs(11));
+        st.window_flag(12_000_658, t + Duration::from_secs(11));
+        assert!(!st.active.as_ref().unwrap().classified.contains_key(&12_000_657));
+        assert!(!st.active.as_ref().unwrap().classified.contains_key(&12_000_658));
     }
 
     #[test]

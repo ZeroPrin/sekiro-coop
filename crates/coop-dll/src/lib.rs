@@ -36,6 +36,7 @@ mod items;
 mod join;
 mod keyitems;
 mod leave;
+mod lifts;
 mod livesync;
 mod loadout;
 mod log;

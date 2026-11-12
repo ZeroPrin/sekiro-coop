@@ -684,7 +684,8 @@ fn open_if_closed(s: &mut State, d: &Door, why: &str) -> bool {
 }
 
 fn add_candidate(s: &mut State, id: u32, why: &str, now: Instant) {
-    if s.door_flags.contains(&id) || s.candidates.len() >= 512 || s.candidates.contains_key(&id) {
+    // test6: a lift script's flags (lifts.rs) are never a door's, whatever opened the window.
+    if s.door_flags.contains(&id) || s.candidates.len() >= 512 || s.candidates.contains_key(&id) || crate::lifts::transient(id) || crate::lifts::pair_flag(id) {
         return;
     }
     s.candidates.insert(id, now);
@@ -715,7 +716,7 @@ fn door_window(last: Option<(Instant, bool)>, flag: Instant) -> bool {
 
 /// Pure: what kind of ObjAct a peer's animation is. Some(true) = a door / chest animation (and
 /// no other kind uses it), Some(false) = any other ObjAct animation, None = no ObjAct.
-fn anim_kind(anim: i32, door: &HashSet<u32>, other: &HashSet<u32>) -> Option<bool> {
+pub(crate) fn anim_kind(anim: i32, door: &HashSet<u32>, other: &HashSet<u32>) -> Option<bool> {
     if is_objact_anim(anim, other) {
         Some(false)
     } else if is_objact_anim(anim, door) {
@@ -1235,11 +1236,12 @@ mod tests {
         let mut s = State::default();
         let t = Instant::now();
         note_peer_objact(&mut s, true, t);
-        friend_on_flag(&mut s, 12000657, t + Duration::from_secs(3));
-        assert!(known_door(&s, 12000657));
-        // OFF 12 s later (one lift ride): released, the OFF goes through.
-        assert!(release_if_cycled(&mut s, 12000657, t + Duration::from_secs(15), "the friend"));
-        assert!(!known_door(&s, 12000657) && !s.friend_on.contains(&12000657));
+        // Some script's busy flag (not a known lift: lifts.rs flags are never candidates).
+        friend_on_flag(&mut s, 11100957, t + Duration::from_secs(3));
+        assert!(known_door(&s, 11100957));
+        // OFF 12 s later (like one lift ride): released, the OFF goes through.
+        assert!(release_if_cycled(&mut s, 11100957, t + Duration::from_secs(15), "the friend"));
+        assert!(!known_door(&s, 11100957) && !s.friend_on.contains(&11100957));
         // A door flag switched off long after: still protected.
         friend_on_flag(&mut s, 11100500, t + Duration::from_secs(4));
         assert!(!release_if_cycled(&mut s, 11100500, t + Duration::from_secs(300), "our game"));
@@ -1251,12 +1253,24 @@ mod tests {
         assert!(cycled_off(t, t + CANDIDATE_CYCLE) && !cycled_off(t, t + CANDIDATE_CYCLE + Duration::from_secs(1)));
     }
 
+    /// test6: the Senpou lift's flags are never door candidates, even right after a door.
+    #[test]
+    fn lift_flags_never_candidates() {
+        let mut s = State::default();
+        let t = Instant::now();
+        note_peer_objact(&mut s, true, t);
+        for f in LIFT {
+            friend_on_flag(&mut s, f, t + Duration::from_secs(1));
+        }
+        assert!(LIFT.iter().all(|&f| !known_door(&s, f)));
+    }
+
     #[test]
     fn load_or_reset_clears_the_guesses() {
         let mut s = State::default();
         let t = Instant::now();
         note_peer_objact(&mut s, true, t);
-        friend_on_flag(&mut s, 12000657, t);
+        friend_on_flag(&mut s, 11100957, t);
         assert!(!s.candidates.is_empty());
         clear_guesses(&mut s);
         assert!(s.candidates.is_empty() && s.friend_objact.is_none() && s.recent_on.is_empty());
