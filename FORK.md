@@ -26,7 +26,16 @@ Version string: `1.0.9-pickups.3-test6`. Everybody in a session needs the same b
 > reloaded (plus a 1.5 s tail); log `enemies: death hold on` / `death hold off: N host HP
 > writes kept off`. `test6` adds `dead_players_untargetable` (enemies stop noticing a dead player while
 > another lives; `docs/RE-CORPSE-TARGET.md`, log `corpse:`) and keeps a boss with the living player while
-> the other is down (no ownership see-saw; 10 s fresh-take deathblow veto). The oracle is a playtest with both logs.
+> the other is down (no ownership see-saw; 10 s fresh-take veto on stealth deathblows only: behind,
+> crouching, plunging, wall hug, ledge hang; posture deathblows always pass). Lift / lever fix
+> (Senpou temple lift, 2026-11-12): only door / chest ObjActs make fallback door flags or open the
+> own-world merge window, a lift script's busy / delay flags (`lifts.rs`, common_func 20005621) are
+> never merged into a joiner's own world, ObjAct animations come only from ObjActParam rows placed in
+> maps. Review fixes: `corpse:` hysteresis (0.5 s dead / 1 s no state), stray team 0 restored, hide byte
+> cleared on warps; the auditor ranks bosses before elites and labels elites; throwprobe logs posture
+> and the AI target with a `+0 s` line (budget 536 lines). Known leftover: a solo world whose Senpou lift
+> was killed by a test5 session stays dead (not repaired automatically; joining a host whose lift works
+> restores it in the co-op world). The oracle is a playtest with both logs.
 
 ## New settings in this build
 
