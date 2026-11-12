@@ -39,7 +39,6 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `friendly_fire_in_boss_fights` | GAMEPLAY | 0 | Friendly fire |
 | `pvp_dry_run` | DEBUG | 0 | Friendly fire |
 | `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | Friendly fire |
-| `block_change_grace_ms` | DEBUG | 2500 (0..3000; 0 = the old immediate rule) | Block-border grace (IMPLEMENTATION-NOTES) |
 | `wardrobe`, `wardrobe_key`, `wardrobe_pad`, `wardrobe_pad_button`, `wardrobe_reload` | DISPLAY | 1, 113 (F2), 1, none, 0 | Wardrobe |
 | `wardrobe_skin`, `wardrobe_head`, `wardrobe_legs`, `wardrobe_original`, `wardrobe_added`, `wardrobe_owner` | DISPLAY | game, skin, skin, empty, empty, empty (written by the panel) | Wardrobe |
 | `fx_speffect_mirror` | DEBUG | 1 (0 off, 2 = also enchant states) | Friend's art effects (`docs/RE-REMOTE-FX.md`) |

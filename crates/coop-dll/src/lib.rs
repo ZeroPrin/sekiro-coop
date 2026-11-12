@@ -10,7 +10,6 @@ mod activation;
 mod artfx;
 mod audit;
 mod backups;
-mod blockgrace;
 mod bossgate;
 mod bosses;
 mod bossrules;
