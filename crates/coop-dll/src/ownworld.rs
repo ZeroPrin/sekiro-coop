@@ -1053,7 +1053,7 @@ pub fn before_join_snapshot(fm: usize) {
         if let Some(a) = st.active.as_mut() {
             // A reconnect (or a session continued after a crash): what changed since the
             // previous snapshot is progress; the backup stays the one of our own world.
-            let added = fold(fm, a);
+            let (added, _) = fold(fm, a);
             // Quest units changed since the previous snapshot: taken now, the next
             // snapshot replaces the world they are compared in.
             let (units, _) = fold_quests(fm, a);
@@ -1150,12 +1150,20 @@ pub fn after_join_snapshot(fm: usize) {
     });
 }
 
+/// Pure (review, test6 final): how one fold changed the progress set, as (added, removed).
+/// The save is dirty when the SET changed, not when it grew: a flag added in the same fold
+/// that strips a lift's busy / delay flag leaves the size equal but the set different.
+fn progress_delta(before: &BTreeSet<u32>, after: &BTreeSet<u32>) -> (usize, usize) {
+    (after.difference(before).count(), before.difference(after).count())
+}
+
 /// Progress flags on now and off in the baseline and the backup: added to `progress`.
-fn fold(fm: usize, a: &mut Saved) -> usize {
+/// Returns (added, removed by the lift sanitizer); either nonzero = the save is dirty.
+fn fold(fm: usize, a: &mut Saved) -> (usize, usize) {
     // No baseline yet (a crash between the backup and the copy): nothing can be told
     // apart from the host's world, so nothing counts.
     if a.baseline.is_empty() {
-        return 0;
+        return (0, 0);
     }
     let mut cands: Vec<u32> = Vec::new();
     if let Some(l) = lists() {
@@ -1177,10 +1185,10 @@ fn fold(fm: usize, a: &mut Saved) -> usize {
     // Only shared records were replaced by the host's; per-player flags never count.
     cands.retain(|&id| world::should_sync(id) && !a.progress.contains(&id));
     let fresh = fresh_progress(cands, |id| world::get_flag(fm, id), &a.baseline, &a.backup);
-    let before = a.progress.len();
+    let before = a.progress.clone();
     a.progress.extend(fresh);
     sanitize_saved(a, "fold");
-    a.progress.len().saturating_sub(before)
+    progress_delta(&before, &a.progress)
 }
 
 /// test6 (review M3 (b)): what the merge writes must leave every lift script working
@@ -1445,10 +1453,10 @@ impl State {
         if self.fold_at.is_none_or(|t| now.duration_since(t) >= FOLD_EVERY) {
             self.fold_at = Some(now);
             if let Some(a) = self.active.as_mut() {
-                let n = fold(fm, a);
-                if n > 0 {
+                let (added, removed) = fold(fm, a);
+                if added + removed > 0 {
                     self.dirty = true;
-                    log::line(&format!("own world: {n} new progress flags ({} in total)", a.progress.len()));
+                    log::line(&format!("own world: {added} new progress flags, {removed} dropped ({} in total)", a.progress.len()));
                 }
             }
         }
@@ -2380,6 +2388,24 @@ mod tests {
         let on_now = |id: u32| matches!(id, 11_100_001 | 11_100_002 | 11_100_003);
         let fresh = fresh_progress([11_100_001, 11_100_002, 11_100_003, 11_100_004], on_now, &baseline, &backup);
         assert_eq!(fresh, vec![11_100_003]);
+    }
+
+    /// Review (test6 final): a fold that adds one flag and strips a lift's busy flag (left by
+    /// an older build) keeps the size but changes the set: the save must be marked dirty.
+    #[test]
+    fn fold_dirty_on_set_change_not_growth() {
+        let busy = crate::lifts::LIFTS[0].busy;
+        let before: BTreeSet<u32> = [busy, 11_100_001].into_iter().collect();
+        let mut after = before.clone();
+        after.insert(11_100_003);
+        let dropped = crate::lifts::sanitize_progress(&mut after, |_| false);
+        assert_eq!(dropped, vec![busy]);
+        assert_eq!(after.len(), before.len(), "same size");
+        assert_eq!(progress_delta(&before, &after), (1, 1), "but changed: dirty");
+        assert_eq!(progress_delta(&before, &before), (0, 0));
+        let mut only_removed = before.clone();
+        only_removed.remove(&busy);
+        assert_eq!(progress_delta(&before, &only_removed), (0, 1));
     }
 
     #[test]
