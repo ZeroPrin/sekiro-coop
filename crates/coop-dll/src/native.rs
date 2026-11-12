@@ -813,6 +813,8 @@ fn create(player: Chr) -> Result<Remote, String> {
         release_pgd(idx);
         return Err("create returned null (player chr set full?)".into());
     }
+    // remotefx.rs: its later part builds (before puppet.rs lists it) are a friend's too.
+    crate::remotefx::created(p);
     let chr = Chr(p);
     let set_type: extern "C" fn(usize, u32) = unsafe { std::mem::transmute(base + SET_CHR_TYPE_RVA) };
     set_type(p, CHR_TYPE_REMOTE);
