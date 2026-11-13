@@ -2,9 +2,9 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test8`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test9`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test8`: nothing in the sections below marked experimental or
+> **Test build `1.0.9-pickups.3-test9`: nothing in the sections below marked experimental or
 > "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
 > onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
@@ -35,7 +35,7 @@ Version string: `1.0.9-pickups.3-test8`. Everybody in a session needs the same b
 > cleared on warps; the auditor ranks bosses before elites and labels elites; throwprobe logs posture
 > and the AI target with a `+0 s` line (budget 536 lines). Known leftover: a solo world whose Senpou lift
 > was killed by a test5 session stays dead (not repaired automatically; joining a host whose lift works
-> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. The oracle is a playtest with both logs.
+> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. The oracle is a playtest with both logs.
 
 ## New settings in this build
 
