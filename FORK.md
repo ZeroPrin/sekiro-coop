@@ -66,8 +66,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `pvp_dry_run` | DEBUG | 0 | Friendly fire |
 | `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | Friendly fire |
 | `wardrobe`, `wardrobe_key`, `wardrobe_pad`, `wardrobe_pad_button`, `wardrobe_reload` | DISPLAY | 1, 113 (F2), 1, none, 0 | Wardrobe |
-| `wardrobe_all_parts` | DISPLAY | 0 (1 = also the combinations that render wrong: Shura head/legs off the Shura skin, Tengu skin with other legs) | Wardrobe, `docs/RE-REMOTE-FX.md` |
-| `wardrobe_skin`, `wardrobe_head`, `wardrobe_legs`, `wardrobe_original`, `wardrobe_added`, `wardrobe_owner` | DISPLAY | game, skin, skin, empty, empty, empty (written by the panel) | Wardrobe |
+| `wardrobe_skin`, `wardrobe_head`, `wardrobe_original`, `wardrobe_added`, `wardrobe_owner` | DISPLAY | game, skin, empty, empty, empty (written by the panel; older builds' `wardrobe_legs` / `wardrobe_all_parts` are ignored) | Wardrobe |
 | `fx_speffect_mirror` | DEBUG | 1 (0 off, 2 = also enchant states) | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 | `native_full_parts` | DEBUG | 1 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 | `rest_refills_partner` | GAMEPLAY | 1 (as before) | 0 = the friend's rest respawns enemies and wakes a dead you, but does not refill a living you (HP, gourd, items). NOT verified live |
@@ -568,21 +567,30 @@ the 25 ids only; the game sends no equipment packet in our session (only types 1
 ## Wardrobe (`[DISPLAY] wardrobe`, default 1; NOT verified live)
 
 Mix outfit parts on your own character while the world stays visible (`wardrobe.rs`). F2
-(`wardrobe_key`) opens a small panel on the left: Skin / Head / Legs, Up/Down = row,
+(`wardrobe_key`) opens a small panel on the left: Skin / Head, Up/Down = row,
 Left/Right = change, applied 200 ms after the last press (Enter = at once), Esc or F2 =
-close. Controller: right stick + right trigger while the panel is open (`wardrobe_pad`), an
+close. The panel closes by itself when a loading screen starts (`game::load_pending` in the
+wardrobe tick, and the world reset of a load) and does not open again until the load is
+over: left open it kept holding the keyboard (`ui.rs` `message_filter`) through the load,
+and F7 / F11 did not get through (live 2026-11-13). Controller: right stick + right trigger while the panel is open (`wardrobe_pad`), an
 open button only if `wardrobe_pad_button` names one. Nothing is read or written until a
 choice other than "As in game" is made. The native Co-op Settings page has no rows for it:
 the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
 
-- **Choices.** Skin (torso + prosthetic arm + default head / legs): Wolf, Shura, Ashina,
-  Tengu. The Sculptor's skin, head and legs are no longer offered (test5, user decision: the
-  body is not rigged right, the head barely differs); `sculptor` in the ini acts as game / skin,
-  and "As in game" still removes its added rows 200000-203000.
-  Head: as skin or any of the four (Shura brings its hair 304000 in protector slot 16). Legs:
-  as skin or the ones that fit the torso: Shura / Tengu torsos carry the bare body and the
-  param has no hide flags, so only 303000 / 503000; the others 103000, 153000, 403000, 203000.
-  A skin change that makes the legs unfit sets them back to "as skin". The torso keeps the
+- **Choices.** Skin (torso + prosthetic arm + legs, and the default head): As in game, Wolf,
+  Shura, Ashina, Tengu. Head: As skin, Wolf, Shura, Ashina, Tengu, the same list with every
+  skin and no locks (user decision 2026-11-13); Shura's head brings its hair 304000 in
+  protector slot 16, any other head empties that slot. Legs are not a choice: they are always
+  the skin's own (103000 / 303000 / 403000 / 503000; user decision 2026-11-13 after live
+  testing, mixed legs never matched anything), so the leg / torso texture pairs (Tengu's
+  torso needs Tengu's legs, Shura's legs need Shura's torso) always come together. A
+  `wardrobe_legs` line from an older build is not read: the skin's legs replace whatever legs
+  are worn on the next apply. Known cosmetic caveat, accepted: Shura's head (`fc_m_0240`) on
+  a non-Shura skin has no fire texture (`BD_M_9110_Fire_B_*` lives in Shura's torso
+  `bd_m_9110`, `docs/RE-REMOTE-FX.md`). The Sculptor's skin and head are not offered (test5,
+  user decision: the body is not rigged right, the head barely differs); `sculptor` in the
+  ini acts as game / skin, and "As in game" still removes the added rows 200000-203000 (and
+  153000, the tabi legs of older builds). The torso keeps the
   sword state worn: x01000 = Mortal Blade, x31000 = sword only, 141000 = no sword (Wolf only;
   the other skins use x31000); Sculptor 201000 has one torso. A bare arm (112000, before the
   prosthetic) or a missing arm (122000) is never touched.
@@ -633,8 +641,8 @@ the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
   The replica side validates them (category 1, an EquipParamProtector row) and now also replays
   emptying slot 16 (`loadout::SLOT_EMPTIABLE`, the game's own way for slots 17..21), else the
   replica kept Shura's hair. Test `loadout::tests::wardrobe_mix_and_the_hair_slot`.
-- **Log lines.** `wardrobe: panel opened / closed`, `wardrobe: choice changed: skin S, head H,
-  legs L`, `wardrobe: original outfit remembered [..]`, `wardrobe: slot N a -> b (from
+- **Log lines.** `wardrobe: panel opened / closed`, `wardrobe: panel closed (loading / world
+  reset)`, `wardrobe: choice changed: skin S, head H`, `wardrobe: original outfit remembered [..]`, `wardrobe: slot N a -> b (from
   inventory / added to inventory / emptied)`, `wardrobe: applied ... -> ids [..] (worn now
   ..)`, `wardrobe: parts reload Ok(()) (holder follows the PGD: true)`, `wardrobe: change
   skipped for now (REASON)`, `wardrobe: the game changed ...`, `wardrobe: original outfit [..]
@@ -646,8 +654,9 @@ the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
   slot 21 is needed and safe on the local player). Then flick Left/Right fast: one apply per
   pause. Then "As in game": the old outfit and `restored`. In co-op the
   friend's replica must change within a second or two (`loadout: peer N ids`).
-- Unit tests: `wardrobe::tests` (torso variants, legs rule, fallback on a skin change, ini
-  round trip, external changes, award flags, restore target, records owner).
+- Unit tests: `wardrobe::tests` (torso variants, legs follow the skin, every head with every
+  skin, older builds' worn legs replaced, skin / head cycling, ini round trip, external
+  changes, award flags, restore target, records owner).
 
 ## Player packet rate (experimental)
 

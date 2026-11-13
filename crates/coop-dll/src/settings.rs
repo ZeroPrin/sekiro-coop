@@ -404,13 +404,11 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
         crate::wardrobe::PAD_BUTTON.store([0u16, 0x0020, 0x0010, 0x0040, 0x0080][i as usize], Relaxed);
     }
     crate::wardrobe::RELOAD.store(ini.flag("wardrobe_reload", false, warn), Relaxed);
-    crate::wardrobe::ALL_PARTS.store(ini.flag("wardrobe_all_parts", false, warn), Relaxed);
     crate::wardrobe::load_ini(
         crate::wardrobe::IniValues {
             enabled: ini.flag("wardrobe", true, warn),
             skin: &ini.text("wardrobe_skin"),
             head: &ini.text("wardrobe_head"),
-            legs: &ini.text("wardrobe_legs"),
             original: &ini.text("wardrobe_original"),
             added: &ini.text("wardrobe_added"),
             owner: &ini.text("wardrobe_owner"),
@@ -784,13 +782,14 @@ send_logs_key = 118
 ;     next start. 0 = log.txt only. Takes effect at the next start.
 log_per_run = 1
 
-; Wardrobe: mix outfit parts (skin = torso and arm, head, legs) on your own character, live.
+; Wardrobe: change your own character's outfit live: a skin (torso, arm and legs) and,
+; separately, a head (any head with any skin).
 ; 1 = the wardrobe panel opens with wardrobe_key. Nothing is changed until you pick something
 ;     in it. 0 = off (the panel does not open, nothing is applied).
 wardrobe = 1
 ; Windows virtual-key code that opens / closes the panel. 113 = F2 (F1..F12 = 112..123).
 ; In the panel: Up/Down = row, Left/Right = change (applied after a short pause), Enter = now,
-; Esc = close.
+; Esc = close. The panel closes by itself when a loading screen starts.
 wardrobe_key = 113
 ; 1 = while the panel is open the controller's right stick also drives it (up/down = row,
 ;     left/right = change, right trigger = now). The camera turns with it. 0 = keyboard only.
@@ -800,13 +799,12 @@ wardrobe_pad = 1
 wardrobe_pad_button = none
 ; Written by the panel (you may edit them with the game closed):
 ; skin: game (= as in game; restores what you wore before the wardrobe), wolf, shura, ashina,
-; tengu. head: skin (= as the skin), wolf, shura, ashina, tengu.
-; legs: skin, wolf, wolf_tabi, shura, ashina, tengu (Shura / Tengu skins take only
-; shura / tengu legs, the others only wolf / wolf_tabi / ashina). The Sculptor's parts are
-; no longer offered: sculptor (from an older build) acts as game / skin.
+; tengu. head: skin (= as the skin), wolf, shura, ashina, tengu; every head goes with every
+; skin (Shura's head off the Shura skin lacks its fire texture, it lives in Shura's torso).
+; Legs are always the skin's own: a wardrobe_legs line from an older build is ignored.
+; The Sculptor's parts are not offered: sculptor (from an older build) acts as game / skin.
 wardrobe_skin = game
 wardrobe_head = skin
-wardrobe_legs = skin
 ; The outfit before the wardrobe's first change (head,torso,arm,legs,hair row ids), the
 ; rows it had to add to your inventory and the character they belong to (save slot,sen);
 ; all cleared when skin = game restored them. Another character of the save is left alone
@@ -818,10 +816,6 @@ wardrobe_owner =
 ;     on your own character, may crash). 0 = only change the equipment, as the game's own
 ;     event script does; the look may then update only after the next load screen.
 wardrobe_reload = 0
-; 0 = only combinations that render right: Shura's head and legs only with the Shura skin,
-;     the Tengu skin only with Tengu legs (these parts borrow textures from each other).
-;     1 = also those broken-looking combinations (the Sculptor's parts never).
-wardrobe_all_parts = 0
 
 [ADVANCED]
 ; Changing anything here (or the password / name) restarts the connection.
