@@ -2,6 +2,19 @@
 /dist
 /target-dist
 /test-builds
+/target-public
+
+# Game asset files (the optional parts package, FORK.md "Parts package"): they are added only
+# at packaging time from a folder outside the repo and must never be committed.
+*.dcx
+*.tpf
+*.dds
+*.flver
+*.partsbnd
+*.bnd
+/mod/
+ship/mod/
+ship-public/mod/
 
 # Secrets and local junk
 .env

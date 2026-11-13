@@ -261,6 +261,22 @@ mod tests {
         assert!(p.packages.is_empty() && p.natives.is_empty());
     }
 
+    /// The profile in git never carries the parts package; tools\parts\stage-parts.ps1 appends
+    /// it (CRLF, as the file is checked out) only at packaging time (FORK.md "Parts package").
+    #[test]
+    fn parts_package_only_in_the_staged_profile() {
+        let shipped = include_str!("../../../ship/sekiro-coop.me3");
+        let p = parse_profile(shipped, "sekiro_coop.dll");
+        assert!(p.loads_us && p.packages.is_empty());
+        let staged = format!(
+            "{}\r\n\r\n[[packages]]\r\nid = \"sekiro-together-parts\"\r\npath = 'mod'\r\n",
+            shipped.trim_end()
+        );
+        let p = parse_profile(&staged, "sekiro_coop.dll");
+        assert!(p.loads_us);
+        assert_eq!(p.packages, vec![("sekiro-together-parts".to_string(), "mod".to_string())]);
+    }
+
     #[test]
     fn packages_and_other_natives_are_listed() {
         let text = "[[natives]]\npath = 'mods\\\\sekiro_coop.dll'\n\n[[packages]]\nid = \"ps5-glyphs\"\npath = \"ps5-glyphs/\"\n\n[[packages]]\npath = \"old/mod\" # off\nenabled = false\n\n[[packages]]\nsource = \"texture-pack\"\n\n[[natives]]\npath = \"other/fps.dll\"\n[[natives]]\npath = \"x.dll\"\nenabled = false\n";

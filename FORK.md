@@ -585,9 +585,10 @@ the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
   testing, mixed legs never matched anything), so the leg / torso texture pairs (Tengu's
   torso needs Tengu's legs, Shura's legs need Shura's torso) always come together. A
   `wardrobe_legs` line from an older build is not read: the skin's legs replace whatever legs
-  are worn on the next apply. Known cosmetic caveat, accepted: Shura's head (`fc_m_0240`) on
-  a non-Shura skin has no fire texture (`BD_M_9110_Fire_B_*` lives in Shura's torso
-  `bd_m_9110`, `docs/RE-REMOTE-FX.md`). The Sculptor's skin and head are not offered (test5,
+  are worn on the next apply. Without the optional parts package (section "Parts package"
+  below) Shura's head (`fc_m_0240`) on a non-Shura skin has no fire texture
+  (`BD_M_9110_Fire_B_*` lives in Shura's torso `bd_m_9110`, `docs/RE-REMOTE-FX.md`); with the
+  package installed it renders with the right material (live 2026-11-14). The Sculptor's skin and head are not offered (test5,
   user decision: the body is not rigged right, the head barely differs); `sculptor` in the
   ini acts as game / skin, and "As in game" still removes the added rows 200000-203000 (and
   153000, the tabi legs of older builds). The torso keeps the
@@ -657,6 +658,66 @@ the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
 - Unit tests: `wardrobe::tests` (torso variants, legs follow the skin, every head with every
   skin, older builds' worn legs replaced, skin / head cycling, ini round trip, external
   changes, award flags, restore target, records owner).
+
+## Parts package (optional game files for the wardrobe)
+
+Some wardrobe mixes need textures that live in another part's file: Shura's head and legs
+use `BD_M_9110_Fire_B_*` from Shura's torso, Tengu's torso uses `LG_M_9130_Leg_*` from
+Tengu's legs. When the donor part is not worn, the texture is missing and the part renders
+with a broken material. The parts package is six patched part files that carry those
+textures themselves: `fc_m_0240` (Shura head), `lg_m_9110` (Shura legs), `bd_m_9130` (Tengu
+torso), each with its `_l` variant (the low-detail file the game uses for other players'
+characters). Only textures are added; the models are vanilla. Live 2026-11-14 (through the
+package): the Shura head on other skins renders correctly; without the package it does not.
+
+- **Optional, but the same for both players.** The DLL works without it (the wardrobe then
+  has the cosmetic caveat above). Each machine renders the friend's character from its own
+  files, so both players need the identical package or neither. The session doctor
+  fingerprints every `[[packages]]` folder of the `.me3` next to the DLL (`me3scan.rs`) and
+  warns on a difference.
+- **Not in git.** The files are game assets (FromSoftware's models and textures,
+  re-packed): they are not ours to publish in the source repository, and at ~17 MB of
+  incompressible Kraken data they would bloat the history. `.gitignore` refuses `*.dcx`,
+  `*.tpf`, `*.dds`, `*.flver`, `*.bnd`, `*.partsbnd` and any `mod/` folder at the root or
+  under `ship*/`. They are added only at packaging time from a folder outside the repo.
+- **Layout.** A me3 package folder mirrors the game's virtual root and its `path` is relative
+  to the `.me3`:
+  `sekiro-together\mod\parts\*.partsbnd.dcx` plus, in the shipped `sekiro-coop.me3`:
+
+  ```toml
+  [[packages]]
+  id = "sekiro-together-parts"
+  path = 'mod'
+  ```
+
+  `ship\sekiro-coop.me3` in git never has the block
+  (`me3scan::tests::parts_package_only_in_the_staged_profile`).
+- **Building it.** Set `SEKIRO_COOP_PARTS` to a `;`-separated list of folders that hold the
+  `.dcx` files, then run `build-public.cmd`, for example
+  `set SEKIRO_COOP_PARTS=E:\RE\work_override\fixed\parts;E:\RE\work_skin\game\mod\parts`.
+  `tools\parts\stage-parts.ps1` copies every file into `<stage>\mod\parts\` and appends the
+  block to the staged `.me3`. It stops the build if a folder is missing, a file is not a
+  `.dcx`, a name is in two folders, or a file fails the reset check below. Unset or empty:
+  the build is exactly as without the package (no `mod\`, no block). The zip name does not
+  change, so say which variant you hand out.
+- **The Kraken reset check (why the first files stalled the game).** A vanilla DCX_KRAK file
+  is one Oodle Kraken stream cut into 256 KiB blocks, and every block header carries the
+  decoder-reset flag (the stream is compressed with `seekChunkReset = 1`,
+  `seekChunkLen = 0x40000`), so each block decodes without the ones before it. The game's
+  loader relies on that. Our first patched files (2026-11-12) were compressed with Oodle's
+  default options: one reset on the first block only. Every offline check passed (whole-stream
+  decode, BND/TPF layout), but in game the part loader stalled on them; the files re-written
+  with per-block resets work (live 2026-11-14, analysis in `E:\RE\work_override\`). The same
+  defaults were used by `tools\icons\dcx.py` for the 2026-10-23 menu icon override that
+  crashed the TPF loader (IMPLEMENTATION-NOTES section 21); `dcx.py` now sets the resets and
+  refuses to return a stream without them. `stage-parts.ps1` walks the block headers of every
+  DCX_KRAK file (no Oodle needed) and refuses any file whose blocks do not all carry the reset.
+  Check a folder by hand with
+  `powershell -File tools\parts\stage-parts.ps1 -Check <file.dcx>...`.
+- **Making the files.** Outside this repo: `E:\RE\work_parts_patch\tools\partspatch.py`
+  (copies named textures from a donor part's TPF into the target's TPF, keeping the BND4 /
+  TPF layout byte-faithful) and `E:\RE\work_override\tools\rebuild_fixed.ps1`. Any other
+  tool is fine as long as its Kraken output passes the check.
 
 ## Player packet rate (experimental)
 
@@ -962,3 +1023,5 @@ tracked by the crate; the hit timer per record (seconds since that player's last
 
 `build-public.cmd` (VS 2022 Build Tools with MSVC x64 and Windows SDK 10.0.26100, Rust
 stable). Unit tests: `cargo test --release -p sekiro_coop --no-default-features --features dev-native`.
+With `SEKIRO_COOP_PARTS` set, the build also stages the optional parts package (section
+"Parts package").

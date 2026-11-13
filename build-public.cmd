@@ -26,6 +26,10 @@ copy /y "%ROOT%\ship\sekiro-coop.me3" "%S%\" >nul || exit /b 1
 copy /y "%ROOT%\ship-public\HOW-TO-PLAY.txt" "%S%\" >nul || exit /b 1
 copy /y "%ROOT%\ship-public\LICENSE.txt" "%S%\" >nul || exit /b 1
 copy /y "%ROOT%\ship-public\licenses\*" "%S%\licenses\" >nul || exit /b 1
+rem Optional parts package (FORK.md "Parts package"): SEKIRO_COOP_PARTS = ';'-separated folders of
+rem *.dcx game part files (never in git). Each file must pass the Kraken reset check; they go to
+rem mod\parts\ and the shipped .me3 gets a [[packages]] block. Unset: no mod\, no block.
+if defined SEKIRO_COOP_PARTS powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\tools\parts\stage-parts.ps1" -Stage "%S%" || exit /b 1
 set "Z=sekiro-together-v%VER%.zip"
 rem Windows tar (not Git's GNU tar on PATH) writes forward-slash paths; Compress-Archive's
 rem backslashes break some unzippers.
