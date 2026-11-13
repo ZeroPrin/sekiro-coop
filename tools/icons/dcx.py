@@ -37,16 +37,60 @@ def kraken_decompress(comp: bytes, raw_size: int) -> bytes:
     return out.raw
 
 
+BLOCK = 0x40000  # Kraken block = seek chunk: 256 KiB of output
+
+
+def kraken_blocks(stream: bytes, raw_size: int):
+    """(blocks, blocks with the decoder-reset flag) of a Kraken stream. Each 256 KiB of output
+    starts with a 2-byte block header (b0 low nibble 0xC, bit 7 reset, bit 6 uncompressed), then
+    for a compressed block a 3-byte quantum header (6 with a CRC; 0x3FFFF = memset, 4 bytes)."""
+    p = out = n = reset = 0
+    while out < raw_size:
+        b0, b1 = stream[p], stream[p + 1]
+        if b0 & 0xF != 0xC:
+            raise ValueError(f"bad Kraken block header 0x{b0:02X} at {p}")
+        n += 1
+        reset += b0 >> 7 & 1
+        p += 2
+        left = min(BLOCK, raw_size - out)
+        if b0 >> 6 & 1:
+            p += left
+        else:
+            size = (stream[p] << 16 | stream[p + 1] << 8 | stream[p + 2]) & 0x3FFFF
+            if size != 0x3FFFF:
+                p += (6 if b1 >> 7 else 3) + size + 1
+            else:
+                p += 4
+        if p > len(stream):
+            raise ValueError("Kraken stream ends inside a block")
+        out += left
+    return n, reset
+
+
 def kraken_compress(raw: bytes, level: int = 6) -> bytes:
+    """Kraken with a decoder reset on every 256 KiB block (seekChunkReset), as vanilla DCX_KRAK
+    files have. The game's loader decodes the blocks independently: a stream without the resets
+    stalled it (the first wardrobe part files) and is the likely cause of the 2026-10-23 icon
+    override crash (IMPLEMENTATION-NOTES section 21). Oodle's default options have no resets."""
     o = oodle()
-    cap = len(raw) + 274 * ((len(raw) + 0x3FFFF) // 0x40000) + 0x10000
+    # OodleLZ_CompressOptions (Oodle 2.6): 12 x int32; [2] seekChunkReset, [3] seekChunkLen.
+    o.OodleLZ_CompressOptions_GetDefault.restype = ctypes.c_void_p
+    opts = (ctypes.c_int32 * 12)()
+    ctypes.memmove(opts, o.OodleLZ_CompressOptions_GetDefault(8, level), ctypes.sizeof(opts))
+    opts[2] = 1
+    opts[3] = BLOCK
+    cap = len(raw) + 274 * ((len(raw) + BLOCK - 1) // BLOCK) + 0x10000
     out = ctypes.create_string_buffer(cap)
     # OodleLZ_Compressor_Kraken = 8
     n = o.OodleLZ_Compress(8, raw, ctypes.c_ssize_t(len(raw)), out, level,
-                           None, None, None, None, ctypes.c_ssize_t(0))
+                           ctypes.byref(opts), None, None, None, ctypes.c_ssize_t(0))
     if n <= 0:
         raise ValueError(f"Oodle compress failed: {n}")
-    return out.raw[:n]
+    comp = out.raw[:n]
+    blocks, reset = kraken_blocks(comp, len(raw))
+    if blocks != reset:
+        raise ValueError(f"Kraken stream has a decoder reset on only {reset} of {blocks} blocks; refusing to write it")
+    return comp
 
 
 def decompress(data: bytes):
