@@ -978,6 +978,22 @@ static INVALID: [AtomicU32; TYPES] = [const { AtomicU32::new(0) }; TYPES];
 static UNRESOLVED_70: AtomicU32 = AtomicU32::new(0);
 static INVALID_LOGS: AtomicU32 = AtomicU32::new(0);
 
+/// Received 21s whose victim is our own player (10 s, `types` line): counted, and dropped
+/// while friendly fire is off (`own_player_hit`).
+static ON_OUR_PLAYER: AtomicU32 = AtomicU32::new(0);
+static ON_OUR_PLAYER_DROPPED: AtomicU32 = AtomicU32::new(0);
+static ON_OUR_PLAYER_LOGS: AtomicU32 = AtomicU32::new(0);
+
+/// Pure: a received 21 aimed at our own player (`ours` = both forms of its netId). None = not
+/// ours; Some(drop). Hits on the local player are decided on the victim's machine (router
+/// action 1, IMPLEMENTATION-NOTES §18b; a replica's hits are reaction only), so such a 21 is a
+/// second copy of a hit we already took (LukeYui drops them). pvp.rs never uses 21 (friendly
+/// fire is the type-20 record over its own bulk kind, and it only reads the damage tables),
+/// but with `friendly_fire` on the 21 is only counted, never dropped.
+fn own_player_hit(victim: u16, ours: [u16; 2], friendly_fire: bool) -> Option<bool> {
+    (victim != NO_NET_ID && ours.contains(&victim)).then_some(!friendly_fire)
+}
+
 /// Type 21: `+0x00` the chr the hit is applied to (victim), `+0x0C` the attacker.
 const DAMAGE_VICTIM: usize = 0x00;
 
@@ -1682,6 +1698,32 @@ fn serve(t: u32, buf: *mut u8, cap: u32) -> i32 {
                 continue;
             }
             note_throw(&p, false, origin);
+        }
+        if t == T_DAMAGE as u32
+            && let Some(victim) = get_u16(&p, DAMAGE_VICTIM)
+            && let Some(drop) = own_player_hit(
+                victim,
+                slot_pnets(ME.load(Ordering::Relaxed)),
+                crate::pvp::FRIENDLY_FIRE.load(Ordering::Relaxed),
+            )
+        {
+            ON_OUR_PLAYER.fetch_add(1, Ordering::Relaxed);
+            if drop {
+                ON_OUR_PLAYER_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+            let k = ON_OUR_PLAYER_LOGS.fetch_add(1, Ordering::Relaxed);
+            if k < 10 || k % 100 == 0 {
+                log::line(&format!(
+                    "hit: a 21 from peer {origin} aimed at our own player (attacker {:#x}, HP damage {}): {} ({} so far)",
+                    get_u16(&p, 0x0C).unwrap_or(NO_NET_ID),
+                    p.get(4..6).map_or(0, |b| i16::from_le_bytes([b[0], b[1]])),
+                    if drop { "dropped (decided on our machine)" } else { "passed (friendly_fire on)" },
+                    k + 1
+                ));
+            }
+            if drop {
+                continue;
+            }
         }
         // The attacker's copy lost a life ours still has (a deathblow, multi-life enemy):
         // lowered and refilled now, so the hit applies on top of the right life (livesync.rs
@@ -5435,6 +5477,10 @@ impl Engine {
             self.stage,
             if parts.is_empty() { "none".into() } else { parts.join(" | ") }
         ));
+        let (on_us, on_us_dropped) = (ON_OUR_PLAYER.swap(0, Ordering::Relaxed), ON_OUR_PLAYER_DROPPED.swap(0, Ordering::Relaxed));
+        if on_us > 0 {
+            log::line(&format!("nsession: 10 s: {on_us} received 21s aimed at our own player, {on_us_dropped} dropped"));
+        }
         let single = SINGLE_23.swap(0, Ordering::Relaxed);
         // Only meaningful with the recipient wraps patched; without them (max_players = 2) every 23
         // takes this path by design.
@@ -6414,6 +6460,17 @@ mod tests {
         assert_eq!(d, vec![1u8; 8]);
         // Short buffers do not panic.
         pnet_from_wire(&mut [0u8; 3], T_DAMAGE, &h);
+    }
+
+    #[test]
+    fn hits_aimed_at_our_own_player_are_dropped_only_without_friendly_fire() {
+        let ours = [0xA000, 0x1003];
+        assert_eq!(own_player_hit(0xA000, ours, false), Some(true));
+        assert_eq!(own_player_hit(0x1003, ours, false), Some(true), "the 0xA4CE60 form too");
+        assert_eq!(own_player_hit(0xA000, ours, true), Some(false), "friendly fire on: counted only");
+        assert_eq!(own_player_hit(0x0850, ours, false), None, "an enemy");
+        assert_eq!(own_player_hit(0xA001, ours, false), None, "another player");
+        assert_eq!(own_player_hit(NO_NET_ID, [NO_NET_ID, NO_NET_ID], false), None, "unknown is never ours");
     }
 
     /// One type-70 record: key, `a` u32s, `b` u64s, the 0x16-byte tail.
