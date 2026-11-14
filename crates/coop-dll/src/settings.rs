@@ -465,8 +465,8 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     crate::audit::ENABLED.store(ini.flag("audit", true, warn), Relaxed);
     crate::audit::EVERY_S.store(ini.num("audit_every_s", 180, 30, 3600, warn), Relaxed);
     // v7.8 bisect switch for a v7.7 behaviour (live 2026-10-24). 0 = the v7.6 behaviour.
-    // test11: `ns_force_distribution` and `ns_throw_claims` are gone (the host's owner table
-    // decides; an old ini's keys are ignored).
+    // test11: `ns_force_distribution` and `ns_throw_claims` are gone; since test14 the
+    // game's own 22 / 23 distribution decides enemy ownership (an old ini's keys are ignored).
     crate::nsession::THROW_COLLIDE_DROP.store(ini.flag("ns_throw_collide_drop", false, warn), Relaxed);
     crate::puppet::SCALE_ALL_LOADED.store(ini.flag("scale_all_loaded", false, warn), Relaxed);
     crate::posture::REST_GUARD.store(ini.flag("posture_rest_guard", true, warn), Relaxed);

@@ -56,7 +56,6 @@ mod nopause;
 mod npcintro;
 mod nsession;
 mod objact;
-mod ownership;
 mod ownworld;
 mod peers;
 mod persist;

@@ -1524,7 +1524,7 @@ impl World {
 /// once the params are loaded (RE-FINDINGS-2: classify by membership, not by
 /// flag ranges).
 /// Slots (bit per slot) whose `EV_DOWN` says they wait dead in a boss fight, as of the last
-/// `on_frame`. nsession's owner table counts them as absent (their enemies, bosses too, move on).
+/// `on_frame`. nsession's owner view (`own: OWNER-DOWN`) counts the enemies they own.
 static DOWN_SLOTS: AtomicU32 = AtomicU32::new(0);
 
 pub fn down_slots() -> u32 {

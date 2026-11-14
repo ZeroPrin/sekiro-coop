@@ -420,10 +420,8 @@ fn scale_dump() {
     let ppos = game::player().and_then(|p| p.position());
     let tag = |c: game::Chr| match crate::netai::net_id_of(c) {
         Some(n) => format!(
-            " net={n} owned_here={} table={} game={}",
-            crate::nsession::owned_here(n),
-            crate::nsession::table_owner(n).map_or("off".to_string(), crate::ownership::who),
-            crate::nsession::game_owned_here(n)
+            " net={n} owned_here={}",
+            crate::nsession::owned_here(n)
         ),
         None => " net=none".to_string(),
     };

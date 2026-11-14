@@ -226,12 +226,6 @@ pub struct Enemies {
     /// Client, death hold (persist.rs `DeathHold`): on last frame, host records kept off.
     death_hold_on: bool,
     death_hold_ignored: u32,
-    /// Native session: stealth ownership claims (entity -> netId, last time the approach
-    /// held, reason), and whether the enemy was seen on its local AI since the claim.
-    claims: HashMap<i32, (u16, Instant, &'static str, bool)>,
-    claim_logs: u32,
-    /// Last `stealth_claims` run (rate limit, see there).
-    claims_at: Option<Instant>,
     /// Our player's HKS throwable state (`player_throw_state`): when read, the value.
     throw_state: (Option<Instant>, Option<u8>),
     _forget: ForgetOnDrop,
@@ -370,16 +364,10 @@ impl Enemies {
             let _ = net.take_damage_from();
             let _ = net.take_netai_from();
             self.scan_step(player);
-            // Stealth / plunging deathblows: ask for ownership of the enemy we sneak up on.
-            let others: Vec<[f32; 3]> = peers.iter().filter_map(|p| p.snapshot).filter(|s| s.hp > 0).map(|s| s.pos).collect();
-            self.stealth_claims(player, &others);
+            // No stealth claims (test14): the game's own 22 / 23 decides who runs each enemy.
             self.loot_step(net.is_host());
             self.trace(net, player, friend_pos, ghost);
             return;
-        }
-        if !self.claims.is_empty() {
-            self.claims.clear();
-            crate::nsession::set_stealth_claims(Vec::new());
         }
         if net.is_host() {
             self.scan_step(player);
@@ -1393,8 +1381,8 @@ impl Facing {
 
 /// Stealth window (settings `[GAMEPLAY] stealth_window_m`, IMPLEMENTATION-NOTES §27):
 /// an enemy we approach from behind (rear 120 degrees) or from above within this many
-/// metres (horizontal) runs on our own AI (mode 4) / is claimed for us (native session),
-/// so its awareness is our machine's, as in single player. 0 = the old 5 m rear check.
+/// metres (horizontal) runs on our own AI (mode 4; the native session has no claims since
+/// test14), so its awareness is our machine's, as in single player. 0 = the old 5 m rear check.
 pub static STEALTH_WINDOW_M: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(15);
 /// Plunging deathblow: at least this far above the enemy, at most `PLUNGE_MAX_ABOVE_M`.
 const PLUNGE_ABOVE_M: f32 = 2.0;
@@ -1406,8 +1394,6 @@ const PLUNGE_MAX_HORIZ_M: f32 = 12.0;
 const STEALTH_LINGER: Duration = Duration::from_millis(3000);
 /// While handed off, the "behind" test widens to the rear half and this much farther.
 const STEALTH_HOLD_EXTRA_M: f32 = 5.0;
-/// Native session: a claim is dropped this long after the approach ended.
-const CLAIM_LINGER: Duration = Duration::from_millis(3000);
 
 /// `[GAMEPLAY] stealth_hang_cover` (1.0.11): while our player hangs from a ledge or hugs a
 /// wall at a corner (peeking), enemies within `HANG_COVER_M` run on our own AI too, so the
@@ -1482,16 +1468,6 @@ fn boss_handoff_allowed(is_boss: bool, reason: &str) -> bool {
 fn boss_like_lives(chr: Chr) -> bool {
     crate::livesync::multi_life(crate::livesync::lives0_of(chr))
 }
-
-/// Another living player stands within `FIGHT_NEAR_M` of an enemy at `ep`: it is in a
-/// fight with them, not a stealth target of ours.
-fn fought_by_another(ep: [f32; 3], others: &[[f32; 3]]) -> bool {
-    others.iter().any(|&o| game::distance(ep, o) <= FIGHT_NEAR_M)
-}
-
-/// v8.10: 8 m let the friend take enemies the host fought from 10-20 m (from a roof, from
-/// below): 123 "claimed by both machines" in 18 min, live 2026-10-25.
-const FIGHT_NEAR_M: f32 = 20.0;
 
 /// The enemy's posture bar is empty here (counts down; `data+0x148`, posture.rs): the
 /// local stagger / deathblow window runs.
@@ -1608,104 +1584,6 @@ impl Enemies {
         }
     }
 
-    /// Native session (both roles): enemies we approach for a stealth / plunging
-    /// deathblow are claimed as requests to the host's owner table (test11; before: type 22,
-    /// nsession.rs `set_stealth_claims`), so they run on our AI like offline.
-    fn stealth_claims(&mut self, player: Chr, others: &[[f32; 3]]) {
-        let now = Instant::now();
-        if !crate::nsession::claims_wanted() || stealth_window_m() <= 0.0 {
-            if !self.claims.is_empty() {
-                self.claims.clear();
-                crate::nsession::set_stealth_claims(Vec::new());
-            }
-            return;
-        }
-        // Rate limit: the walk below reads every known chr's position (3 ReadProcessMemory
-        // each), so run it every 100 ms, not every frame. CLAIM_LINGER is 3 s, so the
-        // claim timing is unchanged.
-        if self.claims_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(100)) {
-            return;
-        }
-        self.claims_at = Some(now);
-        let Some(pp) = player.position() else { return };
-        let reach = stealth_window_m() + STEALTH_HOLD_EXTRA_M;
-        let near: Vec<(i32, Chr)> = self
-            .known
-            .iter()
-            .filter(|(_, c)| c.position().is_some_and(|p| game::distance(pp, p) <= reach + PLUNGE_MAX_ABOVE_M))
-            .copied()
-            .collect();
-        let mut changed = false;
-        let gauge = game::boss_state().map(|b| b.entity);
-        for (id, chr) in near {
-            if chr.hp().is_none_or(|hp| hp <= 0) {
-                continue;
-            }
-            // Never a boss (v8.6): the claim moved Genichiro to the friend's AI while the
-            // host still ran it ("claimed by both machines" for 21 s, live 2026-10-25), so
-            // two AIs drove it and it jumped between the players. Bosses take no stealth
-            // deathblow in a fight anyway.
-            // v8.49: nor a miniboss (two or more lives): Headless 1700500 was claimed "behind"
-            // while the friend fought it, and both machines ran it (live 2026-10-27).
-            if gauge == Some(id) || crate::bosses::encounter_of(id).is_some() || boss_like_lives(chr) {
-                continue;
-            }
-            // Nor one another living player is fighting (v8.8, 20 m since v8.10): the claim handed an enemy
-            // fighting the host to our AI, which knew nothing of the fight, so it "forgot"
-            // the players and gave a stealth deathblow (live 2026-10-25). An unaware enemy
-            // nobody stands next to is still ours to sneak up on.
-            if chr.position().is_some_and(|ep| fought_by_another(ep, others)) {
-                continue;
-            }
-            let holding = self.claims.contains_key(&id);
-            let Some((why, dy)) = self.stealth_approach(chr, player, holding) else { continue };
-            let Some(net_id) = netai::net_id(chr) else { continue };
-            match self.claims.get_mut(&id) {
-                Some(c) => c.1 = now,
-                None => {
-                    self.claims.insert(id, (net_id, now, why, false));
-                    changed = true;
-                    if self.claim_logs < 40 {
-                        self.claim_logs += 1;
-                        log::line(&format!(
-                            "stealth: claiming enemy {id} (netId {net_id:#x}, {why}, height {dy:+.1} m): a request to the host's owner table"
-                        ));
-                    }
-                }
-            }
-        }
-        let mut dropped = Vec::new();
-        for (&id, c) in self.claims.iter_mut() {
-            if now.duration_since(c.1) >= CLAIM_LINGER {
-                dropped.push(id);
-                continue;
-            }
-            // Evidence: the claim moved the enemy to our own AI (slot 37 picks the
-            // ComManipulator for an enemy owned here).
-            if !c.3
-                && let Some(chr) = game::chr_by_entity_id(id)
-                && netai::active_kind(chr) == 1
-            {
-                c.3 = true;
-                if self.claim_logs < 80 {
-                    self.claim_logs += 1;
-                    log::line(&format!("stealth: enemy {id} runs on our own AI now (owned here after the claim)"));
-                }
-            }
-        }
-        for id in dropped {
-            if let Some((_, _, _, local)) = self.claims.remove(&id)
-                && self.claim_logs < 80
-            {
-                self.claim_logs += 1;
-                log::line(&format!("stealth: claim on enemy {id} dropped (approach over; it was {}owned here)", if local { "" } else { "never " }));
-            }
-            changed = true;
-        }
-        if changed {
-            crate::nsession::set_stealth_claims(self.claims.values().map(|c| c.0).collect());
-        }
-    }
 }
 
 /// "A throw is running on this chr", as `0xB4E9C0` gates on it: the ThrowNode
@@ -1881,15 +1759,6 @@ impl Enemies {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn no_stealth_claim_on_an_enemy_another_player_fights() {
-        let e = [10.0, 0.0, 10.0];
-        assert!(fought_by_another(e, &[[0.0; 3], [14.0, 0.0, 14.0]]));
-        assert!(fought_by_another(e, &[[25.0, 0.0, 10.0]]));
-        assert!(!fought_by_another(e, &[[0.0, 0.0, 40.0], [40.0, 0.0, 10.0]]));
-        assert!(!fought_by_another(e, &[]));
-    }
 
     #[test]
     fn bosses_are_not_handed_to_the_friends_ai_for_a_stealth_approach() {
