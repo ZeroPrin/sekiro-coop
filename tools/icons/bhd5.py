@@ -17,17 +17,23 @@ import os
 import struct
 import sys
 
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
-
 try:
     from Crypto.Cipher import AES  # pycryptodome
 except ImportError:  # pragma: no cover
     AES = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sekiro_keys import SEKIRO_KEYS  # noqa: E402
+try:
+    from sekiro_keys import SEKIRO_KEYS  # noqa: E402  (local, untracked: Data1-5 RSA public keys)
+except ImportError:  # or a dir of DataN.pem files (UXM ArchiveKeys) in SEKIRO_KEYS_DIR
+    _KEYS_DIR = os.environ.get("SEKIRO_KEYS_DIR", "")
+    SEKIRO_KEYS = {f"Data{i}": open(os.path.join(_KEYS_DIR, f"Data{i}.pem")).read()
+                   for i in range(1, 6) if _KEYS_DIR and os.path.exists(os.path.join(_KEYS_DIR, f"Data{i}.pem"))}
 
-GAME_DIR = r"F:\SteamLibrary\steamapps\common\Sekiro"
+GAME_DIR = os.environ.get("SEKIRO_GAME_DIR", r"F:\SteamLibrary\steamapps\common\Sekiro")
+# Optional: a folder with files already extracted from the archives at their game paths
+# (e.g. souls-tools SekiroTool extract ... "menu/"); read_game_file looks there first.
+EXTRACTED_DIR = os.environ.get("SEKIRO_EXTRACTED")
 
 
 def normalize(path: str) -> str:
@@ -47,6 +53,7 @@ def path_hash(path: str) -> int:
 
 
 def rsa_decrypt(data: bytes, pem: str) -> bytes:
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
     pub = load_pem_public_key(pem.encode()).public_numbers()
     n, e = pub.n, pub.e
     out = bytearray()
@@ -129,6 +136,11 @@ def locate(path: str):
 
 
 def read_game_file(path: str) -> bytes:
+    if EXTRACTED_DIR:
+        f = os.path.join(EXTRACTED_DIR, *normalize(path).strip("/").split("/"))
+        if os.path.exists(f):
+            with open(f, "rb") as fh:
+                return fh.read()
     a, e = locate(path)
     if a is None:
         raise KeyError(path)

@@ -1,7 +1,9 @@
-//! Custom icons for the three co-op items, ERSC style: no game file is replaced. While the
-//! game turns a loaded TPF into texture-creation jobs, we overwrite the BC7 blocks of three
-//! vanilla icon cells (MENU_ItemIcon_00251 / 00552 / 00962, unused by any param row) in the
-//! TPF's memory, before the GPU textures are created. NOT verified live (2026-10-23).
+//! Custom icons for the three co-op items and Karma, ERSC style: no game file is replaced.
+//! While the game turns a loaded TPF into texture-creation jobs, we overwrite the BC7 blocks
+//! of vanilla icon cells unused by any param row (MENU_ItemIcon_00251 / 00552 / 00962, the
+//! Karma item MENU_ItemIcon_00172 and the Karma HUD status icon MENU_StatusIcon_02150 in
+//! `SB_Status`, docs/KARMA-ASSETS.md) in the TPF's memory, before the GPU textures are
+//! created. NOT verified live (2026-10-23; Karma cells 2026-11-15).
 //!
 //! Hook (IDA, static dump `quick_re7`): `0x71B750` = per-TPF "create texture resources" loop
 //! `(a1, a2 = array of 80-byte texture entry handles, i32 a3, a4 = job list, a5)`.
@@ -260,7 +262,8 @@ fn patch_tpf(base: usize) {
     for i in 0..count as usize {
         let e = &table[20 * i..20 * i + 20];
         let Some(name) = u32_at(e, 12).and_then(|o| read_name(base + o as usize)) else { continue };
-        if !name.starts_with("SB_Icon") {
+        // Item icons (`SB_Icon*`) and the HUD status icons (`SB_Status*`, karma.rs).
+        if !(name.starts_with("SB_Icon") || name.starts_with("SB_Status")) {
             continue;
         }
         let matching: Vec<&Cell> = cells.iter().filter(|c| c.texture == name).collect();
@@ -294,8 +297,9 @@ fn patch_tpf(base: usize) {
             if outcome == Outcome::Patched {
                 PATCHED.fetch_add(1, Ordering::Relaxed);
             }
+            let kind = if c.texture.starts_with("SB_Status") { "MENU_StatusIcon" } else { "MENU_ItemIcon" };
             log::line(&format!(
-                "icons: {name} {w}x{h} MENU_ItemIcon_{:05} blocks ({},{}) {}x{}: {outcome:?}",
+                "icons: {name} {w}x{h} {kind}_{:05} blocks ({},{}) {}x{}: {outcome:?}",
                 c.icon_id, c.bx, c.by, c.bw, c.bh
             ));
         }
@@ -372,13 +376,14 @@ mod tests {
     #[test]
     fn embedded_blob_parses_and_covers_hi_and_low() {
         let cells = parse_blob(BLOB).expect("blob");
-        assert_eq!(cells.len(), 6);
-        for id in [251, 552, 962] {
+        assert_eq!(cells.len(), 10);
+        // Co-op items, the Karma item (karma.rs ITEM_ICON) and the Karma status icon (STATUS_ICON).
+        for id in [251, 552, 962, 172, 2150] {
             let sizes: Vec<_> = cells.iter().filter(|c| c.icon_id == id).map(|c| (c.width, c.height)).collect();
             assert_eq!(sizes.len(), 2, "icon {id}: one hi and one low record");
         }
         for c in &cells {
-            assert!(c.texture.starts_with("SB_Icon"));
+            assert!(c.texture.starts_with("SB_Icon") || c.texture.starts_with("SB_Status"));
             assert_eq!(c.dds_size as usize, DDS_HEADER + (c.width * c.height) as usize);
             assert_ne!(c.vanilla_hash, c.new_hash);
         }

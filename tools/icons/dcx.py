@@ -13,7 +13,7 @@ import os
 import struct
 import zlib
 
-OODLE_DLL = r"F:\SteamLibrary\steamapps\common\Sekiro\oo2core_6_win64.dll"
+OODLE_DLL = os.environ.get("SEKIRO_OODLE_DLL", r"F:\SteamLibrary\steamapps\common\Sekiro\oo2core_6_win64.dll")
 _oodle = None
 
 
