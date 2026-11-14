@@ -15,7 +15,7 @@
 //!    local player; the replica never gets them, so its art slashes and those sounds are
 //!    skipped. The owner sends the ids of its active SpEffects with a gate stateInfo
 //!    (PlayerRaw type `PTYPE`), the watcher applies / removes exactly those ids on the
-//!    owner's replica (`0x9E9C00` / `0xC00340`, the calls speffect.rs uses). The add is
+//!    owner's replica (`0x9E9C00` / `0xBFB6D0`, the calls karma.rs uses). The add is
 //!    FORCED: unforced, `0x9E9D10` refuses every SpEffect on a remote player (test4: 7735 x
 //!    "present false"). Level 1 also mirrors the prosthetic tool stateInfos (`GATES_TOOL`),
 //!    level 2 also the enchant stateInfos the art events test.
@@ -65,8 +65,15 @@ const APPLY_RVA: usize = 0x9E9C00;
 const APPLY_FORCE: u8 = 1;
 const APPLY_PROLOGUE: [u8; 11] = [0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10];
 const HAS_RVA: usize = 0xBFEFB0;
-const REMOVE_RVA: usize = 0xC00340;
-/// `(ParamRef* out, id)`: SpEffectParam row lookup (speffect.rs detours it; we call the entry).
+/// `u8 0xBFB6D0(list, id)`: unlinks and frees the first node with `id` through
+/// `0xC01300(list, node, 1)`, 1 = one was removed; the EMEVD ClearSpEffect (`0x924800`) and the
+/// ChrIns wrapper `0x9EDEE0` use it [VAR Ghidra 2026-11-15, E:\RE\work_karma\d1.c / d2.c]. Until
+/// test12 the mirror called `0xC00340`, which only sets node `+0x26/+0x27 = 1` ("keep for one
+/// more update", IMPLEMENTATION-NOTES §15 review fixes): an infinite gate effect it meant to
+/// take off the replica stayed on.
+const REMOVE_RVA: usize = 0xBFB6D0;
+const REMOVE_PROLOGUE: [u8; 10] = [0x48, 0x83, 0xEC, 0x28, 0x8B, 0xC2, 0x48, 0x8B, 0x51, 0x08];
+/// `(ParamRef* out, id)`: SpEffectParam row lookup (we call the entry).
 const LOOKUP_RVA: usize = 0x10CEC30;
 
 const CHR_SP_LIST: usize = 0x11D0;
@@ -404,7 +411,7 @@ fn mirror(s: &mut State, now: Instant) {
         if want.is_empty() && s.applied[i].1.is_empty() {
             continue;
         }
-        if !want.is_empty() && !apply_checked() {
+        if !apply_checked() {
             continue;
         }
         let has_f: extern "C" fn(usize, i32) -> u8 = unsafe { std::mem::transmute(base + HAS_RVA) };
@@ -416,7 +423,7 @@ fn mirror(s: &mut State, now: Instant) {
         }
         let apply: extern "C" fn(usize, i32, usize, u8, u8, *const [f32; 4], f32, u8, i32, u8) =
             unsafe { std::mem::transmute(base + APPLY_RVA) };
-        let remove: extern "C" fn(usize, i32) -> usize = unsafe { std::mem::transmute(base + REMOVE_RVA) };
+        let remove: extern "C" fn(usize, i32) -> u8 = unsafe { std::mem::transmute(base + REMOVE_RVA) };
         static ONE4: [f32; 4] = [1.0; 4];
         let mut done = Vec::new();
         for &id in &add {
@@ -434,7 +441,12 @@ fn mirror(s: &mut State, now: Instant) {
             }
         }
         for &id in &del {
-            remove(list, id);
+            // One node per call; a forced re-add may have stacked a second one.
+            for _ in 0..4 {
+                if remove(list, id) == 0 {
+                    break;
+                }
+            }
             done.push(format!("-{id}"));
         }
         s.applied[i].1.retain(|id| want.contains(id));
@@ -445,17 +457,23 @@ fn mirror(s: &mut State, now: Instant) {
     }
 }
 
-/// The SpEffect add function has the bytes speffect.rs verified (checked once).
+/// The SpEffect add and remove functions have the expected first bytes (checked once).
 fn apply_checked() -> bool {
     match APPLY_OK.load(Relaxed) {
         1 => true,
         2 => false,
         _ => {
             let mut b = [0u8; 11];
-            let ok = read_bytes(module_base() + APPLY_RVA, &mut b) && b == APPLY_PROLOGUE;
+            let mut r = [0u8; 10];
+            let add_ok = read_bytes(module_base() + APPLY_RVA, &mut b) && b == APPLY_PROLOGUE;
+            let remove_ok = read_bytes(module_base() + REMOVE_RVA, &mut r) && r == REMOVE_PROLOGUE;
+            let ok = add_ok && remove_ok;
             APPLY_OK.store(if ok { 1 } else { 2 }, Relaxed);
-            if !ok {
+            if !add_ok {
                 log::line(&format!("fx: mirror off: SpEffect add 0x9E9C00 has unexpected bytes {b:02x?}"));
+            }
+            if !remove_ok {
+                log::line(&format!("fx: mirror off: SpEffect remove 0xBFB6D0 has unexpected bytes {r:02x?}"));
             }
             ok
         }
