@@ -2,9 +2,9 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test12`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test13`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test12`: nothing in the sections below marked experimental or
+> **Test build `1.0.9-pickups.3-test13`: nothing in the sections below marked experimental or
 > "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
 > onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
@@ -35,7 +35,21 @@ Version string: `1.0.9-pickups.3-test12`. Everybody in a session needs the same 
 > cleared on warps; the auditor ranks bosses before elites and labels elites; throwprobe logs posture
 > and the AI target with a `+0 s` line (budget 536 lines). Known leftover: a solo world whose Senpou lift
 > was killed by a test5 session stays dead (not repaired automatically; joining a host whose lift works
-> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. `test10` adds Reed as a separate skin (`reed.rs`, section "Wardrobe"; only with all eight Reed part files in the parts package), fixes the `aitarget:` logger (records keyed by address: no fake `TARGET me -> me` / HIT lines; separate event and replan budgets, a sharded sample table, section "Enemy target choice, observed"), mirrors the friend's prosthetic tool states onto its replica (`fx_speffect_mirror = 1`: tool flashes and sounds, `docs/RE-REMOTE-FX.md` "Протезы на реплике"; the 906 deflect-spark "gap" was none) and removes `fx_debug`; the wardrobe close-on-load was checked (works, never triggered in test9). Checklist: section "test10 co-op checklist". `test11` replaces enemy AI ownership: the host alone decides which machine runs each enemy (an owner table sent on our control lane, PROTO 6), and `IsOwnedHere` answers only from that table on both machines; ownfill, the boss stripping, the pause hand-over, the prio-0xFFFF stealth claims and contests are gone, stealth claims are requests to the host, and the ini keys `ns_force_distribution` / `ns_throw_claims` are removed (`docs/PLAN-OWNERSHIP.md`; section "test11 co-op checklist"). `test12` is test11 plus the Red Armour outfit as a separate skin with its own head (`red.rs`, section "Wardrobe"; only with all eight Red part files in the parts package); Reed and Red share one table-driven module (`partskin.rs`). The oracle is a playtest with both logs.
+> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. `test10` adds Reed as a separate skin (`reed.rs`, section "Wardrobe"; only with all eight Reed part files in the parts package), fixes the `aitarget:` logger (records keyed by address: no fake `TARGET me -> me` / HIT lines; separate event and replan budgets, a sharded sample table, section "Enemy target choice, observed"), mirrors the friend's prosthetic tool states onto its replica (`fx_speffect_mirror = 1`: tool flashes and sounds, `docs/RE-REMOTE-FX.md` "Протезы на реплике"; the 906 deflect-spark "gap" was none) and removes `fx_debug`; the wardrobe close-on-load was checked (works, never triggered in test9). Checklist: section "test10 co-op checklist". `test11` replaces enemy AI ownership: the host alone decides which machine runs each enemy (an owner table sent on our control lane, PROTO 6), and `IsOwnedHere` answers only from that table on both machines; ownfill, the boss stripping, the pause hand-over, the prio-0xFFFF stealth claims and contests are gone, stealth claims are requests to the host, and the ini keys `ns_force_distribution` / `ns_throw_claims` are removed (`docs/PLAN-OWNERSHIP.md`; section "test11 co-op checklist"). `test12` is test11 plus the Red Armour outfit as a separate skin with its own head (`red.rs`, section "Wardrobe"; only with all eight Red part files in the parts package); Reed and Red share one table-driven module (`partskin.rs`). `test13` replaces the death debuff with Karma (`karma.rs`, section "test13 additions (Karma)"; `death_debuff_icon` is gone). The oracle is a playtest with both logs.
+
+## test13 additions (Karma)
+
+test13 = test12 + Karma, which replaces the old death debuff (`debuff.rs`, `speffect.rs`, the
+setting `death_debuff_icon` and `coop_state.json` are gone; old stacks are not carried over).
+Notes: `docs/IMPLEMENTATION-NOTES.md` "test13: Karma"; art and texts: `docs/KARMA-ASSETS.md`
+(both icons are placeholders). Your own true death while a friend is linked gives one "Karma"
+item (key item, count shown, at most 6) after the reload; each one lowers max HP and posture by
+10 % and damage dealt by 2 % (additive: 6 = 40 % / 88 %), with one status icon under the HP bar.
+Resting at an idol yourself removes all of it (solo too); the friend's rest does not. Setting
+`death_debuffs` turns it on / off (host's value while linked; off = no new Karma, held Karma
+inert). Solo test: `[DEBUG] debug_hotkeys = 1`, F2 = one Karma. Also: the replica SpEffect
+mirror now really removes effects (`0xBFB6D0` instead of `0xC00340`, remotefx.rs). The test11 and
+test12 checklists below still apply (test11 was never played in co-op). Log prefix `karma:`.
 
 ## test12 additions (Red Armour)
 
