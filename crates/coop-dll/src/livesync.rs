@@ -59,7 +59,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::enemies::Enemies;
@@ -263,13 +263,86 @@ pub fn getup_guard(elapsed: Duration, hp: i32, max_hp: i32) -> bool {
     elapsed < GETUP_HOLD && max_hp > 1 && hp <= 1
 }
 
+/// Why a lives byte that would lower our copy was not applied (`lives_byte_action`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteSkip {
+    /// A native throw on it applies here (we sent it, or we own the defender): the throw
+    /// takes the life on this machine itself, the byte would take a second one.
+    Throw,
+    /// The first states after our rest are a baseline (`rest_baseline_blocks`), or the
+    /// baseline is still being collected.
+    Rest,
+    /// Right after our death reload (`DEATH_GUARD`): the sender may be in the old world.
+    DeathReload,
+    /// A wipe within `persist::WIPE_STALE`: the sender's lives are from before the reset.
+    Wipe,
+    /// livesync's state was busy (never blocks the game thread): skipped, Lives follows.
+    Busy,
+}
+
+impl ByteSkip {
+    pub const ALL: [ByteSkip; 5] = [ByteSkip::Throw, ByteSkip::Rest, ByteSkip::DeathReload, ByteSkip::Wipe, ByteSkip::Busy];
+
+    pub fn text(self) -> &'static str {
+        match self {
+            ByteSkip::Throw => "a deathblow on it applies here and takes the life itself",
+            ByteSkip::Rest => "first states after our rest are a baseline",
+            ByteSkip::DeathReload => "right after our death reload",
+            ByteSkip::Wipe => "wipe recent",
+            ByteSkip::Busy => "livesync busy",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            ByteSkip::Throw => "throw",
+            ByteSkip::Rest => "rest",
+            ByteSkip::DeathReload => "death reload",
+            ByteSkip::Wipe => "wipe",
+            ByteSkip::Busy => "busy",
+        }
+    }
+}
+
+/// livesync's guards for one enemy at the moment a lives byte arrives: the same ones its
+/// own merge path applies (throw hold, rest baseline, death-reload guard, wipe guard).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ByteGuards {
+    /// `throw_hold`: a native throw on it within `THROW_HOLD_MS` that this machine applies.
+    pub throw_hold: bool,
+    /// Our engagement follows a rest and the baseline window is still open.
+    pub rest_window: bool,
+    /// The friend's baseline lives for it after our rest (`rest_baseline_blocks`).
+    pub baseline: Option<i32>,
+    pub after_death: bool,
+    pub wiped: bool,
+}
+
 /// test14, the lives byte on relayed hits (type 21, nsession.rs `route_send` / `serve`;
 /// LukeYui's relay does the same): the attacker's copy had `byte` lives when it sent the
 /// hit, ours has `ours`. Lower ours to `byte` (refilled, before the hit applies) only when
 /// both are known (> 0) and the byte is lower: the min-merge of the Lives messages stays
 /// authoritative, a stale or higher byte changes nothing. Single-life enemies read 0.
-pub fn lives_byte_action(ours: i32, byte: u8) -> Option<i32> {
-    (ours > 0 && byte > 0 && (byte as i32) < ours).then_some(byte as i32)
+/// `guards` None = livesync's state was busy. Ok(None) = nothing to do; Err = it would have
+/// lowered ours but one of livesync's guards holds it (the Lives message decides later).
+pub fn lives_byte_action(ours: i32, byte: u8, guards: Option<ByteGuards>) -> Result<Option<i32>, ByteSkip> {
+    if !(ours > 0 && byte > 0 && (byte as i32) < ours) {
+        return Ok(None);
+    }
+    let g = guards.ok_or(ByteSkip::Busy)?;
+    if g.wiped {
+        return Err(ByteSkip::Wipe);
+    }
+    if g.after_death {
+        return Err(ByteSkip::DeathReload);
+    }
+    if g.throw_hold {
+        return Err(ByteSkip::Throw);
+    }
+    if g.rest_window || rest_baseline_blocks(g.baseline, byte as i32) {
+        return Err(ByteSkip::Rest);
+    }
+    Ok(Some(byte as i32))
 }
 
 /// The lives byte to send for a hit on `lives` (0 = unknown, a player, out of range).
@@ -392,18 +465,69 @@ impl State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-/// netId -> chr of the enemies of the last scan while engaged (empty otherwise): the hit
-/// relay's lives byte (nsession.rs, game threads: `try_lock` only, never blocks).
-static CHRS: Mutex<Vec<(u16, usize)>> = Mutex::new(Vec::new());
-/// Lives bytes applied (lowered + refilled before the hit), for the log cap.
-static BYTE_APPLIED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// One enemy of livesync's last scan (also nsession's owner view: it reuses the netId, HP
+/// and boss class instead of reading them again).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Scanned {
+    pub n: u16,
+    pub chr: usize,
+    pub hp: i32,
+    /// A `bosses.rs` encounter entity, the boss gauge's entity or a multi-life enemy.
+    pub boss: bool,
+}
 
-/// The enemy with netId `n` from the last scan, still that enemy (its netId re-read).
+/// The enemies of the last scan while engaged (empty otherwise) and when it ran: the hit
+/// relay's lives byte and the owner view (nsession.rs, game threads: `try_lock` only).
+static CHRS: Mutex<(Option<Instant>, Vec<Scanned>)> = Mutex::new((None, Vec::new()));
+/// Lives bytes applied (lowered + refilled before the hit) / skipped per `ByteSkip`, for
+/// the log caps; the 10 s counters are taken by `stats_line`.
+static BYTE_APPLIED: AtomicU32 = AtomicU32::new(0);
+static BYTE_SKIPPED: AtomicU32 = AtomicU32::new(0);
+static BYTE_APPLIED_10S: AtomicU32 = AtomicU32::new(0);
+static BYTE_SKIPPED_10S: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
+
+/// livesync's last scan if it is at most `max_age` old (None: livesync off / not engaged /
+/// stale, or busy).
+pub(crate) fn last_scan(max_age: Duration) -> Option<Vec<Scanned>> {
+    let g = CHRS.try_lock().ok()?;
+    g.0.filter(|t| t.elapsed() <= max_age)?;
+    Some(g.1.clone())
+}
+
+/// The enemy with netId `n` from the last scan, still that enemy (its netId re-read). For
+/// reads only: the pointer can be up to one scan old (`enemy_now` before any write).
 fn chr_of(n: u16) -> Option<Chr> {
     let g = CHRS.try_lock().ok()?;
-    let chr = g.iter().find(|e| e.0 == n).map(|e| Chr(e.1))?;
+    let chr = g.1.iter().find(|e| e.n == n).map(|e| Chr(e.chr))?;
     drop(g);
     (netai::net_id(chr) == Some(n)).then_some(chr)
+}
+
+/// A throw on `n` within `THROW_HOLD_MS` that this machine applies itself: we sent it, or
+/// we own the defender (the receiver of a type 18 applies it only on an enemy it owns, and
+/// that takes the life there). livesync's merge holds for it; so does the lives byte.
+fn throw_hold(n: u16) -> bool {
+    nsession::recent_throw(n, THROW_HOLD_MS).is_some_and(|sent| sent || nsession::owned_here(n))
+}
+
+/// livesync's guards for a lives byte on `n` now; None = its state is busy (never blocks).
+fn byte_guards(n: u16) -> Option<ByteGuards> {
+    let now = Instant::now();
+    let (rest_window, baseline) = {
+        let g = STATE.try_lock().ok()?;
+        let st = g.as_ref();
+        (
+            st.and_then(|s| s.rest_start).is_some_and(|t| now.duration_since(t) <= REST_BASELINE_FOR),
+            st.and_then(|s| s.baseline.get(&n).copied()),
+        )
+    };
+    Some(ByteGuards {
+        throw_hold: throw_hold(n),
+        rest_window,
+        baseline,
+        after_death: crate::persist::after_death_guard(DEATH_GUARD),
+        wiped: crate::persist::wipe_recent(crate::persist::WIPE_STALE),
+    })
 }
 
 /// Sender side: the lives byte for a hit on enemy `n` (0 = unknown).
@@ -411,19 +535,55 @@ pub(crate) fn lives_byte_for(n: u16) -> u8 {
     lives_byte_of(chr_of(n).and_then(read_data).map(|d| d.4))
 }
 
-/// Receiver side, before the relayed hit is handed to the game: our copy of `n` takes the
-/// attacker's lower lives count, with full HP and posture (`lives_byte_action`). True = done.
-pub(crate) fn apply_lives_byte(n: u16, byte: u8) -> bool {
+/// What the lives byte of one received 21 did here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ByteOutcome {
+    /// Nothing to do (0 / not lower / unknown enemy / livesync off).
+    None,
+    Applied,
+    Skipped(ByteSkip),
+}
+
+/// Receiver side, before the relayed hit is handed to the game (game thread): our copy of
+/// `n` takes the attacker's lower lives count, with full HP and posture, unless one of
+/// livesync's own guards holds it (`lives_byte_action`). The chr comes from the last scan
+/// for the reads; before any write it is looked up again in the game's chr sets now
+/// (`nsession::enemy_now`): a pointer freed since the scan is never written.
+pub(crate) fn apply_lives_byte(n: u16, byte: u8) -> ByteOutcome {
     if byte == 0 || !ENABLED.load(Ordering::Relaxed) {
-        return false;
+        return ByteOutcome::None;
     }
-    let Some(chr) = chr_of(n) else { return false };
-    let Some((data, hp, max_hp, max_posture, ours)) = read_data(chr) else { return false };
-    let Some(to) = lives_byte_action(ours, byte).filter(|_| hp > 0) else { return false };
-    if !set_lives(data, ours, to, "lives byte") {
-        return false;
+    let Some(chr) = chr_of(n) else { return ByteOutcome::None };
+    let Some((_, hp, _, _, ours)) = read_data(chr) else { return ByteOutcome::None };
+    if hp <= 0 {
+        return ByteOutcome::None;
+    }
+    let to = match lives_byte_action(ours, byte, byte_guards(n)) {
+        Ok(Some(to)) => to,
+        Ok(None) => return ByteOutcome::None,
+        Err(why) => {
+            BYTE_SKIPPED_10S[why as usize].fetch_add(1, Ordering::Relaxed);
+            let k = BYTE_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            if k <= MAX_LOGS || k % 50 == 0 {
+                log::line(&format!(
+                    "hit: lives byte {byte} for {n:#x} e{} (ours {ours}) skipped: {} ({k} skipped so far)",
+                    chr.entity_id().unwrap_or(-1),
+                    why.text()
+                ));
+            }
+            return ByteOutcome::Skipped(why);
+        }
+    };
+    // Fresh identity check right before the writes, then the values read again from it.
+    if !nsession::enemy_now(chr, n) {
+        return ByteOutcome::None;
+    }
+    let Some((data, hp, max_hp, max_posture, ours)) = read_data(chr) else { return ByteOutcome::None };
+    if hp <= 0 || ours <= to || !set_lives(data, ours, to, "lives byte") {
+        return ByteOutcome::None;
     }
     refill(chr, data, max_hp, max_posture);
+    BYTE_APPLIED_10S.fetch_add(1, Ordering::Relaxed);
     let k = BYTE_APPLIED.fetch_add(1, Ordering::Relaxed) + 1;
     if k <= MAX_LOGS || k % 50 == 0 {
         log::line(&format!(
@@ -431,7 +591,7 @@ pub(crate) fn apply_lives_byte(n: u16, byte: u8) -> bool {
             chr.entity_id().unwrap_or(-1)
         ));
     }
-    true
+    ByteOutcome::Applied
 }
 
 /// Deathblow trace: (lives, HP, entity) of enemy `n` now (game threads, never blocks).
@@ -507,7 +667,7 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
         // Not engaged: whatever the friend sent is for another engagement.
         let _ = nsession::take_lives();
         if let Ok(mut c) = CHRS.lock() {
-            c.clear();
+            *c = (None, Vec::new());
         }
         return;
     }
@@ -566,10 +726,9 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
     }
     let mut out: Vec<LifeEntry> = Vec::new();
     let gauge = game::boss_state().map(|b| b.entity);
-    let mut chrs: Vec<(u16, usize)> = Vec::new();
+    let mut chrs: Vec<Scanned> = Vec::new();
     for chr in nsession::enemy_chrs() {
         let Some(n) = netai::net_id(chr) else { continue };
-        chrs.push((n, chr.0));
         let Some((data, mut hp, max_hp, max_posture, mut lives)) = read_data(chr) else { continue };
         let prev = st.local.get(&n).copied().filter(|p| p.chr == chr.0);
         let lives0 = prev.map_or_else(|| lives0_of(chr), |p| p.lives0);
@@ -606,7 +765,10 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
         }
         let lives_read = lives;
         let multi = multi_life(lives0);
-        let tracked = multi || boss_tracked(chr.entity_id(), gauge);
+        let entity_id = chr.entity_id();
+        let tracked = multi || boss_tracked(entity_id, gauge);
+        let boss = tracked || entity_id.is_some_and(|e| crate::bosses::encounter_of(e).is_some());
+        chrs.push(Scanned { n, chr: chr.0, hp, boss });
         // A lives drop with a life left is a get-up, never a death: look at it BEFORE the
         // dead test (the same scan can read HP 0).
         let drop = multi && lives_drop(prev.map(|p| (p.lives, p.dead)), lives_read);
@@ -647,7 +809,7 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
         let mut fresh = prev.is_some_and(|p| p.fresh || (!p.dead && dead));
         // The friend's state.
         if let Some(&(r, since)) = st.remote.get(&n) {
-            let throw_pending = nsession::recent_throw(n, THROW_HOLD_MS).is_some_and(|sent| sent || nsession::owned_here(n));
+            let throw_pending = throw_hold(n);
             let waited = now.duration_since(since) >= KILL_GRACE;
             let mut p = puppet_plan(puppet, plan(lives, dead, r.lives, r.flags, throw_pending, waited));
             // Lives of single-life enemies are not tracked (their field reads 0); their
@@ -830,7 +992,7 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
         }
     }
     if let Ok(mut c) = CHRS.lock() {
-        *c = chrs;
+        *c = (Some(now), chrs);
     }
     if !out.is_empty() {
         st.stats.sent += out.len() as u32;
@@ -851,8 +1013,15 @@ fn stats_line(st: &mut State, end: bool) {
     let s = std::mem::take(&mut st.stats);
     let reduced = st.local.values().filter(|l| !l.dead && multi_life(l.lives0) && l.lives < l.lives0).count();
     let dead = st.local.values().filter(|l| l.dead).count();
+    let applied = BYTE_APPLIED_10S.swap(0, Ordering::Relaxed);
+    let skipped: Vec<String> = ByteSkip::ALL
+        .iter()
+        .map(|&w| (w, BYTE_SKIPPED_10S[w as usize].swap(0, Ordering::Relaxed)))
+        .filter(|&(_, k)| k > 0)
+        .map(|(w, k)| format!("{} {k}", w.short()))
+        .collect();
     log::line(&format!(
-        "livesync ({}): sent {} states in {} msgs, received {}, lowered {}, killed {} ({} with loot), held {}, get-up refills guarded {}, corpses kept dead {}, ignored after our death reload {}; here {reduced} enemies short of lives, {dead} dead",
+        "livesync ({}): sent {} states in {} msgs, received {}, lowered {}, killed {} ({} with loot), held {}, get-up refills guarded {}, corpses kept dead {}, ignored after our death reload {}; lives bytes applied {applied}, skipped {}; here {reduced} enemies short of lives, {dead} dead",
         if end { "engagement over" } else { "10 s" },
         s.sent,
         s.msgs,
@@ -863,7 +1032,8 @@ fn stats_line(st: &mut State, end: bool) {
         s.held,
         s.guarded,
         s.corpses,
-        s.stale
+        s.stale,
+        if skipped.is_empty() { "0".to_string() } else { skipped.join(", ") }
     ));
 }
 
@@ -1031,16 +1201,56 @@ mod tests {
 mod lives_byte_tests {
     use super::*;
 
+    const FREE: Option<ByteGuards> = Some(ByteGuards { throw_hold: false, rest_window: false, baseline: None, after_death: false, wiped: false });
+
+    fn with(f: impl FnOnce(&mut ByteGuards)) -> Option<ByteGuards> {
+        let mut g = FREE.unwrap();
+        f(&mut g);
+        Some(g)
+    }
+
     #[test]
     fn the_lives_byte_only_lowers_known_lives() {
-        assert_eq!(lives_byte_action(2, 1), Some(1), "the attacker's deathblow took a life first");
-        assert_eq!(lives_byte_action(3, 1), Some(1));
-        assert_eq!(lives_byte_action(2, 2), None, "equal: nothing");
-        assert_eq!(lives_byte_action(1, 2), None, "higher (stale): never raises");
-        assert_eq!(lives_byte_action(2, 0), None, "0 = unknown");
-        assert_eq!(lives_byte_action(0, 1), None, "single-life enemies read 0");
-        assert_eq!(lives_byte_action(-1, 1), None);
-        assert_eq!(lives_byte_action(300, 255), Some(255));
+        assert_eq!(lives_byte_action(2, 1, FREE), Ok(Some(1)), "the attacker's deathblow took a life first");
+        assert_eq!(lives_byte_action(3, 1, FREE), Ok(Some(1)));
+        assert_eq!(lives_byte_action(2, 2, FREE), Ok(None), "equal: nothing");
+        assert_eq!(lives_byte_action(1, 2, FREE), Ok(None), "higher (stale): never raises");
+        assert_eq!(lives_byte_action(2, 0, FREE), Ok(None), "0 = unknown");
+        assert_eq!(lives_byte_action(0, 1, FREE), Ok(None), "single-life enemies read 0");
+        assert_eq!(lives_byte_action(-1, 1, FREE), Ok(None));
+        assert_eq!(lives_byte_action(300, 255, FREE), Ok(Some(255)));
+    }
+
+    #[test]
+    fn the_lives_byte_holds_while_a_throw_applies_here() {
+        // The defender's owner applies the received type 18 itself and takes the life there:
+        // the byte on the same deathblow's 21 would take a second one (miniboss dead after
+        // one deathblow, a boss skipping a phase; set_lives cannot undo it).
+        let held = with(|g| g.throw_hold = true);
+        assert_eq!(lives_byte_action(2, 1, held), Err(ByteSkip::Throw));
+        // Without the throw hold (the non-owner's NetAI copy, the owner's own deathblow): applied.
+        assert_eq!(lives_byte_action(2, 1, FREE), Ok(Some(1)));
+        // A guard only matters when the byte would lower ours: nothing to skip otherwise.
+        assert_eq!(lives_byte_action(1, 1, held), Ok(None));
+        assert_eq!(lives_byte_action(2, 0, held), Ok(None));
+    }
+
+    #[test]
+    fn the_lives_byte_obeys_livesyncs_stale_state_guards() {
+        assert_eq!(lives_byte_action(2, 1, with(|g| g.wiped = true)), Err(ByteSkip::Wipe));
+        assert_eq!(lives_byte_action(2, 1, with(|g| g.after_death = true)), Err(ByteSkip::DeathReload));
+        // After a rest: while the baseline is collected, and at / above the baseline.
+        assert_eq!(lives_byte_action(2, 1, with(|g| g.rest_window = true)), Err(ByteSkip::Rest));
+        assert_eq!(lives_byte_action(2, 1, with(|g| g.baseline = Some(1))), Err(ByteSkip::Rest));
+        // A deathblow below the baseline still counts.
+        assert_eq!(lives_byte_action(3, 1, with(|g| g.baseline = Some(2))), Ok(Some(1)));
+        // livesync busy: skipped (never blocks the game thread), the Lives message follows.
+        assert_eq!(lives_byte_action(2, 1, None), Err(ByteSkip::Busy));
+        assert_eq!(lives_byte_action(2, 2, None), Ok(None));
+        // Each reason has its own counter slot.
+        for (i, w) in ByteSkip::ALL.iter().enumerate() {
+            assert_eq!(*w as usize, i);
+        }
     }
 
     #[test]

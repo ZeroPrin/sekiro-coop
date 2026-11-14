@@ -1728,11 +1728,13 @@ fn serve(t: u32, buf: *mut u8, cap: u32) -> i32 {
         // The attacker's copy lost a life ours still has (a deathblow, multi-life enemy):
         // lowered and refilled now, so the hit applies on top of the right life (livesync.rs
         // `lives_byte_action`; the Lives message would come later, out of order with the hit).
+        // Skipped (logged, counted) under livesync's own guards: a throw on it that applies
+        // here, the rest baseline, our death reload, a recent wipe.
         if t == T_DAMAGE as u32
             && let Some(victim) = get_u16(&p, DAMAGE_VICTIM).filter(|&n| enemy_net_id(n))
         {
-            let applied = lives_byte != 0 && crate::livesync::apply_lives_byte(victim, lives_byte);
-            dbtrace::received_21(victim, applied);
+            let outcome = crate::livesync::apply_lives_byte(victim, lives_byte);
+            dbtrace::received_21(victim, outcome);
         }
         // SAFETY: the game passes a buffer of `cap` bytes (checked above).
         unsafe { std::ptr::copy_nonoverlapping(p.as_ptr(), buf, p.len()) };
@@ -2747,6 +2749,16 @@ pub fn enemy_chrs() -> Vec<Chr> {
     enemies()
 }
 
+/// `chr` is in WorldChrMan's chr sets right now, still an enemy, and still has netId `n`:
+/// a pointer cached from an earlier scan may be written / passed to game setters (game
+/// thread). One walk of the set pointers; meant for rare writes (the lives byte).
+pub fn enemy_now(chr: Chr, n: u16) -> bool {
+    let vt = module_base() + ENEMY_VTABLE_RVA;
+    all_chrs().iter().any(|c| c.0 == chr.0)
+        && read_ptr(chr.0).is_some_and(|v| v == vt || crate::rtti::class_name(chr.0).is_some_and(|name| name.contains("EnemyIns")))
+        && netai::net_id(chr) == Some(n)
+}
+
 /// The enemy with this netId is owned on this machine (`0xA4A650`). Game thread.
 pub fn owned_here(net_id: u16) -> bool {
     let Some(w) = wcm() else { return false };
@@ -3304,6 +3316,9 @@ pub(crate) mod dbtrace {
         tx21: u32,
         rx21: u32,
         bytes: u32,
+        /// Lives bytes that would have lowered our copy but were skipped, and the last reason.
+        skipped: u32,
+        skip_why: Option<crate::livesync::ByteSkip>,
         stealth_yes: bool,
     }
 
@@ -3331,12 +3346,11 @@ pub(crate) mod dbtrace {
         })
     }
 
-    /// note_throw (game threads): a throw on enemy `n`, ours (`by` None) or a peer's.
+    /// note_throw (game threads): a throw on enemy `n`, ours (`by` None) or a peer's (owned
+    /// here: the throw applies here; owned elsewhere: the owner's own deathblow, whose 21s
+    /// carry the lives byte that lowers our NetAI copy).
     pub fn start(n: u16, by: Option<u8>) {
         let owned = owned_here(n);
-        if by.is_some() && !owned {
-            return;
-        }
         let at = now();
         let lh = crate::livesync::lives_hp(n);
         let Ok(mut g) = OPEN.try_lock() else { return };
@@ -3355,6 +3369,8 @@ pub(crate) mod dbtrace {
             tx21: 0,
             rx21: 0,
             bytes: 0,
+            skipped: 0,
+            skip_why: None,
             stealth_yes: by.is_none() && !owned && stealth_yes_recent(n, at),
         });
     }
@@ -3368,13 +3384,33 @@ pub(crate) mod dbtrace {
         }
     }
 
-    /// serve: a received 21 on `n`, and whether its lives byte lowered our copy.
-    pub fn received_21(n: u16, applied: bool) {
+    /// serve: a received 21 on `n`, and what its lives byte did to our copy.
+    pub fn received_21(n: u16, outcome: crate::livesync::ByteOutcome) {
+        use crate::livesync::ByteOutcome;
         if let Ok(mut g) = OPEN.try_lock() {
             for e in g.iter_mut().filter(|e| e.n == n) {
                 e.rx21 += 1;
-                e.bytes += applied as u32;
+                match outcome {
+                    ByteOutcome::Applied => e.bytes += 1,
+                    ByteOutcome::Skipped(why) => {
+                        e.skipped += 1;
+                        e.skip_why = Some(why);
+                    }
+                    ByteOutcome::None => {}
+                }
             }
+        }
+    }
+
+    /// Pure: the lives-byte part of a TRACE line.
+    pub fn byte_text(applied: u32, skipped: u32, why: Option<crate::livesync::ByteSkip>) -> String {
+        match (applied, skipped, why) {
+            (0, 0, _) => "lives byte not used".into(),
+            (a, 0, _) => format!("lives byte applied {a}"),
+            (a, s, w) => format!(
+                "lives byte applied {a} / skipped {s} ({})",
+                w.map_or("?", crate::livesync::ByteSkip::text)
+            ),
         }
     }
 
@@ -3407,9 +3443,10 @@ pub(crate) mod dbtrace {
             }
             let friend = crate::livesync::friend_lives(e.n)
                 .map_or("none".to_string(), |(l, dead)| format!("{l}{}", if dead { " dead" } else { "" }));
+            let bytes = byte_text(e.bytes, e.skipped, e.skip_why);
             let line = match e.by {
                 None => format!(
-                    "deathblow: TRACE {:#x} e{} owned {}, lives {}->{} HP {}->{} here, 21 sent {} for it, the friend's lives (livesync) {friend}, outcome {}{}",
+                    "deathblow: TRACE {:#x} e{} owned {}, lives {}->{} HP {}->{} here, 21 sent {} / received {} ({bytes}), the friend's lives (livesync) {friend}, outcome {}{}",
                     e.n,
                     e.entity,
                     if e.owned { "here" } else { "elsewhere" },
@@ -3418,19 +3455,20 @@ pub(crate) mod dbtrace {
                     opt(e.hp),
                     opt(hp_b),
                     e.tx21,
+                    e.rx21,
                     out.text(),
                     if e.stealth_yes { "; the gate showed our stealth deathblow on it while owned elsewhere" } else { "" }
                 ),
                 Some(slot) => format!(
-                    "deathblow: TRACE peer {slot}'s throw on {:#x} e{} (owned here), lives {}->{} HP {}->{}, 21 received {} (lives byte applied {}), the friend's lives (livesync) {friend}, outcome {}",
+                    "deathblow: TRACE peer {slot}'s throw on {:#x} e{} (owned {}), lives {}->{} HP {}->{} here, 21 received {} ({bytes}), the friend's lives (livesync) {friend}, outcome {}",
                     e.n,
                     e.entity,
+                    if e.owned { "here" } else { "elsewhere" },
                     opt(e.lives),
                     opt(lives_b),
                     opt(e.hp),
                     opt(hp_b),
                     e.rx21,
-                    e.bytes,
                     out.text()
                 ),
             };
@@ -6681,6 +6719,18 @@ mod tests {
         assert_eq!(outcome((Some(0), Some(0)), Some(30)), Outcome::StoodUp, "a single-life enemy that survived");
         assert_eq!(outcome((Some(2), None), None), Outcome::Gone);
         assert_eq!(outcome((None, None), Some(10)), Outcome::StoodUp);
+    }
+
+    #[test]
+    fn deathblow_trace_states_the_lives_byte() {
+        use crate::livesync::ByteSkip;
+        use dbtrace::byte_text;
+        assert_eq!(byte_text(0, 0, None), "lives byte not used");
+        assert_eq!(byte_text(1, 0, None), "lives byte applied 1");
+        assert_eq!(
+            byte_text(0, 2, Some(ByteSkip::Throw)),
+            "lives byte applied 0 / skipped 2 (a deathblow on it applies here and takes the life itself)"
+        );
     }
 
     #[test]
