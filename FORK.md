@@ -2,9 +2,9 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test10`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test11`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test10`: nothing in the sections below marked experimental or
+> **Test build `1.0.9-pickups.3-test11`: nothing in the sections below marked experimental or
 > "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
 > onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
@@ -35,7 +35,51 @@ Version string: `1.0.9-pickups.3-test10`. Everybody in a session needs the same 
 > cleared on warps; the auditor ranks bosses before elites and labels elites; throwprobe logs posture
 > and the AI target with a `+0 s` line (budget 536 lines). Known leftover: a solo world whose Senpou lift
 > was killed by a test5 session stays dead (not repaired automatically; joining a host whose lift works
-> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. `test10` adds Reed as a separate skin (`reed.rs`, section "Wardrobe"; only with all eight Reed part files in the parts package), fixes the `aitarget:` logger (records keyed by address: no fake `TARGET me -> me` / HIT lines; separate event and replan budgets, a sharded sample table, section "Enemy target choice, observed"), mirrors the friend's prosthetic tool states onto its replica (`fx_speffect_mirror = 1`: tool flashes and sounds, `docs/RE-REMOTE-FX.md` "Протезы на реплике"; the 906 deflect-spark "gap" was none) and removes `fx_debug`; the wardrobe close-on-load was checked (works, never triggered in test9). Checklist: section "test10 co-op checklist". The oracle is a playtest with both logs.
+> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. `test10` adds Reed as a separate skin (`reed.rs`, section "Wardrobe"; only with all eight Reed part files in the parts package), fixes the `aitarget:` logger (records keyed by address: no fake `TARGET me -> me` / HIT lines; separate event and replan budgets, a sharded sample table, section "Enemy target choice, observed"), mirrors the friend's prosthetic tool states onto its replica (`fx_speffect_mirror = 1`: tool flashes and sounds, `docs/RE-REMOTE-FX.md` "Протезы на реплике"; the 906 deflect-spark "gap" was none) and removes `fx_debug`; the wardrobe close-on-load was checked (works, never triggered in test9). Checklist: section "test10 co-op checklist". `test11` replaces enemy AI ownership: the host alone decides which machine runs each enemy (an owner table sent on our control lane, PROTO 6), and `IsOwnedHere` answers only from that table on both machines; ownfill, the boss stripping, the pause hand-over, the prio-0xFFFF stealth claims and contests are gone, stealth claims are requests to the host, and the ini keys `ns_force_distribution` / `ns_throw_claims` are removed (`docs/PLAN-OWNERSHIP.md`; section "test11 co-op checklist"). The oracle is a playtest with both logs.
+
+## test11 co-op checklist (host-authored enemy ownership)
+
+Both players on `1.0.9-pickups.3-test11` (PROTO 6: an older build is refused at the hello).
+Design: `docs/PLAN-OWNERSHIP.md`; notes: `docs/IMPLEMENTATION-NOTES.md` section "test11". The
+host alone decides which machine runs each enemy's AI; `ns_force_distribution` and
+`ns_throw_claims` are gone (old ini lines are ignored). Mark each step with F11 on both sides.
+Every line below is `own:` unless written otherwise.
+
+1. **Engage.** Host: `own: host table active: N enemies seen, H owned here, C by clients; ...`,
+   then every 10 s `own (10 s): seq S; host H / peer1 C / waiting 0 / unowned-within-40m U; changes
+   ...; fulls F, ack resends R; doubles 0; disobeyed 0`. Client: `own: table active here: first full
+   Assign seq S, N entries, M ours; ...`, `nsession: first 23 and owner table, N ms after engage,
+   owned here K: members chr loop patched ...`, then `own (10 s): applied seq S (fulls F, deltas D,
+   stale ignored 0, gaps 0); mine M; ...; disobeyed 0; ...`. No `own: DISOBEY`, `own: DOUBLE` or
+   `own: WARN`.
+2. **Group fight, both near.** Few `own: 0x.. eE host -> peer1 (nearer) d host 21.0 / peer1 9.0 seq S`
+   lines, never two for the same netId less than 4 s apart. A move to the host is two lines (step 5).
+   Summaries: `doubles 0`, `disobeyed 0`.
+3. **Client walks 40 m ahead into a new group.** Host: `own: 0x.. eE none -> peer1 (in range) d ...`.
+   The enemies move and attack on both screens.
+4. **Client stealth deathblow.** Client: `stealth: claiming enemy E (netId 0x.., behind, ...): a
+   request to the host's owner table`, then `stealth: claim on enemy 0x.. granted after N ms` (N
+   under ~300) and the deathblow works; host: `own: 0x.. eE host -> peer1 (claim) d ... seq S`. With
+   the host standing next to the enemy: host `own: claim by peer1 on 0x.. refused (host within 20 m)`,
+   client `stealth: claim on enemy 0x.. not granted within 2 s (table owner host)`.
+5. **Boss or miniboss** (Guardian Ape, a 2000279-type miniboss). Host: `own: 0x.. eE [B] none -> host
+   (boss: host) d ...` once, nothing more while both are alive. Host dies in phase B: host `own: 0x..
+   eE [B] host -> peer1 (host absent) d host 4.1 (absent) / peer1 5.3 seq S`, client `own: table 0x..
+   eE [B] host -> peer1 (Assign seq S)` and `deathblow: boss E netId 0x.. taken while its AI moves
+   here from another machine: ...`. Host back (within 130 m, 4 s after the move): `own: 0x.. eE [B]
+   peer1 -> none (to host, waiting for peer1's ack) ...` then `own: 0x.. eE [B] none -> host (peer1
+   acked after N ms) ...`. No `own: DOUBLE` at any point.
+6. **Host opens a menu that pauses its world (1.5 s+).** Host: `nsession: our world update paused
+   (menu): absent for the owner table`, then `own: ... host -> peer1 (host absent)` for its enemies
+   within 40 m of the client (the rest stay). After `nsession: our world update runs again after a
+   pause` only `(nearer)` moves, after the hold. Client menu: host `own: peer1's world update paused
+   (menu): it is absent`.
+7. **Disconnect and reconnect, load, rest.** `own: table off (N rows here, seq S): the game's own
+   answers again` on both, then a fresh `own: host table active` / `own: table active here: first
+   full Assign` on the next engage.
+8. **Soak (2 h).** `doubles` and `disobeyed` totals 0 (or only DISOBEY lines with `+0x2040 1`,
+   enemies the game forces local), against 54 "claimed by both machines" in test9. `ordinary lines
+   suppressed` rare.
 
 ## test10 co-op checklist
 
@@ -103,6 +147,8 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `native_full_parts` | DEBUG | 1 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 | `rest_refills_partner` | GAMEPLAY | 1 (as before) | 0 = the friend's rest respawns enemies and wakes a dead you, but does not refill a living you (HP, gourd, items). NOT verified live |
 | `remote_every_frame` | DEBUG | 1 | The friend's character updates every frame at any distance (0 = only while spectating) |
+
+Removed in test11: `[NETWORK] ns_force_distribution` and `ns_throw_claims` (an old ini that still has them: ignored). `ns_throw_collide_drop` stays.
 
 Reliable bulk kinds added by the fork: 46 (pickups), 0xA7 (ObjAct), 0xA8 (loadout), 0xA9
 (PvP); `net::tests::bulk_kinds_are_unique` checks them against the upstream kinds. The doctor

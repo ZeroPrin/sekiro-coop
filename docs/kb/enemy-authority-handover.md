@@ -1,6 +1,12 @@
 # Enemy AI authority and hand-over: FromSoftware native vs. Sekiro Together
 
-Research note, 2026-11-14. Read-only research: nothing was built or run. Question: in FromSoftware's
+Research note, 2026-11-14. Read-only research: nothing was built or run.
+
+> **Implemented in test11** (`docs/PLAN-OWNERSHIP.md`, `crates/coop-dll/src/ownership.rs`, nsession.rs
+> `own`): suggestion (1) as a host-authored owner table on our control lane instead of writing the
+> native records, with (2) release-then-acquire, (3) per-entry seq + full resync, (5) the boss pin
+> and (6) a 4 s minimum hold. Layers B and C below are gone; layer A runs only as the client's
+> liveness gate. Section 2 describes the code before test11. Question: in FromSoftware's
 native multiplayer, which machine simulates an enemy's or boss's AI, and how does authority move
 between players? Does it follow the enemy's current target? What makes the hand-over look smooth?
 And how does our mod compare?
@@ -103,8 +109,8 @@ Our mod has **three layers**, all of which can say "owned here".
 **Layer A. The game's own distribution (22/23).**
 - Driven by the game's timers; we feed the friend's 22 into the host's tables (`0xA1D7E0`, `0xA1C6C0`).
 - On engage, `T+0x39C`/`T+0x3A4` are forced to 0.
-- `ns_force_distribution` (default **off**, `nsession.rs:1618`) would force an extra 22/23 at most
-  once per second (`:1625-1643`).
+- `ns_force_distribution` (default **on** since v7.9, `settings.rs:471`; the code default was off,
+  `nsession.rs:1618`) forced an extra 22/23 at most once per second (`:1625-1643`). Removed in test11.
 
 **Layer B. Local forced bits ("ownfill").**
 - `IsOwnedHere 0xA4A650` is detoured (`nsession.rs:3026-3031`) to return 1 for netIds in `FORCED`.
