@@ -12,11 +12,13 @@
 //! - `publish_step`: release-then-acquire; a hand-over away from a client goes through
 //!   NOBODY until that client acks, so a lost or late message never makes two brains;
 //! - `HostTable`: both of the above over every enemy the host sees;
+//! - `LinkOut`: what the host sends one client (delta, full, a full again when its ack is
+//!   behind);
 //! - `Mirror`: the receiver side (per-entry sequence numbers, full resync, contiguous ack);
 //! - `DoubleWatch`: the host's cross-machine two-brains detector;
 //! - `KindCache`: boss or ordinary per enemy (a boss answer kept, an ordinary one re-checked).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Owner "nobody": NetAI on every machine, no records anywhere (frozen until in range).
 pub const NOBODY: u8 = 0xFF;
@@ -514,6 +516,60 @@ impl HostTable {
     }
 }
 
+// --- What the host sends one client ------------------------------------------------------
+
+/// One Assign to a client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Send {
+    Full,
+    /// A delta on top of the Assign with this seq (the previous one on this link).
+    Delta { base: u32 },
+}
+
+/// Host, per engaged client: the last Assign seq sent to it (None = it needs a full), the
+/// recent sends, its last full.
+#[derive(Default, Clone, Debug)]
+pub struct LinkOut {
+    pub sent: Option<u32>,
+    /// (ms, seq) of recent sends; the front is the newest one at least `ACK_RESEND_MS` old.
+    history: VecDeque<(u64, u32)>,
+    pub full_at: u64,
+}
+
+impl LinkOut {
+    /// The client has not acked a seq we sent at least `ACK_RESEND_MS` ago: a delta was
+    /// lost (a gap stops its ack until a full), or its ack was. An ack that only trails the
+    /// newest send by a round trip (steady churn) is not behind.
+    pub fn behind(&mut self, acked: u32, now: u64) -> bool {
+        while self.history.len() >= 2 && now.saturating_sub(self.history[1].0) >= ACK_RESEND_MS {
+            self.history.pop_front();
+        }
+        self.history.front().is_some_and(|&(t, s)| now.saturating_sub(t) >= ACK_RESEND_MS && !reached(acked, s))
+    }
+
+    /// What to send this tick (None = nothing) and whether it is a resend: a full when the
+    /// link is new, every `FULL_EVERY_MS` (`full_all`), when the client is behind or an entry
+    /// waits for its release ack past `ACK_RESEND_MS` (`wait_overdue`; at most one such full
+    /// per `ACK_RESEND_MS`), or when the delta would not fit (`too_big`); else the delta if
+    /// there is one. `seq` = the table's seq now.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan(&mut self, acked: u32, seq: u32, has_delta: bool, full_all: bool, wait_overdue: bool, too_big: bool, now: u64) -> Option<(Send, bool)> {
+        let resend = (self.behind(acked, now) || wait_overdue) && now.saturating_sub(self.full_at) >= ACK_RESEND_MS;
+        let send = match self.sent {
+            None => Send::Full,
+            Some(_) if full_all || resend || too_big => Send::Full,
+            Some(base) if has_delta => Send::Delta { base },
+            Some(_) => return None,
+        };
+        self.sent = Some(seq);
+        self.history.push_back((now, seq));
+        if send == Send::Full {
+            self.full_at = now;
+        }
+        Some((send, resend))
+    }
+}
+
 // --- Mirror: the receiving side --------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -951,6 +1007,43 @@ mod tests {
         // Not running on the host: nothing.
         assert!(w.report(C, 60, &[0x802], &host, seq).is_empty());
         assert!(w.report(C, 60, &[0x802], &host, seq).is_empty());
+    }
+
+    #[test]
+    fn link_out_resends_a_full_only_when_an_old_send_is_unacked() {
+        let mut l = LinkOut::default();
+        // New link: a full.
+        assert_eq!(l.plan(0, 1, false, false, false, false, 0), Some((Send::Full, false)));
+        // Steady churn: a delta every 250 ms, each acked 300 ms later. The ack always trails
+        // the newest send, but never one sent >= 1 s ago: no resend for a minute.
+        let mut sends = vec![(0u64, 1u32)];
+        for i in 1..240u64 {
+            let now = i * 250;
+            let acked = sends.iter().rev().find(|s| s.0 + 300 <= now).map_or(0, |s| s.1);
+            let seq = i as u32 + 1;
+            let (send, resend) = l.plan(acked, seq, true, false, false, false, now).unwrap();
+            assert_eq!((send, resend), (Send::Delta { base: seq - 1 }, false), "at {now} ms");
+            sends.push((now, seq));
+        }
+        // The client stops acking at seq 240 (a lost delta: its ack stops at the gap): a full
+        // once the first unacked send is 1 s old, then at most once a second.
+        let mut fulls = Vec::new();
+        for i in 240..260u64 {
+            let now = i * 250;
+            if let Some((Send::Full, true)) = l.plan(240, i as u32 + 1, true, false, false, false, now) {
+                fulls.push(now);
+            }
+        }
+        assert_eq!(fulls, vec![61_000, 62_000, 63_000, 64_000]);
+        // Nothing to send and nothing behind: nothing.
+        let mut l = LinkOut::default();
+        l.plan(0, 5, false, false, false, false, 0);
+        assert_eq!(l.plan(5, 5, false, false, false, false, 5000), None);
+        // A release wait past 1 s: a full even with the ack caught up.
+        assert_eq!(l.plan(5, 6, true, false, true, false, 6000), Some((Send::Full, true)));
+        // Every FULL_EVERY_MS and when the delta is too big: a full, not a resend.
+        assert_eq!(l.plan(6, 7, true, true, false, false, 6100), Some((Send::Full, false)));
+        assert_eq!(l.plan(7, 8, true, false, false, true, 6200), Some((Send::Full, false)));
     }
 
     #[test]

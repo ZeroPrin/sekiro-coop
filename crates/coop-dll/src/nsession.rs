@@ -2901,15 +2901,6 @@ pub(crate) mod own {
         v.join(" / ")
     }
 
-    /// Host, per engaged client: the last Assign seq sent to it (None = it needs a full), since
-    /// when its ack has been behind that, its last full.
-    #[derive(Default, Clone, Copy)]
-    struct HostLink {
-        sent: Option<u32>,
-        behind_since: Option<u64>,
-        full_at: u64,
-    }
-
     /// Engine-side state (Engine `own`).
     #[derive(Default)]
     pub struct State {
@@ -2924,7 +2915,7 @@ pub(crate) mod own {
         acks: [u32; SLOTS],
         /// Each client's latest Status said "paused".
         paused: [bool; SLOTS],
-        links: [HostLink; SLOTS],
+        links: [om::LinkOut; SLOTS],
         full_at: u64,
         /// netId -> last WARN line about a release ack wait.
         warn_at: HashMap<u16, u64>,
@@ -2993,7 +2984,7 @@ pub(crate) mod own {
         /// next tick (it is no longer engaged: no ack wait for it).
         pub fn link_gone(&mut self, slot: u8) {
             let s = slot as usize % SLOTS;
-            self.links[s] = HostLink::default();
+            self.links[s] = om::LinkOut::default();
             self.acks[s] = 0;
             self.paused[s] = false;
             self.claims[s].clear();
@@ -3374,31 +3365,22 @@ pub(crate) mod own {
             let mut full: Option<Vec<(u16, u8, u32)>> = None;
             for &s in clients {
                 let i = s as usize % SLOTS;
-                let acked = self.acks[i];
-                let l = &mut self.links[i];
-                match l.sent {
-                    Some(x) if !om::reached(acked, x) => {
-                        l.behind_since.get_or_insert(ms);
-                    }
-                    _ => l.behind_since = None,
-                }
-                let resend = (l.behind_since.is_some_and(|t| ms.saturating_sub(t) >= om::ACK_RESEND_MS) || self.table.wait_overdue(s, ms))
-                    && ms.saturating_sub(l.full_at) >= om::ACK_RESEND_MS;
+                let overdue = self.table.wait_overdue(s, ms);
+                let Some((what, resend)) = self.links[i].plan(self.acks[i], seq, !delta.is_empty(), full_all, overdue, delta.len() > MAX_OWNED, ms)
+                else {
+                    continue;
+                };
                 let generation = GEN_OUT[i].load(Ordering::Relaxed);
-                if l.sent.is_none() || full_all || resend || delta.len() > MAX_OWNED {
-                    let entries = full.get_or_insert_with(|| self.table.full()).clone();
-                    queue_ctrl(s, &Msg::Assign { generation, full: true, seq, base: 0, entries });
-                    l.sent = Some(seq);
-                    l.full_at = ms;
-                    self.fulls += 1;
-                    if resend {
-                        self.resends += 1;
+                match what {
+                    om::Send::Full => {
+                        let entries = full.get_or_insert_with(|| self.table.full()).clone();
+                        queue_ctrl(s, &Msg::Assign { generation, full: true, seq, base: 0, entries });
+                        self.fulls += 1;
+                        self.resends += resend as u32;
                     }
-                } else if let Some(base) = l.sent
-                    && !delta.is_empty()
-                {
-                    queue_ctrl(s, &Msg::Assign { generation, full: false, seq, base, entries: delta.clone() });
-                    l.sent = Some(seq);
+                    om::Send::Delta { base } => {
+                        queue_ctrl(s, &Msg::Assign { generation, full: false, seq, base, entries: delta.clone() });
+                    }
                 }
             }
         }
