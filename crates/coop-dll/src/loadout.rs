@@ -281,6 +281,9 @@ pub fn apply(pgd: usize, wanted: &[i32; LOADOUT_SLOTS], who: &str) -> Result<usi
     }
     let gaitems = read_ptr(base + GAITEM_MAN_RVA).filter(|&g| g >= 0x10000).ok_or("gaitem manager null")?;
     let current = ids_of(pgd).ok_or("replica PGD ids unreadable")?;
+    // A friend's Reed rows (reed.rs) are drawn as the Wolf where this machine has no Reed.
+    let fallback = crate::reed::for_replica(wanted, who);
+    let wanted = fallback.as_ref().unwrap_or(wanted);
     let (put, skipped) = plan(&current, wanted, row_exists);
     for (slot, id, why) in &skipped {
         log::line(&format!("loadout: {who} slot {slot} id {id} skipped ({why:?})"));

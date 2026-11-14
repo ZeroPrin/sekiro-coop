@@ -807,8 +807,14 @@ fn unlock_diff(before: &[i32; UNLOCK_ACTIONS], after: &[i32; UNLOCK_ACTIONS]) ->
 /// holder 3, ParamResCap +0x70, FD4ParamResCap +0x70 = file with rows), read fault-safe.
 /// The frame task starts at boot, possibly while the params still load.
 fn goods_params_ready() -> bool {
+    solo_param_ready(GOODS_HOLDER)
+}
+
+/// The same check for SoloParamRepository holder `index` (the vendored crate's
+/// `solo_param_repository.rs` table: 1 = EquipParamProtector, 3 = EquipParamGoods).
+pub(crate) fn solo_param_ready(index: usize) -> bool {
     let Some(repo) = read_ptr(module_base() + SOLO_PARAM_REPO) else { return false };
-    let holder = repo + REPO_HOLDERS + GOODS_HOLDER * REPO_HOLDER_SIZE;
+    let holder = repo + REPO_HOLDERS + index * REPO_HOLDER_SIZE;
     read::<u32>(holder).is_some_and(|n| n > 0)
         && read_ptr(holder + 8)
             .and_then(|cap| read_ptr(cap + 0x70))

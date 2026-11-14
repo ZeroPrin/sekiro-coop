@@ -595,6 +595,25 @@ the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
   sword state worn: x01000 = Mortal Blade, x31000 = sword only, 141000 = no sword (Wolf only;
   the other skins use x31000); Sculptor 201000 has one torso. A bare arm (112000, before the
   prosthetic) or a missing arm (122000) is never touched.
+- **Reed (`reed.rs`, design `E:\RE\work_skin\game\SPEC.md` section 1; NOT verified live).** A
+  recoloured Wolf outfit as a sixth skin, offered only when all eight Reed part files are in
+  the parts package (`mod\parts\{bd_m_9045,bd_m_9005,am_m_9005,lg_m_9005}{,_l}.partsbnd.dcx`
+  next to the DLL). The new part ids exist in no game archive, so the DLL points four
+  never-owned EquipParamProtector rows at them, in memory only, from the frame task at the
+  title screen, on every machine: `equipModelId` 641000 9120 -> 9045 (torso with the Mortal
+  Blade), 201000 9100 -> 9005 (sword / no-sword torso), 602000 9120 -> 9005 (prosthetic arm),
+  603000 9120 -> 9005 (legs). Every row is checked first (vanilla or already Reed); any other
+  value writes nothing and hides Reed for the run. Head: the Wolf's (any head can be chosen as
+  for the other skins; "reed" is not a head). Row 641000 says Mortal Blade; 201000 tells no
+  sword state, so the one seen last is kept (and used by "As in game"). A friend's Reed rows on
+  a machine without Reed are drawn as the Wolf (101000 / 131000 / 102000 / 103000), logged
+  once. The added rows go into `wardrobe_added` like the Sculptor rows did; without the mod a
+  save shows the vanilla models of those rows (Ashina-ninja torso / arm / legs, the
+  Sculptor's torso), stats unchanged. Log: `reed: all 8 part files present ...`, `reed:
+  EquipParamProtector equipModelId patched in memory: 641000 9120->9045, ...; skin offered`,
+  or `reed: skin not offered: <why>`; `wardrobe: skin reed is not offered on this PC (...)`;
+  `reed: peer slot N wears Reed but Reed is not available on this PC ...`. Tests
+  `reed::tests`, `wardrobe::tests::reed_outfit`.
 - **How the game changes armour (static RE, `E:\RE\ghidra_wardrobe`) [VAR].** EMEVD 2003[83]
   `ForcePlayerArmorEquip` = case 0x53 of `0x904EF0`: on the local EGD (`PGD+0x278`) find the
   row in the inventory (`0x79D7E0`, no add), its entry's handle (`0xC3C9B0` / `0xC3CB00`),
