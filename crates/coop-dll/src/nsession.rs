@@ -151,20 +151,34 @@ const LANE_ACK: u32 = 0xFF;
 /// Bumped when the nsession wire format changes (2: own reliable lane, List with HP;
 /// 3: Owned, type 18 / 28 player netIds rewritten; 4: Lives, livesync.rs; 5: N players:
 /// player netIds `0xFFF0 | slot`, game frames with origin + send mode, Owned / Lives with
-/// origin, Engaged).
-const PROTO: u8 = 5;
+/// origin, Engaged; 6: host-authored enemy ownership, Status / Assign / Claims / Ack,
+/// docs/PLAN-OWNERSHIP.md).
+const PROTO: u8 = 6;
 
 const MSG_HELLO: u8 = 1;
 const MSG_LIST: u8 = 2;
 const MSG_READY: u8 = 3;
 const MSG_LEAVE: u8 = 4;
-const MSG_OWNED: u8 = 5;
+/// Client -> host (PROTO 6; was Owned).
+const MSG_STATUS: u8 = 5;
+/// Retiring with ownfill (the next commit).
+const MSG_OWNED: u8 = 12;
 const MSG_LIVES: u8 = 6;
 /// Host -> clients: the slots engaged with the host now.
 const MSG_ENGAGED: u8 = 7;
 /// Max HP of the enemies in our List (same generation), sent right after it on that link
 /// (v7.7 §34; v7.7 used 7, taken here by Engaged; PROTO 5 peers only, so no clash).
 const MSG_MAX_HP: u8 = 8;
+/// Host -> each engaged client: owner table entries (full or delta).
+const MSG_ASSIGN: u8 = 9;
+/// Client -> host: its current stealth claims.
+const MSG_CLAIMS: u8 = 10;
+/// Client -> host: the newest Assign seq applied without a gap.
+const MSG_ACK: u8 = 11;
+/// At most this many netIds in one Claims message.
+const MAX_CLAIMS: usize = 64;
+/// Status flag: the sender's world update is paused (menu).
+const STATUS_PAUSED: u8 = 1;
 
 /// Session slots (host 0, clients 1..=5); per-link state is indexed by slot.
 const SLOTS: usize = MAX_PLAYERS;
@@ -255,6 +269,19 @@ enum Msg {
     /// (not relayed): the engage HP check compares HP only where both machines have the
     /// same max (scaling settled, §34).
     MaxHp { generation: u32, max: Vec<(i32, i32)> },
+    /// Client -> host, every `ownership::STATUS_EVERY_MS` and at once when its pause state
+    /// flips: the newest Assign seq it applied, flags (`STATUS_PAUSED`), and the alive
+    /// enemies whose own AI (ComManipulator) runs on it (the host's DOUBLE detector).
+    Status { generation: u32, origin: u8, applied_seq: u32, flags: u8, running: Vec<u16> },
+    /// Host -> each engaged client: owner table entries `{netId, owner slot (0xFF =
+    /// nobody), entry seq}`. `full` = the whole table (an entry missing = nobody); a delta
+    /// names `base`, the seq of the previous Assign on this link (a gap = no ack until the
+    /// next full).
+    Assign { generation: u32, full: bool, seq: u32, base: u32, entries: Vec<(u16, u8, u32)> },
+    /// Client -> host, when they change: every netId it claims now (stealth approach).
+    Claims { generation: u32, origin: u8, ids: Vec<u16> },
+    /// Client -> host, after applying an Assign.
+    Ack { generation: u32, applied_seq: u32 },
 }
 
 fn encode(m: &Msg) -> Vec<u8> {
@@ -326,6 +353,47 @@ fn encode(m: &Msg) -> Vec<u8> {
                 v.extend_from_slice(&e.to_le_bytes());
                 v.extend_from_slice(&m.to_le_bytes());
             }
+        }
+        Msg::Status { generation, origin, applied_seq, flags, running } => {
+            v.push(MSG_STATUS);
+            v.extend_from_slice(&generation.to_le_bytes());
+            v.push(*origin);
+            v.extend_from_slice(&applied_seq.to_le_bytes());
+            v.push(*flags);
+            let running = &running[..running.len().min(MAX_OWNED)];
+            v.extend_from_slice(&(running.len() as u16).to_le_bytes());
+            for n in running {
+                v.extend_from_slice(&n.to_le_bytes());
+            }
+        }
+        Msg::Assign { generation, full, seq, base, entries } => {
+            v.push(MSG_ASSIGN);
+            v.extend_from_slice(&generation.to_le_bytes());
+            v.push(*full as u8);
+            v.extend_from_slice(&seq.to_le_bytes());
+            v.extend_from_slice(&base.to_le_bytes());
+            let entries = &entries[..entries.len().min(MAX_OWNED)];
+            v.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            for (n, owner, s) in entries {
+                v.extend_from_slice(&n.to_le_bytes());
+                v.push(*owner);
+                v.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        Msg::Claims { generation, origin, ids } => {
+            v.push(MSG_CLAIMS);
+            v.extend_from_slice(&generation.to_le_bytes());
+            v.push(*origin);
+            let ids = &ids[..ids.len().min(MAX_CLAIMS)];
+            v.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+            for n in ids {
+                v.extend_from_slice(&n.to_le_bytes());
+            }
+        }
+        Msg::Ack { generation, applied_seq } => {
+            v.push(MSG_ACK);
+            v.extend_from_slice(&generation.to_le_bytes());
+            v.extend_from_slice(&applied_seq.to_le_bytes());
         }
     }
     v
@@ -434,6 +502,58 @@ fn decode(b: &[u8]) -> Option<Msg> {
             }
             Msg::MaxHp { generation, max }
         }
+        MSG_STATUS => {
+            let generation = r.u32()?;
+            let origin = r.u8()?;
+            let applied_seq = r.u32()?;
+            let flags = r.u8()?;
+            let n = r.u16()? as usize;
+            if n > MAX_OWNED || origin as usize >= SLOTS {
+                return None;
+            }
+            let mut running = Vec::with_capacity(n);
+            for _ in 0..n {
+                running.push(r.u16()?);
+            }
+            Msg::Status { generation, origin, applied_seq, flags, running }
+        }
+        MSG_ASSIGN => {
+            let generation = r.u32()?;
+            let full = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let seq = r.u32()?;
+            let base = r.u32()?;
+            let n = r.u16()? as usize;
+            if n > MAX_OWNED {
+                return None;
+            }
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (net, owner, s) = (r.u16()?, r.u8()?, r.u32()?);
+                if owner as usize >= SLOTS && owner != crate::ownership::NOBODY {
+                    return None;
+                }
+                entries.push((net, owner, s));
+            }
+            Msg::Assign { generation, full, seq, base, entries }
+        }
+        MSG_CLAIMS => {
+            let generation = r.u32()?;
+            let origin = r.u8()?;
+            let n = r.u16()? as usize;
+            if n > MAX_CLAIMS || origin as usize >= SLOTS {
+                return None;
+            }
+            let mut ids = Vec::with_capacity(n);
+            for _ in 0..n {
+                ids.push(r.u16()?);
+            }
+            Msg::Claims { generation, origin, ids }
+        }
+        MSG_ACK => Msg::Ack { generation: r.u32()?, applied_seq: r.u32()? },
         _ => return None,
     };
     (r.at == b.len()).then_some(m)
@@ -2693,19 +2813,54 @@ struct Origin {
     owned: Option<(u8, u32, Instant, Vec<u16>)>,
     /// Lives messages not taken yet (link, generation, entries); livesync.rs.
     lives: Vec<(u8, u32, Vec<LifeEntry>)>,
+    /// Host: this client's Status messages not taken yet (the engine drains them).
+    status: VecDeque<StatusIn>,
+    /// Host: this client's latest Claims (link, generation, netIds).
+    claims: Option<(u8, u32, Vec<u16>)>,
+    /// Host: this client's latest Ack (link, generation, applied seq).
+    ack: Option<(u8, u32, u32)>,
 }
+
+/// A received Status (host side).
+#[allow(dead_code)] // taken by the engine from the next commit
+#[derive(Clone, Debug)]
+struct StatusIn {
+    link: u8,
+    generation: u32,
+    applied: u32,
+    flags: u8,
+    running: Vec<u16>,
+}
+
+/// A received Assign (client side).
+#[allow(dead_code)] // taken by the engine from the next commit
+#[derive(Clone, Debug)]
+struct AssignIn {
+    generation: u32,
+    full: bool,
+    seq: u32,
+    base: u32,
+    entries: Vec<(u16, u8, u32)>,
+}
+
+/// Messages kept per origin / for the engine, bounded.
+const MAX_QUEUED_STATUS: usize = 4;
+const MAX_QUEUED_ASSIGNS: usize = 64;
 
 struct Book {
     peers: [Option<Peer>; SLOTS],
     origins: [Origin; SLOTS],
     /// Client: the host's latest Engaged message (its generation for us, client slots).
     engaged: Option<(u32, Vec<u8>)>,
+    /// Client: the host's Assign messages not applied yet, in order.
+    assigns: VecDeque<AssignIn>,
 }
 
 static BOOK: Mutex<Book> = Mutex::new(Book {
     peers: [const { None }; SLOTS],
-    origins: [const { Origin { owned: None, lives: Vec::new() } }; SLOTS],
+    origins: [const { Origin { owned: None, lives: Vec::new(), status: VecDeque::new(), claims: None, ack: None } }; SLOTS],
     engaged: None,
+    assigns: VecDeque::new(),
 });
 /// Our reliable lane per link (module `lane`); a new one (new id) after every link drop.
 static LANES: Mutex<[Option<lane::Lane>; SLOTS]> = Mutex::new([const { None }; SLOTS]);
@@ -2851,6 +3006,41 @@ fn on_control(from: u8, data: &[u8], epoch: u64) {
                 if let Some(p) = g.peers[s].as_mut() {
                     p.max_hp = Some((generation, max));
                 }
+            }
+            // Ownership (PROTO 6): never relayed; a client's own messages to the host, the
+            // host's to a client. Kept here, taken under `accepts` by the engine.
+            Msg::Status { generation, origin, applied_seq, flags, running } => {
+                if !host || origin != from {
+                    return;
+                }
+                let q = &mut g.origins[s].status;
+                if q.len() >= MAX_QUEUED_STATUS {
+                    q.pop_front();
+                }
+                q.push_back(StatusIn { link: from, generation, applied: applied_seq, flags, running });
+            }
+            Msg::Claims { generation, origin, ids } => {
+                if !host || origin != from {
+                    return;
+                }
+                g.origins[s].claims = Some((from, generation, ids));
+            }
+            Msg::Ack { generation, applied_seq } => {
+                if !host {
+                    return;
+                }
+                g.origins[s].ack = Some((from, generation, applied_seq));
+            }
+            Msg::Assign { generation, full, seq, base, entries } => {
+                if host || from != 0 {
+                    return;
+                }
+                if g.assigns.len() >= MAX_QUEUED_ASSIGNS {
+                    // The engine stopped taking them (not engaged): only the newest matter,
+                    // and a full comes again anyway.
+                    g.assigns.pop_front();
+                }
+                g.assigns.push_back(AssignIn { generation, full, seq, base, entries });
             }
         }
     }
@@ -6566,6 +6756,14 @@ mod tests {
             Msg::Engaged { generation: 10, slots: vec![] },
             Msg::MaxHp { generation: 9, max: vec![(1_120_353, 349), (1_100_301, 9999)] },
             Msg::MaxHp { generation: 9, max: vec![] },
+            Msg::Status { generation: 11, origin: 1, applied_seq: 812, flags: STATUS_PAUSED, running: vec![0x0801, 0x5822] },
+            Msg::Status { generation: 11, origin: 2, applied_seq: 0, flags: 0, running: vec![] },
+            Msg::Assign { generation: 12, full: true, seq: 814, base: 0, entries: vec![(0x48ac, 0, 814), (0x5822, 1, 812)] },
+            Msg::Assign { generation: 12, full: false, seq: 815, base: 814, entries: vec![(0x48ac, crate::ownership::NOBODY, 815)] },
+            Msg::Assign { generation: 12, full: true, seq: u32::MAX, base: 7, entries: vec![] },
+            Msg::Claims { generation: 13, origin: 1, ids: vec![0x0801, 0x0802] },
+            Msg::Claims { generation: 13, origin: 1, ids: vec![] },
+            Msg::Ack { generation: 14, applied_seq: 815 },
         ];
         for m in all {
             let b = encode(&m);
@@ -6581,6 +6779,19 @@ mod tests {
         // An origin or a slot past the six players is malformed.
         assert_eq!(decode(&encode(&Msg::Owned { generation: 1, origin: 6, ids: vec![] })), None);
         assert_eq!(decode(&encode(&Msg::Engaged { generation: 1, slots: vec![6] })), None);
+        assert_eq!(decode(&encode(&Msg::Status { generation: 1, origin: 6, applied_seq: 0, flags: 0, running: vec![] })), None);
+        assert_eq!(decode(&encode(&Msg::Claims { generation: 1, origin: 6, ids: vec![] })), None);
+        // An owner past the six players (but not "nobody") is malformed.
+        assert_eq!(decode(&encode(&Msg::Assign { generation: 1, full: false, seq: 1, base: 0, entries: vec![(1, 6, 1)] })), None);
+        // A "full" byte other than 0 / 1 is malformed.
+        let mut b = encode(&Msg::Assign { generation: 1, full: true, seq: 1, base: 0, entries: vec![] });
+        b[5] = 2;
+        assert_eq!(decode(&b), None);
+        // Caps: the encoder never writes more than the decoder takes.
+        let many = Msg::Claims { generation: 1, origin: 1, ids: (0..100).collect() };
+        assert!(matches!(decode(&encode(&many)), Some(Msg::Claims { ids, .. }) if ids.len() == MAX_CLAIMS));
+        let big = Msg::Assign { generation: 1, full: true, seq: 1, base: 0, entries: (0..3000).map(|n| (n, 0, 1)).collect() };
+        assert!(matches!(decode(&encode(&big)), Some(Msg::Assign { entries, .. }) if entries.len() == MAX_OWNED));
     }
 
     #[test]
