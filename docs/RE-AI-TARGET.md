@@ -100,6 +100,12 @@ Target record (node+0x20; ctor `0x61C9F0`, clear `0x61DD20`, per-frame update `0
 | +0x21 | u8 | is current top (written by `0x629720` every frame) |
 | +0x28 | accessor | `SprjChrInsHandleTargetAccessor` (vt 0x2962030): vt+0xA0 handle, vt+0x70 pos, vt+0x18 valid (`0x613840`: entity not dead-state), vt+0xB8 targetPriority (`0x612D70`) |
 
+One enemy can hold **two NormalEnemy records for the same player** at once: the current one and a
+stale one that is unseen and counting its forget timer (read from the test7 `aitarget:` logs
+2026-11-14 [ARV]: not checked in memory). So "one record per hostile" is not a rule; anything that tracks records must key them by
+record (node) address, not by target. `aitarget.rs` does so since 2026-11-14 (FORK.md "Enemy target
+choice, observed").
+
 ### 1.3 Peripheral awareness list (the 100-point meter) [VAR]
 
 `TS+0x40..0x48`, 40 B entries `{f32 points, u8 notPerceived, accessor +8, ...}`.

@@ -1001,6 +1001,17 @@ Log lines (only enemies that know both players, or events that involve the frien
 - All `aitarget:` lines share a budget of 10 a second; the rest is counted in one
   `aitarget: N line(s) suppressed` line at most every 10 s (the same for dropped events).
 
+Records are keyed by their address within each enemy, not by player: an enemy can hold two
+records for the same player (the current one and a stale "unseen / forget" one), and keyed per
+player they overwrote each other every frame (fake `TARGET me -> me` / `peer0 -> peer0`, HIT
+lines and inflated summary counts; fixed 2026-11-14). The current target is the player of the
+record with the top flag; a TARGET line comes only when that player changes (a hand-over between
+two records of one player is silent), a HIT only when the timer rises on the same record (a new
+duplicate record with a fresh timer is no hit). The addresses are keys only, never read after
+the hook call; an entry not sampled for 5 s, or sampled for another player (reused memory),
+starts over. A target regained more than 0.5 s after it was lost to a non-player shows as
+`TARGET other/none -> X (...; no player target before)`.
+
 Players are keyed by peer id (`me`, `peerN` = session slot N); the friend's distance is measured
 to the native replica's own position, as the AI does. The hook is installed in two phases (the
 trampoline is published before the jump is written); switching 0 -> 1 in the world installs it

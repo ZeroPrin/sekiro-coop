@@ -51,6 +51,15 @@
 //! Not seen by the hook: records with a score > 100 (frozen; reasons 3 / 5), and records
 //! whose target is not a player (NPC allies / enemies).
 //!
+//! One enemy can hold two records for the same player (the current one and a stale "unseen /
+//! forget" one, seen live 2026-11-14): the table keeps its state per record POINTER within
+//! each enemy (`Rec`), never per player, so the two never overwrite each other. The current
+//! target is the player of the record that carries the top flag; a TARGET line is logged only
+//! when that player changes (a hand-over between two records of the same player is silent),
+//! and a HIT only when the hit timer rises on the same record. Record pointers are only keys:
+//! never dereferenced outside the hook call that passed them; an entry not sampled for
+//! `STALE_MS`, or sampled again for another player, starts over (freed and reused memory).
+//!
 //! `FRAME` is counted by the frame task, not by the AI update. If the game runs AI updates on
 //! worker threads that overlap our frame task, one AI frame can straddle two `FRAME` values;
 //! the replan counts are then off by a frame now and then (diagnostics only, review note).
@@ -234,6 +243,24 @@ fn is_friend(slot: usize) -> bool {
     (1..SLOTS).contains(&slot)
 }
 
+/// One target record of an enemy, keyed by its address (only a key: never dereferenced
+/// outside the hook call that passed it).
+#[derive(Clone, Copy, Debug)]
+pub struct Rec {
+    /// The record's address (0 = free entry).
+    pub rec: usize,
+    pub slot: u8,
+    /// Its latest sample (`ms` 0 = not sampled since the entry was (re)taken).
+    pub s: Sample,
+}
+
+impl Rec {
+    pub const FREE: Rec = Rec { rec: 0, slot: NO_SLOT, s: Sample::NONE };
+}
+
+/// Records kept per enemy: two per player and spare.
+pub const RECS: usize = 2 * SLOTS + 2;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Enemy {
     /// The AI's ChrIns (0 = free entry).
@@ -241,9 +268,13 @@ pub struct Enemy {
     pub last_ms: u64,
     /// Player slot of the current top record, `NO_SLOT` = a non-player or nothing.
     pub top: u8,
+    /// That record's address (0 = none).
+    pub top_rec: usize,
     pub top_since_ms: u64,
-    /// The player that lost the top flag last (slot, its sample, since when it held it).
+    /// The player that lost the top flag last (slot, its sample, since when it held it) and
+    /// when it lost it.
     pub lost: (u8, Sample, u64),
+    pub lost_ms: u64,
     /// Last frame with the replanning byte set, and the frames counted in this window.
     pub replan_frame: u64,
     pub replans: u32,
@@ -253,8 +284,10 @@ pub struct Enemy {
     pub hits: [u32; SLOTS],
     /// A friend's record was sampled in this window.
     pub friend_window: bool,
-    pub cands: [Sample; SLOTS],
-    /// The candidates as sampled on the latest replan frame (the raw choice, no +50).
+    /// The player's last sample time in any record (for `Appear`), by slot.
+    pub seen_ms: [u64; SLOTS],
+    pub recs: [Rec; RECS],
+    /// Per player, its best-scored record on the latest replan frame (the raw choice, no +50).
     pub on_replan: [Sample; SLOTS],
     pub line_ms: u64,
     pub logged_replan: u64,
@@ -266,24 +299,56 @@ impl Enemy {
         ai: 0,
         last_ms: 0,
         top: NO_SLOT,
+        top_rec: 0,
         top_since_ms: 0,
         lost: (NO_SLOT, Sample::NONE, 0),
+        lost_ms: 0,
         replan_frame: 0,
         replans: 0,
         replans_multi: 0,
         switches: 0,
         hits: [0; SLOTS],
         friend_window: false,
-        cands: [Sample::NONE; SLOTS],
+        seen_ms: [0; SLOTS],
+        recs: [Rec::FREE; RECS],
         on_replan: [Sample::NONE; SLOTS],
         line_ms: 0,
         logged_replan: 0,
         window_ms: 0,
     };
 
-    /// Player slots whose record was sampled within `PRESENT_MS` of `now`.
+    /// Player slots with a record sampled within `PRESENT_MS` of `now`.
     pub fn present(&self, now: u64) -> Vec<usize> {
-        (0..SLOTS).filter(|&k| self.cands[k].ms != 0 && now.saturating_sub(self.cands[k].ms) <= PRESENT_MS).collect()
+        (0..SLOTS).filter(|&k| self.seen_ms[k] != 0 && now.saturating_sub(self.seen_ms[k]) <= PRESENT_MS).collect()
+    }
+
+    /// The latest sample of record `rec` (NONE when not in the table).
+    pub fn rec_sample(&self, rec: usize) -> Sample {
+        self.recs.iter().find(|r| r.rec == rec && rec != 0).map_or(Sample::NONE, |r| r.s)
+    }
+
+    /// The entry of record `rec` sampled for player `slot`: its own (started over when it was
+    /// stale or belonged to another player: freed and reused memory), else a free or stale
+    /// one, else the least recently sampled.
+    fn rec_entry(&mut self, rec: usize, slot: u8, now: u64) -> usize {
+        let stale = |r: &Rec| r.rec == 0 || r.s.ms == 0 || now.saturating_sub(r.s.ms) > STALE_MS;
+        let i = match self.recs.iter().position(|r| r.rec == rec) {
+            Some(i) if self.recs[i].slot == slot && !stale(&self.recs[i]) => return i,
+            Some(i) => i,
+            None => self
+                .recs
+                .iter()
+                .position(stale)
+                .unwrap_or_else(|| (0..RECS).min_by_key(|&j| self.recs[j].s.ms).unwrap_or(0)),
+        };
+        // The top record's address now holds a record about another player (freed and
+        // reused): the top is no longer known.
+        if self.top_rec == rec && self.top != slot {
+            self.top_rec = 0;
+            self.top = NO_SLOT;
+        }
+        self.recs[i] = Rec { rec, slot, s: Sample::NONE };
+        i
     }
 
     /// Slots scored on the latest replan frame.
@@ -389,12 +454,14 @@ impl Table {
         self.n_events > 0 || self.dropped > 0 || self.enemies.iter().any(|e| e.ai != 0 && now.saturating_sub(e.last_ms) <= PRESENT_MS)
     }
 
-    /// One sample from the hook.
-    pub fn record(&mut self, ai: usize, slot: usize, s: Sample) {
-        if slot >= SLOTS {
+    /// One sample from the hook: record `rec` (its address, a key only) of enemy `ai` about
+    /// player `slot`.
+    pub fn record(&mut self, ai: usize, rec: usize, slot: usize, s: Sample) {
+        if slot >= SLOTS || rec == 0 {
             return;
         }
         let now = s.ms;
+        let k = slot as u8;
         let i = self.entry(ai, now);
         let mut events: [Option<Event>; 3] = [None; 3];
         {
@@ -403,43 +470,73 @@ impl Table {
             if is_friend(slot) {
                 e.friend_window = true;
             }
-            let prev = e.cands[slot];
-            let fresh = prev.ms == 0 || now.saturating_sub(prev.ms) > STALE_MS;
-            if fresh {
-                events[0] = Some(Event::Appear { ai, slot: slot as u8, cur: s });
+            // The player appears (any record), or comes back after `STALE_MS`.
+            if e.seen_ms[slot] == 0 || now.saturating_sub(e.seen_ms[slot]) > STALE_MS {
+                events[0] = Some(Event::Appear { ai, slot: k, cur: s });
             }
-            if hit_rose((!fresh).then_some(prev.hit_timer), s.hit_timer) {
+            let r = e.rec_entry(rec, k, now);
+            let prev = e.recs[r].s;
+            // A hit: the timer rose on THIS record. A new record counts with a fresh timer
+            // only when no other record of the player is around (a stale duplicate carries
+            // the old timer, no hit).
+            let rose = if prev.ms != 0 {
+                hit_rose(Some(prev.hit_timer), s.hit_timer)
+            } else {
+                let twin = e.recs.iter().enumerate().any(|(j, x)| {
+                    j != r && x.rec != 0 && x.slot == k && x.s.ms != 0 && now.saturating_sub(x.s.ms) <= PRESENT_MS
+                });
+                !twin && hit_rose(None, s.hit_timer)
+            };
+            if rose {
                 e.hits[slot] += 1;
-                events[1] = Some(Event::Hit { ai, slot: slot as u8, cur: s, top: e.top });
+                events[1] = Some(Event::Hit { ai, slot: k, cur: s, top: e.top });
             }
+            e.seen_ms[slot] = now;
+            e.recs[r].s = s;
             if s.replanning() {
                 if e.replan_frame != s.frame {
                     e.replan_frame = s.frame;
                     e.replans += 1;
                 }
-                e.on_replan[slot] = s;
-                // The second player record scored on the same replan frame.
-                if e.on_replan.iter().filter(|c| c.ms != 0 && c.frame == s.frame).count() == 2 {
+                let had = e.on_replan[slot].ms != 0 && e.on_replan[slot].frame == s.frame;
+                if !had || s.score > e.on_replan[slot].score {
+                    e.on_replan[slot] = s;
+                }
+                // The second PLAYER scored on the same replan frame (not a second record).
+                if !had && e.on_replan.iter().filter(|c| c.ms != 0 && c.frame == s.frame).count() == 2 {
                     e.replans_multi += 1;
                 }
             }
-            e.cands[slot] = s;
-            // Top (`+0x21`, set by 0x629720): one event when a player record gains it, `from` =
-            // the player that had it (also when its loss was seen first, earlier this frame).
-            let was = e.top;
-            if s.is_top && was != slot as u8 {
-                let (from, s_from, since) = if (was as usize) < SLOTS { (was, e.cands[was as usize], e.top_since_ms) } else { e.lost };
-                events[2] = Some(Event::Top { ai, from, to: slot as u8, replan: s.replan, held_ms: now.saturating_sub(since), s_from, s_to: s });
-                e.top = slot as u8;
-                e.top_since_ms = now;
-                e.lost = (NO_SLOT, Sample::NONE, now);
-                e.switches += 1;
-            } else if !s.is_top && was == slot as u8 {
-                // Lost to the other player (its record comes later this frame) or to a
+            // Top (`+0x21`, set by 0x629720): the current target is the player of the record
+            // that carries the flag. One event when that player changes; a hand-over between
+            // two records of the same player is silent.
+            if s.is_top && e.top_rec != rec {
+                let lost_recent = e.lost.0 != NO_SLOT && now.saturating_sub(e.lost_ms) <= PRESENT_MS;
+                let (from, s_from, since) = if e.top != NO_SLOT {
+                    (e.top, e.rec_sample(e.top_rec), e.top_since_ms)
+                } else if lost_recent {
+                    e.lost
+                } else {
+                    (NO_SLOT, Sample::NONE, now)
+                };
+                if from == k {
+                    e.top_since_ms = since;
+                } else {
+                    events[2] = Some(Event::Top { ai, from, to: k, replan: s.replan, held_ms: now.saturating_sub(since), s_from, s_to: s });
+                    e.top_since_ms = now;
+                    e.switches += 1;
+                }
+                e.top = k;
+                e.top_rec = rec;
+                e.lost = (NO_SLOT, Sample::NONE, 0);
+                e.lost_ms = 0;
+            } else if !s.is_top && e.top_rec == rec {
+                // Lost to another record (its sample comes later this frame) or to a
                 // non-player / nothing (no event).
-                e.lost = (was, s, e.top_since_ms);
+                e.lost = (e.top, s, e.top_since_ms);
+                e.lost_ms = now;
                 e.top = NO_SLOT;
-                e.top_since_ms = now;
+                e.top_rec = 0;
             }
         }
         for ev in events.into_iter().flatten() {
@@ -610,8 +707,8 @@ fn observe(rec: usize, ctx: usize, score: f32) {
         };
         // Never wait in the AI update: a busy table drops this sample.
         match TABLE.try_lock() {
-            Ok(mut t) => t.record(ai, slot, s),
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().record(ai, slot, s),
+            Ok(mut t) => t.record(ai, rec, slot, s),
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().record(ai, rec, slot, s),
             Err(std::sync::TryLockError::WouldBlock) => {
                 BUSY.fetch_add(1, Relaxed);
             }
@@ -892,7 +989,7 @@ impl AiTarget {
                 if !first {
                     parts.push(describe(&format!("old {}", self.who(from as usize)), &s_from));
                 }
-                let held = if first { "first player target".to_string() } else { format!("old held {:.1}s", held_ms as f32 / 1000.0) };
+                let held = if first { "no player target before".to_string() } else { format!("old held {:.1}s", held_ms as f32 / 1000.0) };
                 format!(
                     "aitarget: {} TARGET {} -> {} ({}; {held}): {}",
                     enemy_name(ai),
@@ -929,6 +1026,11 @@ mod tests {
 
     fn rp(ms: u64, frame: u64, score: f32) -> Sample {
         Sample { replan: Some(true), ..s(ms, frame, score) }
+    }
+
+    /// The (one) record address of player `slot` in the older tests.
+    fn rec(slot: usize) -> usize {
+        0x1000 + 0x100 * slot
     }
 
     #[test]
@@ -979,8 +1081,8 @@ mod tests {
         let mut t = Table::new();
         let a = 0x5000;
         // Enemy sees us (top), then the friend (slot 1) appears with a hit.
-        t.record(a, 0, Sample { is_top: true, ..s(100, 1, 51.0) });
-        t.record(a, 1, Sample { hit_timer: 10.0, ..s(100, 1, 1.9) });
+        t.record(a, rec(0), 0, Sample { is_top: true, ..s(100, 1, 51.0) });
+        t.record(a, rec(1), 1, Sample { hit_timer: 10.0, ..s(100, 1, 1.9) });
         let (ev, n, d) = t.take_events();
         assert_eq!((n, d), (4, 0));
         assert!(matches!(ev[0], Some(Event::Appear { slot: 0, .. })));
@@ -988,14 +1090,14 @@ mod tests {
         assert!(matches!(ev[2], Some(Event::Appear { slot: 1, .. })));
         assert!(matches!(ev[3], Some(Event::Hit { slot: 1, top: 0, .. })));
         // Replan frame: the friend wins, we lose the top flag.
-        t.record(a, 0, rp(200, 2, 1.0));
-        t.record(a, 1, Sample { is_top: true, hit_timer: 9.0, ..rp(200, 2, 2.0) });
+        t.record(a, rec(0), 0, rp(200, 2, 1.0));
+        t.record(a, rec(1), 1, Sample { is_top: true, hit_timer: 9.0, ..rp(200, 2, 2.0) });
         let (ev, n, _) = t.take_events();
         assert_eq!(n, 1, "one switch, one event, whichever record is scored first");
         assert!(matches!(ev[0], Some(Event::Top { from: 0, to: 1, replan: Some(true), held_ms: 100, .. })));
         // The other order: the new top is scored before the old one loses its flag.
-        t.record(a, 0, Sample { is_top: true, ..s(300, 3, 2.0) });
-        t.record(a, 1, s(300, 3, 2.0));
+        t.record(a, rec(0), 0, Sample { is_top: true, ..s(300, 3, 2.0) });
+        t.record(a, rec(1), 1, s(300, 3, 2.0));
         let (ev, n, _) = t.take_events();
         assert_eq!(n, 1);
         assert!(matches!(ev[0], Some(Event::Top { from: 1, to: 0, replan: Some(false), .. })));
@@ -1009,37 +1111,169 @@ mod tests {
     #[test]
     fn unknown_replan_state_is_not_counted() {
         let mut t = Table::new();
-        t.record(9, 0, Sample { replan: None, ..s(10, 1, 1.0) });
-        t.record(9, 1, Sample { replan: None, ..s(10, 1, 1.0) });
+        t.record(9, rec(0), 0, Sample { replan: None, ..s(10, 1, 1.0) });
+        t.record(9, rec(1), 1, Sample { replan: None, ..s(10, 1, 1.0) });
         let e = t.enemies[t.entry(9, 10)];
         assert_eq!((e.replans, e.replans_multi), (0, 0));
-        assert!(describe("me", &e.cands[0]).contains("replan state unknown"));
+        assert!(describe("me", &e.rec_sample(rec(0))).contains("replan state unknown"));
     }
 
     #[test]
     fn replan_counted_once_per_frame() {
         let mut t = Table::new();
         for f in 1..=3 {
-            t.record(7, 0, rp(f * 10, f, 1.0));
-            t.record(7, 1, rp(f * 10, f, 1.0));
+            t.record(7, rec(0), 0, rp(f * 10, f, 1.0));
+            t.record(7, rec(1), 1, rp(f * 10, f, 1.0));
         }
-        t.record(7, 0, s(40, 4, 1.0));
+        t.record(7, rec(0), 0, s(40, 4, 1.0));
         let e = t.enemies[t.entry(7, 40)];
         assert_eq!(e.replans, 3);
         assert_eq!(e.replans_multi, 3);
+    }
+
+    /// The bug of 2026-11-14: an enemy holds a current and a stale ("unseen / forget") record
+    /// for the same player; per player they overwrote each other every frame and logged
+    /// `TARGET me -> me` and HIT lines. Per record: nothing but the first target.
+    #[test]
+    fn two_records_of_one_player_do_not_flap() {
+        for (slot, label) in [(0usize, "me"), (1, "peer0")] {
+            for cur_first in [true, false] {
+                let mut t = Table::new();
+                let (a, cur, old) = (0x900, 0x1_0000 + slot, 0x2_0000 + slot);
+                for f in 1..=120u64 {
+                    let ms = f * 16;
+                    // Current: top, its hit timer decaying from 8 s. Stale: unseen, forgetting,
+                    // an older (lower) timer, also decaying.
+                    let c = Sample { is_top: true, hit_timer: 8.0 - f as f32 * 0.016, perceived: true, ..s(ms, f, 51.0) };
+                    let o = Sample { hit_timer: 3.0 - f as f32 * 0.016, forget: 10.0, ..s(ms, f, 0.5) };
+                    if cur_first {
+                        t.record(a, cur, slot, c);
+                        t.record(a, old, slot, o);
+                    } else {
+                        t.record(a, old, slot, o);
+                        t.record(a, cur, slot, c);
+                    }
+                }
+                let (ev, n, _) = t.take_events();
+                let ev: Vec<Event> = ev.into_iter().take(n).flatten().collect();
+                let tops = ev.iter().filter(|e| matches!(e, Event::Top { .. })).count();
+                let hits = ev.iter().filter(|e| matches!(e, Event::Hit { .. })).count();
+                assert_eq!((tops, hits), (1, 0), "{label} current first {cur_first}: {ev:?}");
+                assert!(matches!(ev.iter().find(|e| matches!(e, Event::Top { .. })), Some(Event::Top { from: NO_SLOT, .. })));
+                let e = t.enemies[t.entry(a, 120 * 16)];
+                assert_eq!((e.switches, e.hits[slot], e.top, e.top_rec), (1, 0, slot as u8, cur));
+            }
+        }
+    }
+
+    #[test]
+    fn top_moves_between_records_and_players() {
+        let mut t = Table::new();
+        let a = 0x901;
+        let (me1, me2, friend) = (0xA0, 0xA8, 0xB0);
+        t.record(a, me1, 0, Sample { is_top: true, ..s(100, 1, 51.0) });
+        t.take_events();
+        // The top moves to another record of us (same frame, both orders): no TARGET line,
+        // the holding time goes on.
+        t.record(a, me1, 0, s(200, 2, 1.0));
+        t.record(a, me2, 0, Sample { is_top: true, ..s(200, 2, 51.0) });
+        t.record(a, me1, 0, Sample { is_top: true, ..s(300, 3, 51.0) });
+        t.record(a, me2, 0, s(300, 3, 1.0));
+        assert_eq!(t.take_events().1, 0);
+        let e = t.enemies[t.entry(a, 300)];
+        assert_eq!((e.top, e.top_rec, e.top_since_ms, e.switches), (0, me1, 100, 1));
+        // A real change to the friend: one line from us, with our current record's sample.
+        t.record(a, me1, 0, s(400, 4, 1.0));
+        t.record(a, friend, 1, Sample { is_top: true, ..s(400, 4, 51.0) });
+        let (ev, n, _) = t.take_events();
+        let ev: Vec<Event> = ev.into_iter().take(n).flatten().collect();
+        assert!(matches!(ev[..], [Event::Appear { slot: 1, .. }, Event::Top { from: 0, to: 1, held_ms: 300, .. }]), "{ev:?}");
+        // Our stale record says "not top" now and then: nothing.
+        t.record(a, me2, 0, s(500, 5, 0.5));
+        t.record(a, friend, 1, Sample { is_top: true, ..s(500, 5, 51.0) });
+        assert_eq!(t.take_events().1, 0);
+        // The top goes to a non-player (no sample) and comes back to the friend long after:
+        // one line from "other/none".
+        t.record(a, friend, 1, s(600, 6, 1.0));
+        assert_eq!(t.take_events().1, 0);
+        t.record(a, friend, 1, Sample { is_top: true, ..s(600 + PRESENT_MS + 100, 7, 51.0) });
+        let (ev, n, _) = t.take_events();
+        assert_eq!(n, 1);
+        assert!(matches!(ev[0], Some(Event::Top { from: NO_SLOT, to: 1, .. })));
+    }
+
+    #[test]
+    fn hits_count_per_record() {
+        let mut t = Table::new();
+        let a = 0x902;
+        let (cur, old) = (0xC0, 0xC8);
+        t.record(a, cur, 1, Sample { hit_timer: 4.0, ..s(100, 1, 1.0) });
+        // A duplicate record appears with a fresh-looking timer: no hit.
+        t.record(a, old, 1, Sample { hit_timer: 9.8, ..s(100, 1, 1.0) });
+        // The timer rises on the current record: one hit; the stale one decays.
+        t.record(a, cur, 1, Sample { hit_timer: 10.0, ..s(200, 2, 1.0) });
+        t.record(a, old, 1, Sample { hit_timer: 9.7, ..s(200, 2, 1.0) });
+        let (ev, n, _) = t.take_events();
+        let hits: Vec<Event> = ev.into_iter().take(n).flatten().filter(|e| matches!(e, Event::Hit { .. })).collect();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(matches!(hits[0], Event::Hit { slot: 1, cur: Sample { ms: 200, .. }, .. }));
+        // A record of a player seen for the first time with a fresh timer: a hit (as before).
+        t.record(a, 0xD0, 0, Sample { hit_timer: 10.0, ..s(300, 3, 1.0) });
+        assert_eq!(t.enemies[t.entry(a, 300)].hits, { let mut h = [0; SLOTS]; h[0] = 1; h[1] = 1; h });
+    }
+
+    #[test]
+    fn replan_multi_counts_players_not_records() {
+        let mut t = Table::new();
+        t.record(5, 0xE0, 0, rp(10, 1, 1.0));
+        t.record(5, 0xE8, 0, rp(10, 1, 3.0));
+        let e = t.enemies[t.entry(5, 10)];
+        assert_eq!((e.replans, e.replans_multi, e.on_replan[0].score), (1, 0, 3.0), "the better record of the player");
+        assert!(!e.replan_line_due(10));
+        t.record(5, 0xF0, 1, rp(10, 1, 2.0));
+        assert_eq!(t.enemies[t.entry(5, 10)].replans_multi, 1);
+    }
+
+    /// Freed and reused record memory: a stale entry starts over, and an address that comes
+    /// back about another player is a new record (and no longer the top).
+    #[test]
+    fn record_addresses_are_reused_safely() {
+        let mut t = Table::new();
+        let a = 0x903;
+        t.record(a, 0x10, 0, Sample { is_top: true, hit_timer: 2.0, ..s(100, 1, 51.0) });
+        t.take_events();
+        // Same address, the friend now: not "our" record any more, top unknown.
+        t.record(a, 0x10, 1, Sample { hit_timer: 2.0, ..s(200, 2, 1.0) });
+        let e = t.enemies[t.entry(a, 200)];
+        assert_eq!((e.top, e.top_rec), (NO_SLOT, 0));
+        assert_eq!(e.recs.iter().filter(|r| r.rec == 0x10).count(), 1);
+        let (ev, n, _) = t.take_events();
+        assert!(ev.into_iter().take(n).flatten().all(|e| matches!(e, Event::Appear { slot: 1, .. })), "no hit, no top");
+        // More records than entries: the oldest go, the table never grows.
+        for k in 0..(RECS as u64 + 5) {
+            t.record(a, 0x100 + k as usize, (k % 2) as usize, s(300 + k, 3, 1.0));
+        }
+        let e = t.enemies[t.entry(a, 400)];
+        assert_eq!(e.recs.iter().filter(|r| r.rec != 0).count(), RECS);
+        assert!(e.recs.iter().all(|r| r.rec != 0x10), "the oldest went first");
+        // A record not sampled for STALE_MS starts over: its timer is no rise.
+        let mut t = Table::new();
+        t.record(a, 0x20, 0, Sample { hit_timer: 1.0, ..s(100, 1, 1.0) });
+        t.record(a, 0x20, 0, Sample { hit_timer: 5.0, ..s(100 + STALE_MS + 1, 2, 1.0) });
+        assert_eq!(t.enemies[t.entry(a, 100 + STALE_MS + 1)].hits[0], 0);
     }
 
     #[test]
     fn table_reuses_stale_and_never_grows() {
         let mut t = Table::new();
         for ai in 1..=(ENEMIES + 10) {
-            t.record(ai, 0, s(ai as u64, 1, 1.0));
+            t.record(ai, rec(0), 0, s(ai as u64, 1, 1.0));
         }
         assert_eq!(t.enemies.iter().filter(|e| e.ai != 0).count(), ENEMIES);
         // Bad slot: ignored.
-        t.record(1, SLOTS, s(1, 1, 1.0));
+        t.record(1, rec(SLOTS), SLOTS, s(1, 1, 1.0));
         let mut t = Table::new();
-        t.record(1, 0, s(1, 1, 1.0));
+        t.record(1, rec(0), 0, s(1, 1, 1.0));
         let i = t.entry(2, 1 + STALE_MS + 1);
         assert_eq!(i, 0);
         assert_eq!(t.enemies[0].ai, 2);
@@ -1049,7 +1283,7 @@ mod tests {
     fn events_overflow_is_counted() {
         let mut t = Table::new();
         for ai in 1..=(EVENTS + 5) {
-            t.record(ai, 0, s(1, 1, 1.0));
+            t.record(ai, rec(0), 0, s(1, 1, 1.0));
         }
         let (_, n, d) = t.take_events();
         assert_eq!(n, EVENTS);
@@ -1061,7 +1295,7 @@ mod tests {
     fn idle_table_needs_no_copy() {
         let mut t = Table::new();
         assert!(!t.active(1_000));
-        t.record(3, 0, s(1_000, 1, 1.0));
+        t.record(3, rec(0), 0, s(1_000, 1, 1.0));
         assert!(t.active(1_000), "an event waits");
         t.take_events();
         assert!(t.active(1_400), "seen within PRESENT_MS");
@@ -1126,15 +1360,15 @@ mod tests {
         let mut t = Table::new();
         let a = 0x77;
         // Only us on replan frames: no replan line.
-        t.record(a, 0, rp(10, 1, 1.0));
+        t.record(a, rec(0), 0, rp(10, 1, 1.0));
         let i = t.entry(a, 10);
         assert!(!t.enemies[i].replan_line_due(10));
         // Both players on replan frames every frame for 3 s (60 fps): one line a second.
         let mut lines = 0;
         for f in 2..=181u64 {
             let ms = f * 16;
-            t.record(a, 0, rp(ms, f, 1.0));
-            t.record(a, 1, rp(ms, f, 1.0));
+            t.record(a, rec(0), 0, rp(ms, f, 1.0));
+            t.record(a, rec(1), 1, rp(ms, f, 1.0));
             let e = &mut t.enemies[i];
             if e.replan_line_due(ms) {
                 lines += 1;
@@ -1147,8 +1381,8 @@ mod tests {
         let e = &mut t.enemies[i];
         e.line_ms = 0;
         e.logged_replan = e.replan_frame;
-        t.record(a, 0, s(5_000, 300, 51.0));
-        t.record(a, 1, s(5_000, 300, 1.0));
+        t.record(a, rec(0), 0, s(5_000, 300, 51.0));
+        t.record(a, rec(1), 1, s(5_000, 300, 1.0));
         assert!(!t.enemies[i].replan_line_due(5_000));
         // Summary: idle (a boss that just remembers both players) stays silent.
         let idle = Enemy { ai: 1, window_ms: 0, friend_window: true, ..Enemy::FREE };
