@@ -52,7 +52,7 @@
 //! it and re-queues an "all" one to every other engaged client under its own
 //! generation for that link. The host's type 23 reaches the right client through the
 //! recipient wrap at `0xA1DFC1` (rcx = the recipient chr) or `0xA1DFDD` (rcx = its
-//! record). `MSG_ENGAGED` tells the clients who is engaged (ownfill, Owned lists).
+//! record). `MSG_ENGAGED` tells the clients who is engaged (Owned lists).
 //! Safety rules for N: a peer's own trouble disengages only that peer; our block
 //! change, a rest, a load disengage all; a same-block peer that cannot join the native
 //! session (unavailable, latched failure, fallback world, no hello) keeps everyone in
@@ -161,7 +161,7 @@ const MSG_READY: u8 = 3;
 const MSG_LEAVE: u8 = 4;
 /// Client -> host (PROTO 6; was Owned).
 const MSG_STATUS: u8 = 5;
-/// Retiring with ownfill (the next commit).
+/// Retiring with the Owned lists (the diagnostics commit).
 const MSG_OWNED: u8 = 12;
 const MSG_LIVES: u8 = 6;
 /// Host -> clients: the slots engaged with the host now.
@@ -2264,9 +2264,10 @@ fn install_hooks() -> Result<(), String> {
         }
     }
     HOOKS_INSTALLED.store(true, Ordering::Release);
-    // Not fatal: without it ownerless enemies keep no owner (the 7.4 behaviour).
-    if !ownfill::install() {
-        log::line("nsession: IsOwnedHere hook not installed: enemies nobody owns stay without an owner");
+    // Not fatal: without it the host's owner table cannot answer, the game's own
+    // distribution (22 / 23) decides alone (the 7.4 behaviour).
+    if !own::install() {
+        log::line("nsession: IsOwnedHere hook not installed: no owner table, the game's own distribution decides");
     }
     // Not fatal either: without it a second deathblow can still start, the lock then
     // only settles the collision (drop / give way, §39).
@@ -2532,32 +2533,12 @@ fn owned_ids() -> Vec<u16> {
     v
 }
 
-/// netIds of the loaded boss members (table bosses and enemies with two or more lives, as
-/// ownfill's boss rule counts them).
-fn boss_net_ids() -> Vec<u16> {
-    enemies()
-        .into_iter()
-        .filter(|&c| {
-            c.entity_id().is_some_and(|e| crate::bosses::encounter_of(e).is_some())
-                || crate::livesync::multi_life(crate::livesync::lives0_of(c))
-        })
-        .filter_map(netai::net_id)
-        .collect()
-}
-
-/// Marker in an Owned list: "our world update is paused (menu), the enemies near you that
-/// we owned are left out of this list". Sorts after every real netId (`NO_NET_ID` is 0xFFFF);
-/// an older peer sees an id no enemy has.
-const OWNED_PAUSED_MARK: u16 = 0xFFFE;
-/// Our world update stood still this long while engaged: hand our enemies on.
+/// Our world update stood still this long while engaged: we are "paused" (absent for the
+/// host's owner table; a client says so in its Status).
 const WORLD_PAUSED_AFTER: Duration = Duration::from_millis(1500);
 /// Both machines own (and we claim) an enemy this long (> `OWNED_EVERY`, the lists lag):
 /// the lower slot wins.
 const DOUBLE_CLAIM_AFTER: Duration = Duration::from_millis(2500);
-
-fn owned_is_paused(ids: &[u16]) -> bool {
-    ids.binary_search(&OWNED_PAUSED_MARK).is_ok()
-}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum PauseStep {
@@ -2585,25 +2566,6 @@ impl PauseTracker {
             PauseStep::Idle
         }
     }
-}
-
-/// Of our owned enemies (netId, position) the ones a peer would take over while we are
-/// paused, and which one (the peers' own ownfill rule: nearest within `ownfill::NEAR_M`,
-/// the host 5 m ahead). `peers`: the other engaged players that are not paused.
-fn handover_targets(owned: &[(u16, [f32; 3])], peers: &[(u8, Option<[f32; 3]>)]) -> Vec<(u16, u8)> {
-    let mut out = Vec::new();
-    for &(n, p) in owned {
-        let d: Vec<(u8, Option<f32>)> = peers.iter().map(|&(s, o)| (s, o.map(|o| crate::game::distance(o, p)))).collect();
-        for (i, &(s, dist)) in d.iter().enumerate() {
-            let Some(ds) = dist else { continue };
-            let others: Vec<(u8, Option<f32>)> = d.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, &x)| x).collect();
-            if ownfill::wanted(s, ds, &others) {
-                out.push((n, s));
-                break;
-            }
-        }
-    }
-    out
 }
 
 /// Client (or any non-lowest slot): drop our claim on an enemy that a lower slot owns
@@ -2665,7 +2627,7 @@ fn ownerless_report(player: Chr, others: &[(u8, Option<[f32; 3]>)], theirs: Opti
         // Before the early `continue`: `tally.add` is false for every owned enemy, which
         // is exactly the both-claimed case.
         if here && there && both_ids.len() < 4 {
-            let how = if ownfill::forced(n) { "forced here" } else { "game here" };
+            let how = if own::mine(n) { "table here" } else { "game here" };
             both_ids.push(format!("{n:#x} ent {} ({how})", c.entity_id().unwrap_or(-1)));
         }
         if !tally.add(n, here, there) {
@@ -2822,7 +2784,6 @@ struct Origin {
 }
 
 /// A received Status (host side).
-#[allow(dead_code)] // taken by the engine from the next commit
 #[derive(Clone, Debug)]
 struct StatusIn {
     link: u8,
@@ -2833,7 +2794,6 @@ struct StatusIn {
 }
 
 /// A received Assign (client side).
-#[allow(dead_code)] // taken by the engine from the next commit
 #[derive(Clone, Debug)]
 struct AssignIn {
     generation: u32,
@@ -3143,79 +3103,84 @@ pub fn owned_here(net_id: u16) -> bool {
     owned(w, net_id) != 0
 }
 
-/// v8.30b (F11 line tag): our forced bit is set for this netId.
-pub(crate) fn forced_here(n: u16) -> bool {
-    ownfill::forced(n)
+/// F11 / throwprobe: the owner slot the host's table names for this netId (None = the table
+/// is not active here: not engaged, or a client before its first full Assign).
+pub(crate) fn table_owner(n: u16) -> Option<u8> {
+    own::active().then(|| own::owner(n))
 }
 
-/// See `forced_here`: the game's native ownership answer is nonzero.
+/// The game's native ownership answer (`0xA4A650`'s own code): ignored for enemies while the
+/// table is active, logged for comparison.
 pub(crate) fn game_owned_here(n: u16) -> bool {
-    wcm().is_some_and(|w| ownfill::game_owned(w, n) != 0)
+    wcm().is_some_and(|w| own::game_owned(w, n) != 0)
 }
 
-/// Ownerless enemies near the players get an owner (IMPLEMENTATION-NOTES §31, NOT verified
-/// live). Live 7.4: `ownerless (10 s): 200 alive enemies owned by nobody, 3 within 40 m`
-/// on the friend (enemies 7-20 m away, NetAI, update interval -1: running in place, a
-/// backstab still possible). The game hands out ownership only from the players' candidate
-/// lists (22, `0xA4E520`), and an enemy that is NetAI here is not updated here (interval
-/// -1), so one that nobody listed when the engagement started never becomes a candidate:
-/// it stays NetAI without records on both machines. Fix: `0xA4A650` (IsOwnedHere(WCM,
-/// netId), used by EnemyIns slot 37 `0xA14B50` to pick ComManipulator / NetAI, by the
-/// sender `0xA1C100` for 4 / 70 / 71 and by the damage router `0xB6A040` / `0xB6F4C0`;
-/// IDA v75 o10) is detoured: it also answers "owned here" for the netIds in `FORCED`.
-/// Such an enemy runs our own AI, its state goes to the friend like any enemy we own, and
-/// it becomes our candidate for the game's next distribution. Which machine takes one:
-/// the nearest engaged player (the host's distance counts 5 m less; a tie goes to the
-/// lowest slot), only within 40 m, never one the game or another player owns (their
-/// Owned lists, every 2 s); a conflict (two own it) is dropped at once by the higher slot
-/// and after 3 s by the lowest (then it was the game's). Two players: the 7.4 rule.
-pub(crate) mod ownfill {
+/// Table bosses and multi-life minibosses (v8.51: Headless 1500680 and Shichimen 1700520
+/// were "claimed by both machines" while only table bosses counted).
+fn is_boss(c: Chr) -> bool {
+    c.entity_id().is_some_and(|e| crate::bosses::encounter_of(e).is_some()) || crate::livesync::multi_life(crate::livesync::lives0_of(c))
+}
+
+/// Host-authored enemy ownership (docs/PLAN-OWNERSHIP.md, test11; NOT verified live).
+///
+/// Before test11 three layers could each say "owned here": the game's 22 / 23, every
+/// machine's own forced bits (ownfill, decided locally) and the stealth claims; a forced
+/// bit could only add ownership, never take the game's away (test9: a dead host kept a boss
+/// natively while the friend forced it, "claimed by both machines" 54 times). Now the host
+/// alone decides (`crate::ownership`), sends the table on the control lane (Assign), and
+/// `IsOwnedHere` `0xA4A650` (used by EnemyIns slot 37 `0xA14B50` to pick ComManipulator /
+/// NetAI, by the sender `0xA1C100` for 4 / 70 / 71 and by the damage router `0xB6A040` /
+/// `0xB6F4C0`; IDA v75 o10) answers ONLY from that table for enemy netIds while it is
+/// active, on every machine. Player netIds and 0xFFFF go to the game's code as before; with
+/// no engagement the detour passes everything through (solo play unchanged). The game's
+/// 22 / 23 keep running: the client's first 23 still gates its chr-loop patch (liveness).
+pub(crate) mod own {
     use super::*;
+    use crate::ownership::{self as om, HOST, Kind, NOBODY, Why};
 
     const OWNED_HERE_PROLOGUE: [u8; 11] = [0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x89, 0x30, 0x06, 0x00, 0x00];
     static TRAMP: AtomicUsize = AtomicUsize::new(0);
-    static ANY: AtomicBool = AtomicBool::new(false);
-    static BITS: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+    /// The table answers (host: from its first decision of an engagement; client: from its
+    /// first full Assign). Cleared by `clear_all` (teardown, shutdown).
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    /// The table's owner slot per netId (`NOBODY` = nobody): the host's publications, the
+    /// client's applied Assigns.
+    static OWNER: [AtomicU8; 0x10000] = [const { AtomicU8::new(NOBODY) }; 0x10000];
+    /// Ordinary decision / transition lines per `STATS_EVERY` (bosses and claims are never capped).
+    const MAX_LINES: u32 = 60;
 
-    pub const NEAR_M: f32 = 40.0;
-    /// Hysteresis (live 2026-10-24: "taken 127, given back 112" for enemies 40-48 m away):
-    /// we take at <= `NEAR_M`, and let one go only beyond `NEAR_M + GIVE_BACK_EXTRA_M` ...
-    pub const GIVE_BACK_EXTRA_M: f32 = 8.0;
-    const FAR_M: f32 = NEAR_M + GIVE_BACK_EXTRA_M;
-    /// ... that stayed beyond (no longer `keep`) for this long without a break.
-    pub const GIVE_BACK_AFTER: Duration = Duration::from_secs(5);
-    const TIE_M: f32 = 5.0;
-    const HOST_CONFLICT_DROP: Duration = Duration::from_secs(3);
-
-    fn bit(n: u16) -> (usize, u64) {
-        ((n >> 6) as usize, 1u64 << (n & 63))
+    pub fn active() -> bool {
+        ACTIVE.load(Ordering::Acquire)
     }
 
-    pub fn forced(n: u16) -> bool {
-        let (i, m) = bit(n);
-        ANY.load(Ordering::Relaxed) && BITS[i].load(Ordering::Relaxed) & m != 0
+    pub fn owner(n: u16) -> u8 {
+        OWNER[n as usize].load(Ordering::Relaxed)
     }
 
-    pub fn set(n: u16, on: bool) {
-        let (i, m) = bit(n);
-        if on {
-            BITS[i].fetch_or(m, Ordering::Relaxed);
-            ANY.store(true, Ordering::Release);
-        } else {
-            BITS[i].fetch_and(!m, Ordering::Relaxed);
-        }
+    /// Ours in the table (`ME` = our slot).
+    pub fn mine(n: u16) -> bool {
+        owner(n) == ME.load(Ordering::Relaxed)
     }
 
+    pub(super) fn set(n: u16, slot: u8) {
+        OWNER[n as usize].store(slot, Ordering::Relaxed);
+    }
+
+    pub(super) fn activate() {
+        ACTIVE.store(true, Ordering::Release);
+    }
+
+    /// Off first (the detour passes through from here), then the table empties.
     pub fn clear_all() {
-        ANY.store(false, Ordering::Release);
-        for b in &BITS {
-            b.store(0, Ordering::Relaxed);
+        ACTIVE.store(false, Ordering::Release);
+        for o in &OWNER {
+            o.store(NOBODY, Ordering::Relaxed);
         }
     }
 
     extern "C" fn detour(w: usize, n: u16) -> u8 {
-        if forced(n) && crate::mod_alive() {
-            return 1;
+        if ACTIVE.load(Ordering::Acquire) && crate::mod_alive() && enemy_net_id(n) {
+            return mine(n) as u8;
         }
         game_owned(w, n)
     }
@@ -3242,396 +3207,381 @@ pub(crate) mod ownfill {
         }
     }
 
-    /// The distance a player competes with: the host's counts `TIE_M` less (the 7.4 "host
-    /// on a tie within 5 m"). Minimum (key, slot) wins: exactly one taker.
-    fn key(slot: u8, d: f32) -> f32 {
-        if slot == 0 { d } else { d + TIE_M }
+    /// The hook is in (without it nothing of this runs: the game's own distribution only).
+    pub fn installed() -> bool {
+        TRAMP.load(Ordering::Acquire) != 0
     }
 
-    /// Do we (`me`, `d_me` from the enemy, our key lowered by `bonus`) beat every other
-    /// engaged player (`others`: slot, distance if known)? A tie goes to the lower slot. An
-    /// unknown distance does not compete, except the host's: a client never takes without it.
-    fn beats(me: u8, mine: f32, others: &[(u8, Option<f32>)]) -> bool {
-        others.iter().all(|&(s, d)| match d {
-            None => s != 0,
-            Some(d) if s < me => mine < key(s, d),
-            Some(d) => mine <= key(s, d),
-        })
+    fn tag(kind: Kind) -> &'static str {
+        if kind == Kind::Boss { " [B]" } else { "" }
     }
 
-    /// The pure rule: should this machine take an enemy nobody owns? Two players (host 0,
-    /// client 1): the host when `d_host <= d_client + 5`, the client when `d_client + 5 <
-    /// d_host`; no position of the other: only the host.
-    pub fn wanted(me: u8, d_me: f32, others: &[(u8, Option<f32>)]) -> bool {
-        d_me <= NEAR_M && beats(me, key(me, d_me), others)
+    /// "host 4.1 / peer1 5.3 (down)".
+    fn dists(players: &[om::Player]) -> String {
+        let v: Vec<String> = players
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} {}{}",
+                    om::who(p.slot),
+                    p.dist.map_or("?".into(), |d| format!("{d:.1}")),
+                    if p.present { "" } else { " (absent)" }
+                )
+            })
+            .collect();
+        v.join(" / ")
     }
 
-    /// A boss is never decided by "who is nearer" (v8.12: Genichiro / Tomoe flipped between
-    /// the machines every few seconds, a second AI ran the copy and the boss jumped behind the
-    /// player, live 2026-10-25): the host owns it while it is within `BOSS_HOST_M`; a client
-    /// only when the host is clearly farther than that.
-    pub const BOSS_HOST_M: f32 = 150.0;
-    /// The client lets a boss go back once the host is within this (hysteresis below `BOSS_HOST_M`).
-    const BOSS_HOST_BACK_M: f32 = 130.0;
-
-    fn host_far(others: &[(u8, Option<f32>)], beyond: f32) -> bool {
-        others.iter().all(|&(s, d)| s != 0 || d.is_some_and(|d| d > beyond))
+    /// Host, per engaged client: the last Assign seq sent to it (None = it needs a full), since
+    /// when its ack has been behind that, its last full.
+    #[derive(Default, Clone, Copy)]
+    struct HostLink {
+        sent: Option<u32>,
+        behind_since: Option<u64>,
+        full_at: u64,
     }
 
-    /// v8.57: with the host out of the rule (down, `boss_rivals`) a client takes the boss at the
-    /// host's own range: the Divine Dragon is fought from 60-85 m, beyond `NEAR_M`.
-    fn host_listed(others: &[(u8, Option<f32>)]) -> bool {
-        others.iter().any(|&(s, _)| s == 0)
-    }
-
-    pub fn wanted_boss(me: u8, d_me: f32, others: &[(u8, Option<f32>)]) -> bool {
-        if me == 0 || !host_listed(others) { d_me <= BOSS_HOST_M } else { d_me <= NEAR_M && host_far(others, BOSS_HOST_M) }
-    }
-
-    pub fn keep_boss(me: u8, d_me: f32, others: &[(u8, Option<f32>)]) -> bool {
-        if me == 0 || !host_listed(others) {
-            d_me <= BOSS_HOST_M + 20.0
-        } else {
-            d_me <= FAR_M && host_far(others, BOSS_HOST_BACK_M)
-        }
-    }
-
-    /// The players a boss's owner rule weighs: one waiting dead in the fight (`EV_DOWN`,
-    /// bit per slot in `down`) does not count. Live 2026-10-27 (Divine Dragon): the dead
-    /// spectating host kept the dragon forced, its HP sat at 1 for 165 s and the living
-    /// friend never got the final deathblow (the game itself had answered "not ours").
-    pub fn boss_rivals(others: &[(u8, Option<f32>)], down: u32) -> Vec<(u8, Option<f32>)> {
-        others.iter().copied().filter(|&(s, _)| s >= 32 || down & (1 << s) == 0).collect()
-    }
-
-    /// Keep one we took? (hysteresis: let go only clearly past the rule: our key counts
-    /// another `TIE_M` less; two players: the host up to 10 m farther, the client while
-    /// nearer, 50 m at most)
-    pub fn keep(me: u8, d_me: f32, others: &[(u8, Option<f32>)]) -> bool {
-        d_me <= FAR_M && beats(me, key(me, d_me) - TIE_M, others)
-    }
-
-    /// Dwell for giving back: `beyond` = how long `keep` has been false without a break
-    /// (None = it holds). Pure: true once it has stayed beyond for `GIVE_BACK_AFTER`.
-    pub fn give_back_due(beyond: Option<Duration>) -> bool {
-        beyond.is_some_and(|d| d >= GIVE_BACK_AFTER)
-    }
-
-    /// Drop a conflicting one now? `owners` = the other slots that list it as owned. A
-    /// lower slot among them: at once; else (we are the lowest) after `HOST_CONFLICT_DROP`.
-    /// v8.30b: the host drops a non-boss at once (the friend's game-native ownership cannot be
-    /// dropped, so a double claim only desyncs the AI); bosses keep the old sticky rules.
-    pub fn conflict_drop(me: u8, owners: &[u8], conflict_for: Duration, is_boss: bool) -> bool {
-        if me == 0 && !is_boss && !owners.is_empty() {
-            return true;
-        }
-        owners.iter().any(|&s| s < me) || conflict_for >= HOST_CONFLICT_DROP
-    }
-
-    /// v8.30b: after a conflict drop the host does not retake that enemy for this long.
-    pub const RETAKE_COOLDOWN: Duration = Duration::from_secs(10);
-    /// Minimum gap between two "given back (another player owns it)" lines per netId.
-    const GIVE_LOG_GAP: Duration = Duration::from_secs(5);
-
-    /// Drop a held enemy because the game's own IsOwnedHere answer turned nonzero? Never for a
-    /// host boss (v8.25a: our forced bit and a nonzero native answer both return 1 through the
-    /// detour, so dropping only made the boss flip-flop and warp on the friend).
-    /// test6: nor for a client's boss while another player waits dead in the fight
-    /// (`rival_down`): live 2026-11-12 (miniboss 1500490, host down) the client dropped the
-    /// forced bit each time the game's answer turned 1, re-took it when the answer fell back
-    /// to 0 (the downed host is out of `boss_rivals`), three times in 45 s; every move gave the
-    /// boss a fresh AI and the client a stealth deathblow at 73 % HP. The client keeps it
-    /// until the rival is back; then the normal rules (host within `BOSS_HOST_BACK_M`) apply.
-    pub fn drop_on_native(me: u8, is_boss: bool, rival_down: bool) -> bool {
-        !(is_boss && (me == 0 || rival_down))
-    }
-
-    /// Is one of the engaged players (`slots`) waiting dead (`down`: bit per slot, world.rs
-    /// `down_slots`)?
-    pub fn rival_down(slots: impl IntoIterator<Item = u8>, down: u32) -> bool {
-        slots.into_iter().any(|s| s < 32 && down & (1 << s) != 0)
-    }
-
-    /// Pure (review, test6 final): the 10 s fresh-take veto (`dblock::boss_taken`) arms at
-    /// most once per boss netId per "rival down" episode, so a take -> conflict drop ->
-    /// re-take cycle cannot keep it armed for good. `armed` = netIds armed this episode; it
-    /// empties as soon as no rival is down. Called every step with `take = None` (episode
-    /// bookkeeping) and with `Some(n)` when boss `n` is taken; true = arm it now.
-    pub fn arm_take_veto(armed: &mut std::collections::HashSet<u16>, rival_down: bool, take: Option<u16>) -> bool {
-        if !rival_down {
-            armed.clear();
-            return false;
-        }
-        take.is_some_and(|n| armed.insert(n))
-    }
-
-    /// Minimum gap between two native-change log lines per boss.
-    const BOSS_DIAG_GAP: Duration = Duration::from_secs(5);
-
+    /// Engine-side state (Engine `own`).
     #[derive(Default)]
-    pub struct Fill {
-        /// netId -> (entity, since, conflict since, beyond the keep rule since)
-        pub ours: HashMap<u16, (i32, Instant, Option<Instant>, Option<Instant>)>,
-        /// netId -> the game's last native owner answer seen for a held boss.
-        pub native: HashMap<u16, u8>,
-        /// netId -> last time a rate-limited boss diagnostic line was logged.
-        pub diag_at: HashMap<u16, Instant>,
-        /// netId -> time of a conflict drop ("another player owns it"); no retake for `RETAKE_COOLDOWN`.
-        pub cooldown: HashMap<u16, Instant>,
-        /// netId -> last time a conflict "given back" line was logged.
-        pub give_log_at: HashMap<u16, Instant>,
-        /// Boss netIds whose fresh-take veto was armed in the current "rival down" episode
-        /// (`arm_take_veto`).
-        pub veto_armed: std::collections::HashSet<u16>,
-        pub at: Option<Instant>,
-        pub taken: u32,
-        pub given: u32,
-        pub logs: u32,
+    pub struct State {
+        // --- host ---
+        table: om::HostTable,
+        /// Boss or not, per netId, for this engagement.
+        kinds: HashMap<u16, Kind>,
+        decide_at: Option<Instant>,
+        /// Presence signature of the last decision (a change decides at once).
+        presence: u64,
+        /// Each client's newest contiguous applied seq (its Ack).
+        acks: [u32; SLOTS],
+        /// Each client's latest Status said "paused".
+        paused: [bool; SLOTS],
+        links: [HostLink; SLOTS],
+        full_at: u64,
+        /// netId -> last WARN line about a release ack wait.
+        warn_at: HashMap<u16, u64>,
+        // --- client ---
+        mirror: om::Mirror,
+        ack_sent: u32,
+        status_at: Option<Instant>,
+        // --- both: log caps and counters (10 s) ---
+        lines_at: Option<Instant>,
+        lines: u32,
+        suppressed: u32,
+        changes: HashMap<Why, u32>,
+        fulls: u32,
+        resends: u32,
+        transitions: u32,
     }
 
-    impl Fill {
-        pub fn reset(&mut self) {
-            clear_all();
-            set_boss_forced(Vec::new());
-            self.ours.clear();
-            self.native.clear();
-            self.diag_at.clear();
-            self.cooldown.clear();
-            self.give_log_at.clear();
-            self.veto_armed.clear();
-            self.logs = 0;
-            self.taken = 0;
-            self.given = 0;
+    impl State {
+        /// Client: the first full Assign of this engagement is in.
+        pub fn ready(&self) -> bool {
+            self.mirror.ready
         }
 
-        fn log(&mut self, s: String) {
-            self.logs += 1;
-            // A boss line is never rate limited (v8.12: the 30-line cap hid the boss owner flips
-            // that made it jump between the players).
-            if self.logs <= 30 || self.logs % 50 == 0 || s.contains("(boss)") {
+        /// Teardown: everything goes (the host's seq counter keeps counting).
+        pub fn reset(&mut self) {
+            let was = active();
+            clear_all();
+            if was {
+                log::line(&format!(
+                    "own: table off ({} rows here, seq {}): the game's own answers again",
+                    if self.mirror.ready { self.mirror.rows.len() } else { self.table.rows.len() },
+                    if self.mirror.ready { self.mirror.applied } else { self.table.seq }
+                ));
+            }
+            let seq = self.table.seq;
+            *self = Self::default();
+            self.table.seq = seq;
+        }
+
+        /// Host: client `slot` left while others stay. Its entries are decided again at the
+        /// next tick (it is no longer engaged: no ack wait for it).
+        pub fn link_gone(&mut self, slot: u8) {
+            let s = slot as usize % SLOTS;
+            self.links[s] = HostLink::default();
+            self.acks[s] = 0;
+            self.paused[s] = false;
+            self.decide_at = None;
+            let mut g = book();
+            let o = &mut g.origins[s];
+            o.status.clear();
+            o.claims = None;
+            o.ack = None;
+        }
+
+        /// Ordinary lines: at most `MAX_LINES` per 10 s; `always` (bosses, claims) never capped.
+        fn line(&mut self, always: bool, s: String) {
+            let now = Instant::now();
+            if self.lines_at.is_none_or(|t| now.duration_since(t) >= STATS_EVERY) {
+                self.lines_at = Some(now);
+                self.lines = 0;
+            }
+            if always || self.lines < MAX_LINES {
+                if !always {
+                    self.lines += 1;
+                }
                 log::line(&s);
+            } else {
+                self.suppressed += 1;
             }
         }
 
-        /// Every 250 ms while engaged (stage >= 2, the client after its first 23). `others`:
-        /// the other engaged players (slot, native remote position); `theirs`: their Owned lists.
-        pub fn step(&mut self, me: u8, player: Chr, others: &[(u8, Option<[f32; 3]>)], theirs: Option<&[(u8, Vec<u16>)]>) {
-            if TRAMP.load(Ordering::Acquire) == 0 {
+        /// Host, every frame while engaged at stage >= 2: decide every `DECIDE_EVERY_MS` (at
+        /// once on a presence, ack or pause change), publish, send. `clients` = the engaged
+        /// client slots.
+        pub fn host_step(&mut self, f: &Frame, clients: &[u8], world_running: bool) {
+            if !installed() {
                 return;
             }
             let now = Instant::now();
-            if self.at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(250)) {
+            let ms = crate::game::now_ms();
+            let mut changed = false;
+            {
+                let mut g = book();
+                for &s in clients {
+                    let o = &mut g.origins[s as usize % SLOTS];
+                    if let Some((link, generation, a)) = o.ack
+                        && accepts(link, generation)
+                        && a != self.acks[s as usize]
+                    {
+                        self.acks[s as usize] = a;
+                        changed = true;
+                    }
+                    for st in o.status.drain(..) {
+                        if !accepts(st.link, st.generation) {
+                            continue;
+                        }
+                        let p = st.flags & STATUS_PAUSED != 0;
+                        if p != self.paused[s as usize] {
+                            self.paused[s as usize] = p;
+                            changed = true;
+                            log::line(&format!("own: peer{s}'s world update {}", if p { "paused (menu): it is absent" } else { "runs again" }));
+                        }
+                    }
+                }
+            }
+            // Who may run enemies: alive, not waiting dead in a boss fight, world running.
+            let down = crate::world::down_slots();
+            let host_present =
+                f.player.hp().is_some_and(|h| h > 0) && !crate::bossrules::spectating() && down & 1 == 0 && world_running;
+            let mut pl: Vec<(u8, bool, Option<[f32; 3]>)> = vec![(HOST, host_present, f.player.position())];
+            for &s in clients {
+                let r = PeerId::new(s).and_then(|id| f.remote_of(id));
+                let present = r.is_some_and(|c| c.hp().is_some_and(|h| h > 0))
+                    && (s >= 32 || down & (1 << s) == 0)
+                    && !self.paused[s as usize % SLOTS];
+                pl.push((s, present, r.and_then(|c| c.position())));
+            }
+            let sig = pl.iter().fold(0u64, |m, &(s, p, _)| m | 1 << (2 * s as u64 % 64) | (p as u64) << ((2 * s as u64 + 1) % 64));
+            if sig != self.presence {
+                self.presence = sig;
+                changed = true;
+            }
+            if !changed && self.decide_at.is_some_and(|t| now.duration_since(t) < Duration::from_millis(om::DECIDE_EVERY_MS)) {
                 return;
             }
-            self.at = Some(now);
-            // No Owned list from every engaged player yet: we cannot tell what they own.
-            let Some(theirs) = theirs else { return };
-            let Some(w) = wcm() else { return };
-            let my_pos = player.position();
-            let owners_of = |n: u16| -> Vec<u8> {
-                theirs.iter().filter(|(_, ids)| ids.binary_search(&n).is_ok()).map(|(s, _)| *s).collect()
-            };
-            let dists = |p: [f32; 3]| -> (f32, Vec<(u8, Option<f32>)>) {
-                let d_me = my_pos.map_or(f32::MAX, |m| crate::game::distance(m, p));
-                (d_me, others.iter().map(|&(s, o)| (s, o.map(|o| crate::game::distance(o, p)))).collect())
-            };
-            // v8.51: minibosses too (two or more lives): Headless 1500680 and Shichimen 1700520
-            // were "claimed by both machines" through the game's own distribution (live
-            // 2026-10-27, v8.50), as only table bosses were forced to the host.
-            let is_boss = |c: Chr| {
-                c.entity_id().is_some_and(|e| crate::bosses::encounter_of(e).is_some())
-                    || crate::livesync::multi_life(crate::livesync::lives0_of(c))
-            };
-            // We wait dead in a boss fight: a living player owns the boss (it gets the deathblow).
-            let me_down = crate::bossrules::spectating();
-            let down = crate::world::down_slots();
-            let others_down = rival_down(others.iter().map(|&(s, _)| s), down);
-            arm_take_veto(&mut self.veto_armed, others_down, None);
-            let mut alive_ids = HashMap::new();
+            self.decide_at = Some(now);
+            let mut seen = Vec::new();
             for c in enemies() {
                 let Some(n) = netai::net_id(c) else { continue };
-                if c.hp().is_none_or(|hp| hp <= 0) {
-                    continue;
-                }
-                let Some(p) = c.position() else { continue };
-                alive_ids.insert(n, (c, p));
+                let kind = *self.kinds.entry(n).or_insert_with(|| if is_boss(c) { Kind::Boss } else { Kind::Ordinary });
+                let pos = c.position();
+                let players = pl
+                    .iter()
+                    .map(|&(slot, present, pp)| om::Player { slot, present, dist: pos.zip(pp).map(|(a, b)| crate::game::distance(a, b)) })
+                    .collect();
+                seen.push(om::Seen {
+                    net: n,
+                    entity: c.entity_id().unwrap_or(-1),
+                    kind,
+                    dead: c.hp().is_none_or(|hp| hp <= 0),
+                    players,
+                });
             }
-            // Ours first: still needed?
-            let mut drop: Vec<(u16, &'static str)> = Vec::new();
-            let mut diag: Vec<String> = Vec::new();
-            for (&n, (_, _, conflict, beyond)) in self.ours.iter_mut() {
-                let Some(&(c, p)) = alive_ids.get(&n) else {
-                    drop.push((n, "dead or unloaded"));
-                    continue;
+            let acks = self.acks;
+            let out = self.table.tick(&seen, &[], |s| acks.get(s as usize).copied().unwrap_or(0), |s| s == HOST || clients.contains(&s), ms);
+            for w in &out.whys {
+                *self.changes.entry(*w).or_default() += 1;
+            }
+            for d in &out.decided {
+                let ch = d.change;
+                set(d.net, ch.to);
+                if ch.to == HOST && d.kind == Kind::Boss && (ch.after.is_some() || ch.from != NOBODY) {
+                    // Its AI moves here fresh from another machine.
+                    super::dblock::boss_taken(d.net, d.entity);
+                }
+                let why = match (ch.pending, ch.after) {
+                    (Some(t), _) => format!("to {}, waiting for {}'s ack", om::who(t), om::who(ch.from)),
+                    (None, Some((x, waited, true))) => format!("{} acked after {waited} ms", om::who(x)),
+                    (None, Some((x, waited, false))) => format!("{} left after {waited} ms", om::who(x)),
+                    _ if d.why == Why::OwnerAbsent => format!("{} absent", om::who(ch.from)),
+                    _ => d.why.label().to_string(),
                 };
-                let boss = is_boss(c);
-                let go = game_owned(w, n);
-                if boss {
-                    let old = self.native.insert(n, go);
-                    if old.is_some_and(|o| o != go)
-                        && self.diag_at.get(&n).is_none_or(|t| now.duration_since(*t) >= BOSS_DIAG_GAP)
-                    {
-                        self.diag_at.insert(n, now);
-                        let kept = !(go != 0 && drop_on_native(me, boss, others_down));
-                        diag.push(format!(
-                            "ownfill: BOSS (boss) netId {n:#x} native owner answer {}->{go} while forced ({})",
-                            old.unwrap_or(0),
-                            if kept {
-                                "forced bit kept"
-                            } else {
-                                "forced bit dropped: the game's own answer runs it here now"
-                            }
-                        ));
-                    }
-                }
-                if boss && me_down {
-                    drop.push((n, "we are dead (spectating): a living player takes it"));
-                    continue;
-                }
-                if go != 0 && drop_on_native(me, boss, others_down) {
-                    drop.push((n, "the game gives it to us now"));
-                    continue;
-                }
-                let owners = owners_of(n);
-                if !owners.is_empty() {
-                    let since = *conflict.get_or_insert(now);
-                    // The host keeps a boss in a conflict: the client (higher slot) gives it up at once.
-                    if !(boss && me == 0) && conflict_drop(me, &owners, now.duration_since(since), boss) {
-                        drop.push((n, "another player owns it"));
-                    }
-                    continue;
-                }
-                *conflict = None;
-                let (d_me, ds) = dists(p);
-                let kept = if boss { keep_boss(me, d_me, &boss_rivals(&ds, down)) } else { keep(me, d_me, &ds) };
-                if kept {
-                    *beyond = None;
-                } else if give_back_due(Some(now.duration_since(*beyond.get_or_insert(now)))) {
-                    drop.push((n, "another player is nearer / we are far"));
-                }
+                let always = d.kind == Kind::Boss || d.why == Why::Claim;
+                self.line(
+                    always,
+                    format!(
+                        "own: {:#x} e{}{} {} -> {} ({why}) d {} seq {}",
+                        d.net,
+                        d.entity,
+                        tag(d.kind),
+                        om::who(ch.from),
+                        om::who(ch.to),
+                        dists(&d.players),
+                        ch.seq
+                    ),
+                );
             }
-            for l in diag {
-                self.log(l);
-            }
-            for (n, why) in drop {
-                set(n, false);
-                self.native.remove(&n);
-                self.diag_at.remove(&n);
-                if let Some((e, since, ..)) = self.ours.remove(&n) {
-                    self.given += 1;
-                    let tag = if crate::bosses::encounter_of(e).is_some() { " (boss)" } else { "" };
-                    if !tag.is_empty() {
-                        let (d, pos, hp) = alive_ids.get(&n).map_or((f32::NAN, None, None), |&(c, p)| {
-                            (my_pos.map_or(f32::NAN, |m| crate::game::distance(m, p)), Some(p), c.hp())
-                        });
-                        let o = owners_of(n);
-                        self.log(format!(
-                            "ownfill: BOSS (boss) netId {n:#x} ent {e} drop why={why} game_owned={} forced={} d_me={d:.0} others={:?} pos={pos:?} hp={hp:?} owners={o:?}",
-                            game_owned(w, n),
-                            forced(n),
-                            others.iter().map(|&(s, o)| (s, o.map(|o| my_pos.map_or(f32::NAN, |m| crate::game::distance(m, o))))).collect::<Vec<_>>()
-                        ));
-                    }
-                    let line = format!(
-                        "ownfill: enemy {e}{tag} netId {n:#x} given back after {} ms ({why})",
-                        now.duration_since(since).as_millis()
-                    );
-                    if why == "another player owns it" {
-                        self.cooldown.insert(n, now);
-                        // Bypasses the 30-line cap; one per netId per 5 s.
-                        if self.give_log_at.get(&n).is_none_or(|t| now.duration_since(*t) >= GIVE_LOG_GAP) {
-                            self.give_log_at.insert(n, now);
-                            log::line(&line);
-                        }
-                    } else {
-                        self.log(line);
-                    }
-                }
-            }
-            self.cooldown.retain(|_, t| now.duration_since(*t) < RETAKE_COOLDOWN);
-            self.give_log_at.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-            // New ones: alive, near, nobody owns them.
-            for (&n, &(c, p)) in &alive_ids {
-                if self.cooldown.contains_key(&n) {
-                    continue;
-                }
-                let boss = is_boss(c);
-                if boss && me_down {
-                    continue;
-                }
-                let host_boss = me == 0 && boss;
-                if self.ours.contains_key(&n) || (game_owned(w, n) != 0 && !host_boss) || !owners_of(n).is_empty() {
-                    continue;
-                }
-                let (d_me, ds) = dists(p);
-                let take = if boss { wanted_boss(me, d_me, &boss_rivals(&ds, down)) } else { wanted(me, d_me, &ds) };
-                if !take {
-                    continue;
-                }
-                set(n, true);
-                let e = c.entity_id().unwrap_or(-1);
-                if boss {
-                    // The boss's AI moves here fresh (no "noticed the player" state): no
-                    // deathblow that its posture / HP does not open for a while.
-                    // Once per netId per rival-down episode (a re-take after a conflict drop
-                    // does not arm it again).
-                    if arm_take_veto(&mut self.veto_armed, others_down, Some(n)) {
-                        super::dblock::boss_taken(n, e);
-                    }
-                    self.native.insert(n, game_owned(w, n));
-                    self.log(format!(
-                        "ownfill: BOSS (boss) netId {n:#x} ent {e} take why=wanted_boss game_owned={} forced={} d_me={d_me:.0} others={:?} pos={p:?} hp={:?} owners=[]",
-                        game_owned(w, n),
-                        forced(n),
-                        ds,
-                        c.hp()
-                    ));
-                }
-                self.ours.insert(n, (e, now, None, None));
-                self.taken += 1;
-                let near = ds.iter().filter_map(|&(_, d)| d).fold(f32::MAX, f32::min);
-                let tag = if is_boss(c) { " (boss)" } else { "" };
-                self.log(format!(
-                    "ownfill: enemy {e}{tag} netId {n:#x} owned by nobody, {d_me:.0} m from us, {} from the nearest other player (interval {:?}): runs here now",
-                    if near < f32::MAX { format!("{near:.0} m") } else { "?".to_string() },
-                    read::<i32>(c.0 + 0x110)
+            if !active() {
+                activate();
+                log::line(&format!(
+                    "own: host table active: {} enemies seen, {} owned here, {} by clients; IsOwnedHere answers from it for enemies",
+                    seen.len(),
+                    self.table.full().iter().filter(|e| e.1 == HOST).count(),
+                    self.table.full().iter().filter(|e| e.1 != HOST).count()
                 ));
             }
-            // Host: publish the boss members we hold forced (`host_candidates` strips them
-            // from every client's candidate list).
-            if me == 0 {
-                let held: Vec<u16> = self
-                    .ours
-                    .iter()
-                    .filter(|&(n, v)| crate::bosses::encounter_of(v.0).is_some() || alive_ids.get(n).is_some_and(|&(c, _)| is_boss(c)))
-                    .map(|(&n, _)| n)
+            self.send(clients, &out, ms);
+            self.warn_waits(ms);
+        }
+
+        /// Host: deltas to every engaged client, a full to one that needs it (new, behind on
+        /// its acks for `ACK_RESEND_MS`, or every `FULL_EVERY_MS`).
+        fn send(&mut self, clients: &[u8], out: &om::TickOut, ms: u64) {
+            let seq = self.table.seq;
+            let full_all = ms.saturating_sub(self.full_at) >= om::FULL_EVERY_MS;
+            if full_all {
+                self.full_at = ms;
+            }
+            let delta: Vec<(u16, u8, u32)> = out.decided.iter().map(|d| (d.net, d.change.to, d.change.seq)).collect();
+            let mut full: Option<Vec<(u16, u8, u32)>> = None;
+            for &s in clients {
+                let i = s as usize % SLOTS;
+                let acked = self.acks[i];
+                let l = &mut self.links[i];
+                match l.sent {
+                    Some(x) if !om::reached(acked, x) => {
+                        l.behind_since.get_or_insert(ms);
+                    }
+                    _ => l.behind_since = None,
+                }
+                let resend = (l.behind_since.is_some_and(|t| ms.saturating_sub(t) >= om::ACK_RESEND_MS) || self.table.wait_overdue(s, ms))
+                    && ms.saturating_sub(l.full_at) >= om::ACK_RESEND_MS;
+                let generation = GEN_OUT[i].load(Ordering::Relaxed);
+                if l.sent.is_none() || full_all || resend || delta.len() > MAX_OWNED {
+                    let entries = full.get_or_insert_with(|| self.table.full()).clone();
+                    queue_ctrl(s, &Msg::Assign { generation, full: true, seq, base: 0, entries });
+                    l.sent = Some(seq);
+                    l.full_at = ms;
+                    self.fulls += 1;
+                    if resend {
+                        self.resends += 1;
+                    }
+                } else if let Some(base) = l.sent
+                    && !delta.is_empty()
+                {
+                    queue_ctrl(s, &Msg::Assign { generation, full: false, seq, base, entries: delta.clone() });
+                    l.sent = Some(seq);
+                }
+            }
+        }
+
+        /// Host: entries waiting for a client's release ack longer than `ACK_WARN_MS` (they
+        /// stay nobody meanwhile, never double): one line per netId per `ACK_WARN_MS`.
+        fn warn_waits(&mut self, ms: u64) {
+            let mut lines = Vec::new();
+            for (&n, r) in &self.table.rows {
+                let Some((x, s1, since)) = r.publ.wait else { continue };
+                if ms.saturating_sub(since) < om::ACK_WARN_MS || self.warn_at.get(&n).is_some_and(|&t| ms.saturating_sub(t) < om::ACK_WARN_MS) {
+                    continue;
+                }
+                self.warn_at.insert(n, ms);
+                lines.push(format!(
+                    "own: WARN {n:#x} e{}{} waits {} ms for {}'s release ack (seq {s1}, it acked {}): nobody runs it meanwhile",
+                    r.entity,
+                    tag(r.kind),
+                    ms.saturating_sub(since),
+                    om::who(x),
+                    self.acks[x as usize % SLOTS]
+                ));
+            }
+            self.warn_at.retain(|n, _| self.table.rows.get(n).is_some_and(|r| r.publ.wait.is_some()));
+            for l in lines {
+                log::line(&l);
+            }
+        }
+
+        /// Client, every frame while engaged at stage >= 2: apply the host's Assigns, ack,
+        /// Status every `STATUS_EVERY_MS` and at once when our pause state flips.
+        pub fn client_step(&mut self, me: u8, paused: bool, pause_flipped: bool) {
+            let ms = crate::game::now_ms();
+            let msgs: Vec<AssignIn> = {
+                let mut g = book();
+                g.assigns.drain(..).filter(|a| accepts(0, a.generation)).collect()
+            };
+            let mut trans = Vec::new();
+            for a in &msgs {
+                trans.extend(self.mirror.apply(a.full, a.seq, a.base, &a.entries, ms).into_iter().map(|t| (t, a.seq)));
+            }
+            if !trans.is_empty() {
+                let chrs: HashMap<u16, Chr> = enemies().into_iter().filter_map(|c| Some((netai::net_id(c)?, c))).collect();
+                for ((n, old, new), seq) in trans {
+                    set(n, new);
+                    self.transitions += 1;
+                    let c = chrs.get(&n).copied();
+                    let kind = match c {
+                        Some(c) => *self.kinds.entry(n).or_insert_with(|| if is_boss(c) { Kind::Boss } else { Kind::Ordinary }),
+                        None => Kind::Ordinary,
+                    };
+                    let entity = c.and_then(|c| c.entity_id()).unwrap_or(-1);
+                    if new == me && old != NOBODY && kind == Kind::Boss {
+                        super::dblock::boss_taken(n, entity);
+                    }
+                    if kind == Kind::Boss || old == me || new == me {
+                        self.line(
+                            kind == Kind::Boss,
+                            format!("own: table {n:#x} e{entity}{} {} -> {} (Assign seq {seq})", tag(kind), om::who(old), om::who(new)),
+                        );
+                    }
+                }
+            }
+            if self.mirror.ready && !active() {
+                activate();
+                let mine = self.mirror.rows.values().filter(|r| r.owner == me).count();
+                log::line(&format!(
+                    "own: table active here: first full Assign seq {}, {} entries, {mine} ours; IsOwnedHere answers from it for enemies",
+                    self.mirror.applied,
+                    self.mirror.rows.len()
+                ));
+            }
+            if self.mirror.applied != 0 && self.mirror.applied != self.ack_sent {
+                self.ack_sent = self.mirror.applied;
+                queue_ctrl(0, &Msg::Ack { generation: GEN_OUT[0].load(Ordering::Relaxed), applied_seq: self.ack_sent });
+            }
+            if pause_flipped || self.status_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(om::STATUS_EVERY_MS)) {
+                self.status_at = Some(Instant::now());
+                let mut running: Vec<u16> = enemies()
+                    .into_iter()
+                    .filter(|c| c.hp().is_some_and(|hp| hp > 0) && netai::active_kind(*c) == 1)
+                    .filter_map(netai::net_id)
                     .collect();
-                set_boss_forced(held);
+                running.sort_unstable();
+                running.dedup();
+                running.truncate(MAX_OWNED);
+                queue_ctrl(
+                    0,
+                    &Msg::Status {
+                        generation: GEN_OUT[0].load(Ordering::Relaxed),
+                        origin: me,
+                        applied_seq: self.mirror.applied,
+                        flags: if paused { STATUS_PAUSED } else { 0 },
+                        running,
+                    },
+                );
             }
         }
     }
-}
-
-/// netIds of boss / illusion members the host holds forced (ownfill). The friend's own
-/// type-22 candidate list still names them, so the game's distribution kept handing the
-/// same boss to the friend (live 2026-10-26: `claimed by both machines`).
-static BOSS_FORCED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
-static STRIPPED_BOSS: AtomicU32 = AtomicU32::new(0);
-
-fn set_boss_forced(mut v: Vec<u16>) {
-    v.sort_unstable();
-    if let Ok(mut g) = BOSS_FORCED.lock() {
-        *g = v;
-    }
-}
-
-/// The netIds a client may not keep: the contested / claimed ones (`base`) plus the
-/// host's forced boss members. Pure; sorted and deduplicated.
-fn blocked_with_bosses(mut base: Vec<u16>, boss_forced: &[u16]) -> Vec<u16> {
-    base.extend_from_slice(boss_forced);
-    base.sort_unstable();
-    base.dedup();
-    base
 }
 
 /// Type 18 (throw / grab / deathblow, `+0x20` defender netId, `+0x22` attacker) seen lately.
@@ -4154,7 +4104,8 @@ pub(crate) mod dblock {
 
     // --- Fresh-take veto (test6) -------------------------------------------------------
 
-    /// After ownfill takes a boss while another player waits dead in the fight, its AI starts
+    /// After a boss moves here from another machine (test11: the owner table, e.g. the host
+    /// went down in the fight; before: ownfill while another player waited dead), its AI starts
     /// fresh here (live 2026-11-12: retaken at 21:02:18, a stealth deathblow, throw 59972, at
     /// 21:02:19 with 73 % HP and posture not broken). For this long our player's STEALTH
     /// deathblows on it are refused at the gate unless the boss is open to one (`take_vetoed`);
@@ -4186,7 +4137,8 @@ pub(crate) mod dblock {
         word != 0 && (word >> 48) as u16 == net && word & UNTIL_MASK > now
     }
 
-    /// ownfill: boss `n` (entity `entity`) taken while a rival is down.
+    /// `own`: boss `n` (entity `entity`) became ours from another machine (not the first
+    /// assignment of an engagement).
     pub fn boss_taken(n: u16, entity: i32) {
         let now = crate::game::now_ms();
         let w = take_word(n, now + TAKE_VETO_MS);
@@ -4199,7 +4151,7 @@ pub(crate) mod dblock {
         TAKEN[i].store(w, Ordering::Relaxed);
         ANY_TAKEN.store(true, Ordering::Release);
         log::line(&format!(
-            "deathblow: boss {entity} netId {n:#x} taken while another player is down: for {} s our stealth deathblows on it need broken posture or HP at 1 (fresh AI here; stealth = behind, crouching, plunging, wall hug, ledge hang; posture deathblows always pass)",
+            "deathblow: boss {entity} netId {n:#x} taken while its AI moves here from another machine: for {} s our stealth deathblows on it need broken posture or HP at 1 (fresh AI here; stealth = behind, crouching, plunging, wall hug, ledge hang; posture deathblows always pass)",
             TAKE_VETO_MS / 1000
         ));
     }
@@ -5109,8 +5061,8 @@ struct Engine {
     ownerless_at: Option<Instant>,
     stats_at: Option<Instant>,
     timers_logged: bool,
-    /// Ownerless enemies near us that we took (`ownfill`).
-    fill: ownfill::Fill,
+    /// The host-authored owner table (module `own`, docs/PLAN-OWNERSHIP.md).
+    own: own::State,
     /// Host: the Engaged set last sent, and when.
     engaged_sent: u8,
     engaged_sent_at: Option<Instant>,
@@ -5129,9 +5081,8 @@ struct Engine {
     contested: Vec<u16>,
     contest_at: Option<Instant>,
     contest_logs: u32,
-    /// Our world update paused (menu): the enemies handed on (left out of our Owned list).
+    /// Our world update paused (menu): absent for the owner table (a client's Status says so).
     pause: PauseTracker,
-    handed: Vec<u16>,
     /// Double claims: since when both machines own a claimed enemy; logged once each.
     both_since: HashMap<u16, Instant>,
     double_logged: std::collections::HashSet<u16>,
@@ -5161,7 +5112,7 @@ impl Engine {
             ownerless_at: None,
             stats_at: None,
             timers_logged: false,
-            fill: ownfill::Fill::default(),
+            own: own::State::default(),
             engaged_sent: 0,
             engaged_sent_at: None,
             own_sync: None,
@@ -5173,7 +5124,6 @@ impl Engine {
             contest_at: None,
             contest_logs: 0,
             pause: PauseTracker::default(),
-            handed: Vec::new(),
             both_since: HashMap::new(),
             double_logged: std::collections::HashSet::new(),
         }
@@ -5241,17 +5191,8 @@ impl Engine {
         self.late.clear();
         clear_queues();
         let _ = take_last23();
-        if !self.fill.ours.is_empty() {
-            log::line(&format!(
-                "nsession: ownfill: {} enemies we had taken go back to the game's rules (taken {}, given back {} this engagement)",
-                self.fill.ours.len(),
-                self.fill.taken,
-                self.fill.given
-            ));
-        }
-        self.fill.reset();
+        self.own.reset();
         self.pause = PauseTracker::default();
-        self.handed.clear();
         self.both_since.clear();
         self.double_logged.clear();
         if let Ok(mut d) = DROPPED_CLAIMS.lock() {
@@ -5277,6 +5218,10 @@ impl Engine {
         let others = !self.all_going && self.any_engaged();
         if was == Phase::Engaged && others {
             drop_inbound_from(slot);
+            if self.host {
+                // Its enemies are decided again at the next tick (no ack wait for it).
+                self.own.link_gone(slot);
+            }
             if self.host && self.stage >= 2 {
                 let cleared = clear_record(slot);
                 log::line(&format!(
@@ -5777,14 +5722,17 @@ impl Engine {
             return;
         }
         let served_23 = SERVED_23.load(Ordering::Relaxed) != l.served_23_at_engage;
-        if !served_23 {
+        // test11: the host's owner table (its first full Assign) is the second half of the
+        // gate; without the IsOwnedHere hook there is no table and the 23 alone decides.
+        let table = self.own.ready() || !own::installed();
+        if !served_23 || !table {
             // The 5 s rule counts from the first packet of the host's sync (its 4 / 5 /
             // 70 / 71 come from the same update as its 23), not from the engage.
             let fed = SYNC_IN.load(Ordering::Relaxed).wrapping_sub(l.sync_in_at_engage);
             if fed > 0 && l.host_live_at.is_none() {
                 l.host_live_at = Some(Instant::now());
                 log::line(&format!(
-                    "nsession: the host's sync runs ({fed} packets, {} ms after engage); its first 23 is due within 5 s",
+                    "nsession: the host's sync runs ({fed} packets, {} ms after engage); its first 23 and its owner table are due within 5 s",
                     l.since.elapsed().as_millis()
                 ));
             }
@@ -5792,11 +5740,12 @@ impl Engine {
                 Some(t) if t.elapsed() >= FIRST_23_WITHIN => {
                     l.soft_fails += 1;
                     let latch = l.soft_fails >= SOFT_FAILS_LATCH;
-                    let why = format!(
-                        "no ownership list (23) within 5 s of the host's sync packets ({fed} of them, timers here {:?}), failure {}",
-                        timers(),
-                        l.soft_fails
-                    );
+                    let what = if served_23 {
+                        "no ownership table within 5 s".to_string()
+                    } else {
+                        format!("no ownership list (23) within 5 s (timers here {:?})", timers())
+                    };
+                    let why = format!("{what} of the host's sync packets ({fed} of them), failure {}", l.soft_fails);
                     l.failed_attempt = true;
                     self.disengage(l, &why, Reason::No23, true, latch);
                     return;
@@ -5810,14 +5759,14 @@ impl Engine {
                 _ => {}
             }
         }
-        if served_23 && !self.late.is_empty() {
-            // First 23 of this engagement: ownership is known now, enemies not owned here
-            // go to NetAI (fed by the host) from the next chr loop.
+        if served_23 && table && !self.late.is_empty() {
+            // First 23 and the owner table of this engagement: ownership is known now,
+            // enemies not owned here go to NetAI (fed by the host) from the next chr loop.
             match apply_patches(self.late.clone()) {
                 Ok(a) => {
                     let (_, _, _, here) = owners();
                     log::line(&format!(
-                        "nsession: first 23 {} ms after engage, owned here {here}: members chr loop patched, enemies not owned here go to NetAI now",
+                        "nsession: first 23 and owner table, {} ms after engage, owned here {here}: members chr loop patched, enemies not owned here go to NetAI now",
                         l.since.elapsed().as_millis()
                     ));
                     self.applied.extend(a);
@@ -5860,7 +5809,7 @@ impl Engine {
     }
 
     /// Once per frame while any link is engaged: Owned lists, the Engaged set, the
-    /// ownerless report, ownfill, the host's 22 feed, timers.
+    /// ownerless report, the owner table, the host's 22 feed, timers.
     fn engaged_common(&mut self, f: &Frame) {
         update_pnets(f);
         let now = Instant::now();
@@ -5895,12 +5844,15 @@ impl Engine {
         }
         let comps = self.competitors(f);
         let comp_slots: Vec<u8> = comps.iter().map(|c| c.0).collect();
-        // Paused peers (marker in their Owned list) do not compete for enemies.
-        let paused_peers: Vec<u8> = owned_lists(&comp_slots)
-            .map(|l| l.iter().filter(|(_, ids)| owned_is_paused(ids)).map(|(s, _)| *s).collect())
-            .unwrap_or_default();
-        let active: Vec<(u8, Option<[f32; 3]>)> = comps.iter().filter(|c| !paused_peers.contains(&c.0)).cloned().collect();
-        self.pause_step(me, &active);
+        // Our world update paused (menu) for `WORLD_PAUSED_AFTER`: absent for the owner table.
+        let stalled = if self.updates.is_some() { self.updates_at.elapsed() } else { Duration::ZERO };
+        let pause_flipped = self.stage >= 2 && self.pause.step(stalled) != PauseStep::Idle;
+        if pause_flipped {
+            log::line(&format!(
+                "nsession: our world update {}",
+                if self.pause.active { "paused (menu): absent for the owner table" } else { "runs again after a pause" }
+            ));
+        }
         // The 2 s heartbeat, plus (v8.30b) an early send when the list changed (at most every 250 ms).
         let owned_due = self.owned_sent_at.is_none_or(|t| t.elapsed() >= OWNED_EVERY);
         let owned_check = !owned_due
@@ -5908,17 +5860,7 @@ impl Engine {
             && self.owned_check_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(250));
         if self.stage >= 2 && (owned_due || owned_check) {
             self.owned_check_at = Some(now);
-            let mut ids = owned_ids();
-            ids.retain(|n| !self.handed.contains(n));
-            // v8.57: dead in a boss fight: the boss leaves our list like a paused hand-over, so a
-            // living player's ownfill takes it (the game kept it ours natively, live 2026-10-27).
-            if crate::bossrules::spectating() {
-                let bosses = boss_net_ids();
-                ids.retain(|n| !bosses.contains(n));
-            }
-            if self.pause.active {
-                ids.push(OWNED_PAUSED_MARK);
-            }
+            let ids = owned_ids();
             if owned_due || ids != self.owned_sent_ids {
                 self.owned_sent_at = Some(now);
                 self.owned_sent_ids = ids.clone();
@@ -5931,24 +5873,16 @@ impl Engine {
         if self.stage >= 2 && self.ownerless_at.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
             self.ownerless_at = Some(now);
             ownerless_report(f.player, &comps, owned_lists(&comp_slots).as_deref());
-            if !self.fill.ours.is_empty() || self.fill.taken > 0 {
-                log::line(&format!(
-                    "nsession: ownfill (engagement): {} ownerless enemies run here now, taken {}, given back {}",
-                    self.fill.ours.len(),
-                    self.fill.taken,
-                    self.fill.given
-                ));
-            }
         }
-        // Enemies nobody owns near the players get one (the client once its first 23 is in;
-        // before that every enemy keeps its own AI there anyway).
-        if self.stage >= 2
-            && !self.pause.active
-            && (self.host || self.late.is_empty())
-            && self.fill.at.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
-        {
-            let theirs = owned_lists(&comp_slots);
-            self.fill.step(me, f.player, &active, theirs.as_deref());
+        // The owner table: the host decides and sends it, a client applies it.
+        if self.stage >= 2 {
+            if self.host {
+                let clients = mask_slots(engaged_links());
+                let running = self.world_running();
+                self.own.host_step(f, &clients, running);
+            } else {
+                self.own.client_step(me, self.pause.active, pause_flipped);
+            }
         }
         if self.host && self.stage >= 2 {
             self.host_candidates(f);
@@ -5961,50 +5895,6 @@ impl Engine {
             self.timers_logged = true;
             let t = sync_table();
             log::line(&format!("nsession: sync table {t:x?} timers +0x398.. {:?}", t.and_then(|t| read::<[f32; 4]>(t + T_TIMERS))));
-        }
-    }
-
-    /// Our world update paused while engaged (menu): after `WORLD_PAUSED_AFTER` the enemies
-    /// we own near other players are left out of our Owned list (with the paused marker), so
-    /// their ownfill takes them (nearest peer); back when our update runs again, where the
-    /// peers' lower-slot / dwell rules settle who keeps what.
-    fn pause_step(&mut self, me: u8, active: &[(u8, Option<[f32; 3]>)]) {
-        if self.stage < 2 {
-            return;
-        }
-        let stalled = if self.updates.is_some() { self.updates_at.elapsed() } else { Duration::ZERO };
-        match self.pause.step(stalled) {
-            PauseStep::Begin => {
-                let Some(w) = wcm() else { return };
-                let owned: Vec<(u16, [f32; 3])> = enemies()
-                    .into_iter()
-                    .filter(|c| c.hp().is_some_and(|hp| hp > 0))
-                    .filter_map(|c| Some((netai::net_id(c)?, c.position()?)))
-                    .filter(|&(n, _)| ownfill::game_owned(w, n) != 0 || ownfill::forced(n))
-                    .collect();
-                let targets = handover_targets(&owned, active);
-                self.handed = targets.iter().map(|t| t.0).collect();
-                self.handed.sort_unstable();
-                self.handed.dedup();
-                let mut per: BTreeMap<u8, u32> = BTreeMap::new();
-                for &(_, s) in &targets {
-                    *per.entry(s).or_default() += 1;
-                }
-                if per.is_empty() {
-                    log::line("nsession: our world update paused: 0 enemies handed to a peer (none near another player)");
-                }
-                for (s, n) in per {
-                    log::line(&format!("nsession: our world update paused: {n} enemies handed to peer {s}"));
-                }
-                self.owned_sent_at = None;
-                let _ = me;
-            }
-            PauseStep::End => {
-                log::line(&format!("nsession: our world update paused: ended, {} handed enemies back to the usual rules", self.handed.len()));
-                self.handed.clear();
-                self.owned_sent_at = None;
-            }
-            PauseStep::Idle => {}
         }
     }
 
@@ -6073,7 +5963,6 @@ impl Engine {
             }
         }
         let ours = claims_now();
-        let boss_forced: Vec<u16> = BOSS_FORCED.try_lock().map(|g| g.clone()).unwrap_or_default();
         // Who claims what: us (slot 0) and each engaged client from its last list.
         let mut claimants: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
         for &n in &ours {
@@ -6107,8 +5996,8 @@ impl Engine {
             // netIds another machine won.
             let mut blocked: Vec<u16> = ours.iter().copied().filter(|n| self.winners.get(n).is_none_or(|&w| w != slot)).collect();
             blocked.extend(self.winners.iter().filter(|&(n, &w)| w != slot && !ours.contains(n)).map(|(&n, _)| n));
-            // The host's forced boss members: the client's list must not keep them either.
-            let blocked = blocked_with_bosses(blocked, &boss_forced);
+            blocked.sort_unstable();
+            blocked.dedup();
             let Some(l) = self.links.get_mut(&id) else { continue };
             let changed = blocked != l.blocked;
             any_change |= changed;
@@ -6122,10 +6011,6 @@ impl Engine {
                 if !l.blocked.is_empty()
                     && let Some((kept, n)) = strip_22(&p, &l.blocked, &l.blocked)
                 {
-                    if !boss_forced.is_empty() {
-                        let nb = list_22(&p).map_or(0, |v| v.iter().filter(|&&x| boss_forced.contains(&((x & 0xFFFF) as u16))).count());
-                        STRIPPED_BOSS.fetch_add(nb as u32, Ordering::Relaxed);
-                    }
                     p = kept;
                     STRIPPED.fetch_add(n as u32, Ordering::Relaxed);
                 }
@@ -6302,10 +6187,6 @@ impl Engine {
             let (cw, cl) = (CONTESTS_WON.swap(0, Ordering::Relaxed), CONTESTS_LOST.swap(0, Ordering::Relaxed));
             let (drops, tc) = (THROW_DROPS.swap(0, Ordering::Relaxed), THROW_CLAIMS.swap(0, Ordering::Relaxed));
             let fskip = FORCES_SKIPPED.swap(0, Ordering::Relaxed);
-            let sb = STRIPPED_BOSS.swap(0, Ordering::Relaxed);
-            if sb > 0 {
-                log::line(&format!("nsession: stripped boss members from the friend's candidates: {sb} (10 s)"));
-            }
             if claims > 0 || pk > 0 || st > 0 || cw + cl + drops + tc + fskip > 0 {
                 log::line(&format!(
                     "nsession: stealth claims (10 s): ours now {claims}; {}; our deathblows claimed {tc}, the friend's throws on them not applied {drops}; forced distributions rate-limited {fskip} (ns_force_distribution {}, ns_throw_claims {}, ns_throw_collide_drop {})",
@@ -6648,6 +6529,7 @@ pub fn shutdown() {
         a.store(0, Ordering::Release);
     }
     ENGAGED_LINKS.store(0, Ordering::Release);
+    own::clear_all();
     if let Some(e) = engine().as_mut() {
         restore_patches(&mut e.applied);
         for l in e.links.values_mut() {
@@ -7397,19 +7279,6 @@ mod tests {
     }
 
     #[test]
-    fn forced_boss_members_leave_the_friends_candidates() {
-        // Blocked set = base plus the host's forced bosses, sorted, no duplicates.
-        let b = blocked_with_bosses(vec![0x900, 0x850], &[0x852, 0x850]);
-        assert_eq!(b, vec![0x850, 0x852, 0x900]);
-        assert_eq!(blocked_with_bosses(Vec::new(), &[]), Vec::<u16>::new());
-        // Even the friend's own prio-0xFFFF entry for a boss goes (blocked is also `won`).
-        let d = encode_22(&[0x850 | 7 << 16, 0x852 | CLAIM_PRIO << 16, 0x700 | 2 << 16]);
-        let (s, removed) = strip_22(&d, &b, &b).unwrap();
-        assert_eq!(removed, 2);
-        assert_eq!(list_22(&s), Some(vec![0x700 | 2 << 16]));
-    }
-
-    #[test]
     fn two_deathblows_at_once_do_not_cancel_each_other() {
         // Live 2026-10-24 host 1792813226 (bytes from the log): the friend's throw 1200 on
         // 0x182e (attacker = the friend, our remote 0xa001 after the rewrite); both players
@@ -7488,201 +7357,6 @@ mod tests {
     }
 
     #[test]
-    fn ownerless_enemies_go_to_exactly_one_machine() {
-        use super::ownfill::{NEAR_M, keep, wanted};
-        // Two players (host 0, client 1), the 7.4 rule. The host / the client asks:
-        let host = |dh: f32, dc: Option<f32>| wanted(0, dh, &[(1, dc)]);
-        let client = |dc: f32, dh: Option<f32>| wanted(1, dc, &[(0, dh)]);
-        // Live 7.4 friend line: 1100237 NetAI 7 m from the friend (client), 394 m from the host.
-        assert!(client(7.0, Some(394.0)));
-        assert!(!host(394.0, Some(7.0)));
-        // Both near: the nearer one; within 5 m of each other the host.
-        for (dh, dc) in [(10.0, 30.0), (30.0, 10.0), (20.0, 22.0), (22.0, 20.0), (20.0, 25.5), (35.0, 35.0), (25.0, 20.0)] {
-            let (h, c) = (host(dh, Some(dc)), client(dc, Some(dh)));
-            assert!(!(h && c), "both take it at host {dh} m / client {dc} m");
-            assert!(h || c || dh.min(dc) > NEAR_M, "nobody takes it at host {dh} m / client {dc} m");
-            assert_eq!(h, dh <= NEAR_M && dh <= dc + 5.0, "host at {dh} / {dc}");
-            assert_eq!(c, dc <= NEAR_M && dc + 5.0 < dh, "client at {dc} / {dh}");
-        }
-        // Too far from both: nobody (the game's own LOD).
-        assert!(!host(60.0, Some(80.0)) && !client(80.0, Some(60.0)));
-        // No position of the other: only the host.
-        assert!(host(10.0, None) && !client(10.0, None));
-        // Hysteresis: a taken enemy stays a little past the rule (host up to 10 m farther,
-        // the client while nearer).
-        assert!(keep(0, 28.0, &[(1, Some(20.0))]) && !host(28.0, Some(20.0)));
-        assert!(!keep(0, 31.0, &[(1, Some(20.0))]));
-        assert!(keep(1, 19.0, &[(0, Some(20.0))]) && !keep(1, 20.0, &[(0, Some(20.0))]));
-        assert!(!keep(0, 55.0, &[(1, Some(70.0))]));
-    }
-
-    #[test]
-    fn ownfill_nearest_player_takes_it_tie_lowest_slot() {
-        use super::ownfill::{conflict_drop, wanted};
-        // Every slot asks with the same distances: exactly one may take it (within 40 m).
-        let takers = |d: &[(u8, f32)]| -> Vec<u8> {
-            d.iter()
-                .filter(|&&(me, dm)| {
-                    let others: Vec<(u8, Option<f32>)> = d.iter().filter(|(s, _)| *s != me).map(|&(s, x)| (s, Some(x))).collect();
-                    wanted(me, dm, &others)
-                })
-                .map(|&(s, _)| s)
-                .collect()
-        };
-        // Clients only: the nearest.
-        assert_eq!(takers(&[(0, 90.0), (1, 12.0), (2, 8.0), (3, 30.0)]), vec![2]);
-        // A tie between clients: the lowest slot.
-        assert_eq!(takers(&[(0, 90.0), (2, 10.0), (3, 10.0), (5, 10.0)]), vec![2]);
-        // The host's 5 m bias: it wins a tie band against every client.
-        assert_eq!(takers(&[(0, 14.0), (1, 10.0), (2, 9.5)]), vec![0]);
-        assert_eq!(takers(&[(0, 15.0), (1, 10.0), (2, 9.9)]), vec![2]);
-        // The 3-player cycle a pairwise rule would have (nobody takes it): one taker here.
-        assert_eq!(takers(&[(0, 10.0), (1, 6.0), (2, 4.0)]).len(), 1);
-        // A grid of distances: never two, never none within range.
-        let ds = [3.0f32, 5.0, 8.0, 10.0, 13.0, 15.0, 20.0, 35.0, 45.0];
-        for &a in &ds {
-            for &b in &ds {
-                for &c in &ds {
-                    let t = takers(&[(0, a), (1, b), (4, c)]);
-                    assert!(t.len() <= 1, "{a} {b} {c}: {t:?}");
-                    assert!(!t.is_empty() || a.min(b).min(c) > 40.0, "{a} {b} {c}: nobody");
-                }
-            }
-        }
-        // A client without the host's position never takes one; an unknown client does not compete.
-        assert!(!wanted(2, 5.0, &[(0, None), (1, Some(30.0))]));
-        assert!(wanted(0, 5.0, &[(1, None), (2, Some(30.0))]));
-        assert!(wanted(1, 5.0, &[(0, Some(30.0)), (2, None)]));
-        // Conflicts: a lower slot also owns it = we drop at once; we are the lowest = after 3 s.
-        assert!(conflict_drop(2, &[1], Duration::ZERO, false));
-        // v8.30b: the host yields a non-boss at once; a boss keeps the old rule.
-        assert!(conflict_drop(0, &[1], Duration::ZERO, false));
-        assert!(!conflict_drop(0, &[1], Duration::ZERO, true));
-        assert!(!conflict_drop(0, &[], Duration::ZERO, false));
-        assert!(!conflict_drop(1, &[2, 3], Duration::from_secs(1), false));
-        assert!(conflict_drop(1, &[2, 3], Duration::from_secs(3), false));
-        assert!(!conflict_drop(0, &[1], Duration::from_secs(2), true) && conflict_drop(1, &[0], Duration::ZERO, false));
-    }
-
-    #[test]
-    fn a_dead_spectating_host_leaves_the_boss_to_the_living_friend() {
-        use super::ownfill::{boss_rivals, keep_boss, wanted_boss};
-        // Live 2026-10-27 Divine Dragon: host dead 50 m from the dragon, the friend 40 m.
-        let host_near = [(0u8, Some(50.0f32))];
-        assert!(!wanted_boss(1, 40.0, &host_near));
-        // Host down (EV_DOWN, bit 0): it no longer counts, the friend takes and keeps the boss.
-        let rivals = boss_rivals(&host_near, 1);
-        assert!(rivals.is_empty());
-        assert!(wanted_boss(1, 40.0, &rivals) && keep_boss(1, 40.0, &rivals));
-        // v8.57: at the dragon's fighting range (the friend was 84 m away) too, not beyond 150 m.
-        assert!(wanted_boss(1, 84.0, &rivals) && keep_boss(1, 160.0, &rivals));
-        assert!(!wanted_boss(1, 151.0, &rivals) && !keep_boss(1, 171.0, &rivals));
-        // The host still listed (alive, 50 m): the client keeps the old 40 m rule.
-        assert!(!wanted_boss(1, 84.0, &[(0, Some(400.0))]));
-        // Back on its feet (bit cleared): the host's rule again, the friend lets it go.
-        assert_eq!(boss_rivals(&host_near, 0), host_near.to_vec());
-        assert!(!keep_boss(1, 40.0, &boss_rivals(&host_near, 0)));
-        // 3 players: only the down one drops out.
-        let three = [(0u8, Some(50.0f32)), (2, Some(10.0))];
-        assert_eq!(boss_rivals(&three, 0b100), vec![(0, Some(50.0))]);
-        assert_eq!(boss_rivals(&three, 0b001), vec![(2, Some(10.0))]);
-    }
-
-    #[test]
-    fn a_boss_is_the_hosts_not_the_nearest_players() {
-        use super::ownfill::{keep_boss, wanted_boss};
-        // The client stands 2 m from the boss and the host 16 m: the nearest-player rule would
-        // give it to the client; a boss stays with the host.
-        assert!(wanted_boss(0, 16.0, &[(1, Some(2.0))]));
-        assert!(!wanted_boss(1, 2.0, &[(0, Some(16.0))]));
-        assert!(keep_boss(0, 100.0, &[(1, Some(2.0))]));
-        assert!(!keep_boss(1, 2.0, &[(0, Some(16.0))]));
-        // The host far away (another area) or unknown: the client only with a known far host.
-        assert!(wanted_boss(1, 20.0, &[(0, Some(400.0))]));
-        assert!(!wanted_boss(1, 20.0, &[(0, None)]));
-        assert!(keep_boss(1, 30.0, &[(0, Some(400.0))]));
-        assert!(!keep_boss(1, 30.0, &[(0, Some(125.0))]));
-        // Too far from the boss for anybody to take it.
-        assert!(!wanted_boss(0, 200.0, &[]));
-    }
-
-    #[test]
-    fn a_host_boss_is_not_dropped_on_a_native_owner_answer() {
-        use super::ownfill::drop_on_native;
-        assert!(!drop_on_native(0, true, false));
-        assert!(drop_on_native(0, false, false));
-        assert!(drop_on_native(1, true, false));
-        assert!(drop_on_native(1, false, false));
-    }
-
-    /// test6, live 2026-11-12 (miniboss 1500490): with the host down the client kept dropping
-    /// and re-taking the boss on the game's flapping answer. While a rival is down the living
-    /// player's machine keeps a boss; ordinary enemies and the rival's return are unchanged.
-    #[test]
-    fn a_boss_stays_with_the_living_player_while_a_rival_is_down() {
-        use super::ownfill::{drop_on_native, rival_down};
-        assert!(!drop_on_native(1, true, true));
-        assert!(!drop_on_native(0, true, true));
-        assert!(drop_on_native(1, false, true), "ordinary enemies follow the game's answer");
-        assert!(drop_on_native(1, true, false), "rival back: as before");
-        // down bits per slot (world.rs down_slots): host (0) down, seen from the client.
-        assert!(rival_down([0u8], 0b1));
-        assert!(!rival_down([0u8], 0b10));
-        assert!(rival_down([0u8, 2], 0b100));
-        assert!(!rival_down([], 0b1), "nobody engaged");
-        assert!(!rival_down([40u8], u32::MAX), "out-of-range slot never counts");
-    }
-
-    /// Review (test6 final): take -> conflict drop -> re-take while the rival stays down arms
-    /// the fresh-take veto once; the next episode (rival back, then down again) arms it again.
-    #[test]
-    fn fresh_take_veto_arms_once_per_rival_down_episode() {
-        use super::ownfill::arm_take_veto;
-        let mut armed = std::collections::HashSet::new();
-        assert!(!arm_take_veto(&mut armed, false, Some(7)), "no rival down: never");
-        assert!(!arm_take_veto(&mut armed, true, None), "bookkeeping only");
-        assert!(arm_take_veto(&mut armed, true, Some(7)), "first take");
-        assert!(!arm_take_veto(&mut armed, true, None));
-        assert!(!arm_take_veto(&mut armed, true, Some(7)), "re-take, same episode");
-        assert!(!arm_take_veto(&mut armed, true, Some(7)), "and again");
-        assert!(arm_take_veto(&mut armed, true, Some(8)), "another boss: its own");
-        assert!(!arm_take_veto(&mut armed, false, None), "rival back: episode over");
-        assert!(armed.is_empty());
-        assert!(arm_take_veto(&mut armed, true, Some(7)), "new episode");
-    }
-
-    #[test]
-    fn ownfill_hysteresis_no_flapping_at_the_threshold() {
-        use super::ownfill::{GIVE_BACK_AFTER, give_back_due, keep, wanted};
-        // Alternating 39 / 41 m (250 ms steps, 10 s): taken once, never given back.
-        let (mut held, mut beyond, mut transfers) = (false, None::<Duration>, 0u32);
-        for i in 0..40u32 {
-            let d = if i % 2 == 0 { 39.0 } else { 41.0 };
-            let others = [(1u8, Some(100.0f32))];
-            if held {
-                if keep(0, d, &others) {
-                    beyond = None;
-                } else {
-                    let b = beyond.unwrap_or(Duration::ZERO) + Duration::from_millis(250);
-                    beyond = Some(b);
-                    if give_back_due(beyond) {
-                        held = false;
-                        transfers += 1;
-                    }
-                }
-            } else if wanted(0, d, &others) {
-                held = true;
-                transfers += 1;
-            }
-        }
-        assert!(transfers <= 1, "{transfers} transfers");
-        // Beyond 48 m only counts after 5 s without a break.
-        assert!(!keep(0, 49.0, &[(1, Some(100.0))]) && keep(0, 47.0, &[(1, Some(100.0))]));
-        assert!(!give_back_due(None) && !give_back_due(Some(Duration::from_millis(4750))));
-        assert!(give_back_due(Some(GIVE_BACK_AFTER)));
-    }
-
-    #[test]
     fn double_claim_host_wins() {
         let s = |m| Duration::from_millis(m);
         // Client claims, the host owns too for 2.5 s: the client drops.
@@ -7715,7 +7389,7 @@ mod tests {
     }
 
     #[test]
-    fn world_pause_hands_enemies_on_and_back() {
+    fn world_pause_begins_after_1_5_s_and_ends_when_it_runs() {
         // Stalled time grows 100 ms per tick; a pause begins at 1.5 s, ends when it runs.
         let mut p = PauseTracker::default();
         let mut began = None;
@@ -7726,17 +7400,6 @@ mod tests {
         }
         assert_eq!(began, Some(1500));
         assert!(p.active);
-        // Our enemies near the friend (client slot 1, 20 m) go to it; the far one stays; the
-        // paused marker sorts last and is recognised.
-        let owned = [(0x10u16, [0.0f32, 0.0, 0.0]), (0x20, [30.0, 0.0, 0.0]), (0x30, [300.0, 0.0, 0.0])];
-        let peers = [(1u8, Some([20.0f32, 0.0, 0.0]))];
-        assert_eq!(handover_targets(&owned, &peers), vec![(0x10, 1), (0x20, 1)]);
-        // With two peers the nearer one takes it.
-        let peers2 = [(1u8, Some([20.0f32, 0.0, 0.0])), (2, Some([-3.0f32, 0.0, 0.0]))];
-        assert_eq!(handover_targets(&owned[..1], &peers2), vec![(0x10, 2)]);
-        let mut ids = vec![0x10u16, 0x20, OWNED_PAUSED_MARK];
-        ids.sort_unstable();
-        assert!(owned_is_paused(&ids) && !owned_is_paused(&[0x10, 0x20]));
         // Resumed: ends at once; a short stall (menu flicker < 1.5 s) never begins one.
         assert_eq!(p.step(Duration::from_millis(100)), PauseStep::End);
         assert!(!p.active);
@@ -7745,17 +7408,20 @@ mod tests {
     }
 
     #[test]
-    fn ownfill_bits_set_and_clear() {
-        use super::ownfill::{clear_all, forced, set};
-        clear_all();
-        assert!(!forced(0x87b));
-        set(0x87b, true);
-        set(0x1036, true);
-        assert!(forced(0x87b) && forced(0x1036) && !forced(0x87c));
-        set(0x87b, false);
-        assert!(!forced(0x87b) && forced(0x1036));
-        clear_all();
-        assert!(!forced(0x1036));
+    fn owner_table_answers_only_while_active() {
+        use crate::ownership::NOBODY;
+        own::clear_all();
+        assert_eq!(table_owner(0x87b), None, "off: the game answers");
+        own::set(0x87b, 0);
+        own::set(0x1036, 2);
+        assert_eq!(table_owner(0x87b), None);
+        own::activate();
+        assert_eq!((table_owner(0x87b), table_owner(0x1036), table_owner(0x87c)), (Some(0), Some(2), Some(NOBODY)));
+        own::set(0x87b, NOBODY);
+        assert_eq!(table_owner(0x87b), Some(NOBODY));
+        own::clear_all();
+        assert_eq!(table_owner(0x1036), None);
+        assert_eq!(own::owner(0x1036), NOBODY);
     }
 
     #[test]
@@ -8310,7 +7976,7 @@ mod throw_probe {
         };
         let entity = chr.entity_id().unwrap_or(-1);
         let owned = owned_here(defender);
-        let forced = ownfill::forced(defender);
+        let table = table_owner(defender).map_or("off".to_string(), crate::ownership::who);
         let posture = crate::game::read_ptr(chr.0 + 0x1FF8)
             .and_then(|m| crate::game::read_ptr(m + 0x18))
             .and_then(|d| crate::game::read::<i32>(d + 0x148))
@@ -8318,10 +7984,10 @@ mod throw_probe {
         let ai = super::aiview::describe(chr.0);
         match crate::livesync::read_data(chr) {
             Some((_, hp, max_hp, max_posture, lives)) => format!(
-                "entity {entity} hp {hp}/{max_hp} lives {lives} (of {}) posture {posture}/{max_posture} owned here {owned} forced {forced}; {ai}",
+                "entity {entity} hp {hp}/{max_hp} lives {lives} (of {}) posture {posture}/{max_posture} owned here {owned} table owner {table}; {ai}",
                 crate::livesync::lives0_of(chr)
             ),
-            None => format!("entity {entity} (data unreadable) posture {posture} owned here {owned} forced {forced}; {ai}"),
+            None => format!("entity {entity} (data unreadable) posture {posture} owned here {owned} table owner {table}; {ai}"),
         }
     }
 

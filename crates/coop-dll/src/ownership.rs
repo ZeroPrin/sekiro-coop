@@ -429,11 +429,6 @@ pub struct HostTable {
 }
 
 impl HostTable {
-    /// Rows go (a new engagement starts clean); `seq` keeps counting.
-    pub fn clear(&mut self) {
-        self.rows.clear();
-    }
-
     /// One decision tick. `claims` = (slot, its claimed netIds); `acked` / `engaged` as in
     /// `publish_step`.
     pub fn tick(&mut self, seen: &[Seen], claims: &[(u8, Vec<u16>)], acked: impl Fn(u8) -> u32, engaged: impl Fn(u8) -> bool, now: u64) -> TickOut {
@@ -498,6 +493,11 @@ impl HostTable {
     /// Entries waiting for a release ack.
     pub fn waiting(&self) -> usize {
         self.rows.values().filter(|r| r.publ.wait.is_some()).count()
+    }
+
+    /// An entry has waited for `slot`'s release ack past `ACK_RESEND_MS`.
+    pub fn wait_overdue(&self, slot: u8, now: u64) -> bool {
+        self.rows.values().any(|r| r.publ.wait.is_some_and(|w| w.0 == slot) && resend_due(&r.publ, now))
     }
 
     /// The seq of the last publication of `net` (0 = none).
@@ -614,10 +614,6 @@ impl DoubleWatch {
 
     pub fn forget(&mut self, slot: u8) {
         self.prev.remove(&slot);
-    }
-
-    pub fn clear(&mut self) {
-        self.prev.clear();
     }
 }
 
