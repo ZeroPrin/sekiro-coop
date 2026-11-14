@@ -331,7 +331,7 @@ Net about −1,900 lines. D1–D5 are each a separate later commit with a pure, 
 2. **Group fight, both near.** `ownerless-near 0`, `doubles 0`, few `FLAP`.
 3. **Client goes 40 m ahead into a new group.** The enemies fight on both screens. The host's summary shows peer1 owning them within about 8 s, and `SLOW` lines if slower.
 4. **Posture deathblow on an enemy the other machine owns** (host, then client).
-   - Multi-life: `hit: lives byte ...` on the owner and one orb gone on both.
+   - Multi-life: one orb gone on both. On the owner the received type 18 takes the life and the byte is skipped (`hit: lives byte ... skipped: a deathblow on it applies here ...`, review 2026-11-15: applying it too took two lives); on the owner's own deathblow the non-owner logs `hit: lives byte ... lowered and refilled before the hit`.
    - TRACE: `owned elsewhere ... outcome life lost`, no stand-up.
    - Single-life: `outcome died`.
 5. **Both press deathblow together.** One animation. `dblock` collision lines as in §39.

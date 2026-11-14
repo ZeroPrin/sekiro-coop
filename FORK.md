@@ -59,10 +59,15 @@ on both sides. Nothing in this list needs a setting.
    feels its deflects land late on enemies right next to it while the host is far away, look for
    `own: SLOW 0x.. eE peer1 nearer by D m for T s, still the host's (...)`.
 4. **Posture deathblow on an enemy the other PC runs** (host does one, then the client).
-   - A miniboss with two lives (two red dots): after the deathblow one dot is gone on BOTH screens
-     and it does not stand up with the old dot. The PC that runs it logs `hit: lives byte 1 for
-     0x.. eE (ours 2): lowered and refilled before the hit`. The attacker logs `deathblow: TRACE
-     0x.. eE owned elsewhere, lives 2->1 ..., outcome life lost`.
+   - A miniboss with two lives (two red dots): after the deathblow exactly one dot is gone on BOTH
+     screens, it does not stand up with the old dot and it does not die from one deathblow. The PC
+     that runs it takes the life through the deathblow itself and logs `hit: lives byte 1 for 0x..
+     eE (ours 2) skipped: a deathblow on it applies here and takes the life itself` and
+     `deathblow: TRACE peer N's throw on 0x.. eE (owned here), lives 2->1 ...`. The attacker logs
+     `deathblow: TRACE 0x.. eE owned elsewhere, lives 2->1 ..., outcome life lost`.
+   - The PC that runs it does the deathblow: the other PC logs `hit: lives byte 1 for 0x.. eE
+     (ours 2): lowered and refilled before the hit` and `deathblow: TRACE peer N's throw on 0x..
+     eE (owned elsewhere) ... (lives byte applied 1)`.
    - An ordinary enemy: it dies on both screens; TRACE `outcome died`.
    - Any TRACE `outcome stood up` after a real deathblow animation is the bug to report.
 5. **Both press deathblow on the same enemy at once.** Only one deathblow animation plays. The
