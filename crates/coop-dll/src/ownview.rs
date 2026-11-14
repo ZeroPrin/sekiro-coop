@@ -268,9 +268,41 @@ pub fn entries_22(payload: &[u8]) -> HashMap<u16, u16> {
         .collect()
 }
 
+/// Per-enemy reads (position, which manipulator runs) every observation only within this
+/// many metres of a player (covers every distance rule above: 40 m / 10 m) and for bosses /
+/// multi-life enemies; farther ones are re-read every `FAR_REFRESH_MS` (= one OwnView round,
+/// so the two-report rule still sees each of them fresh once per report).
+pub const READ_NEAR_M: f32 = 60.0;
+pub const FAR_REFRESH_MS: u64 = 2000;
+
+/// Pure: read this enemy's position / running flag now? `last` = (ms of its last read, its
+/// distance to the nearest player then; None = position unknown). A new enemy, a boss, a
+/// near one or an unknown position: every time; a far one once per `FAR_REFRESH_MS`.
+pub fn read_due(boss: bool, last: Option<(u64, Option<f32>)>, ms: u64) -> bool {
+    match last {
+        None => true,
+        Some(_) if boss => true,
+        Some((_, d)) if d.is_none_or(|d| d <= READ_NEAR_M) => true,
+        Some((at, _)) => ms.saturating_sub(at) >= FAR_REFRESH_MS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn far_enemies_are_read_once_per_report_round() {
+        assert!(read_due(false, None, 0), "first sight");
+        assert!(read_due(true, Some((0, Some(500.0))), 10), "a boss always");
+        assert!(read_due(false, Some((0, Some(59.0))), 10), "near");
+        assert!(read_due(false, Some((0, None)), 10), "position unknown");
+        assert!(!read_due(false, Some((0, Some(80.0))), 250));
+        assert!(!read_due(false, Some((0, Some(80.0))), FAR_REFRESH_MS - 1));
+        assert!(read_due(false, Some((0, Some(80.0))), FAR_REFRESH_MS));
+        // Every distance rule of the detectors lies inside the always-read radius.
+        assert!(NEAR_M <= READ_NEAR_M && SLOW_NEAR_M <= READ_NEAR_M);
+    }
 
     fn snap(at_ms: u64, running: &[(u16, u8)], near: &[(u16, f32)]) -> Snapshot {
         Snapshot { at_ms, running: running.iter().copied().collect(), near: near.iter().copied().collect() }

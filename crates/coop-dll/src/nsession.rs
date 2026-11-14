@@ -2811,7 +2811,22 @@ mod ownlog {
         pub running: bool,
         /// The game's `IsOwnedHere` answer.
         pub here: bool,
+        /// A boss or multi-life enemy (`is_boss`, from livesync's scan when it ran).
+        pub boss: bool,
     }
+
+    /// One enemy's last per-enemy read (`ov::read_due`): the chr it was read on, when, the
+    /// position, its distance to the nearest player then, and whether its own AI ran here.
+    struct Cached {
+        chr: usize,
+        at_ms: u64,
+        pos: Option<[f32; 3]>,
+        dist: Option<f32>,
+        running: bool,
+    }
+
+    /// livesync's scan is reused while at most this old (it runs every 150 ms).
+    const SCAN_MAX_AGE: Duration = Duration::from_millis(500);
 
     #[derive(Default)]
     pub struct State {
@@ -2819,6 +2834,8 @@ mod ownlog {
         flaps: ov::Flaps,
         two: ov::TwoReports,
         observe_at: Option<Instant>,
+        /// Per-enemy reads, kept between observations (`ov::read_due`).
+        cache: HashMap<u16, Cached>,
         // --- host ---
         /// Each client's latest OwnView (arrival ms, running netIds).
         views: [Option<(u64, BTreeSet<u16>)>; SLOTS],
@@ -2966,7 +2983,13 @@ mod ownlog {
             }
             if self.observe_at.is_none_or(|t| t.elapsed() >= OBSERVE_EVERY) {
                 self.observe_at = Some(Instant::now());
-                let seen = self.observe(ms, clients);
+                let players: Vec<[f32; 3]> = f
+                    .player
+                    .position()
+                    .into_iter()
+                    .chain(f.peers.iter().filter_map(|p| p.native.and_then(|c| c.position()).or(p.view.map(|v| v.0))))
+                    .collect();
+                let seen = self.observe(ms, clients, &players);
                 if host {
                     self.host_checks(f, &seen, clients, ms);
                 } else {
@@ -2980,18 +3003,42 @@ mod ownlog {
         }
 
         /// Native answers of every alive enemy: BOSS / FLAP lines, `boss_taken` on 0 -> 1.
-        fn observe(&mut self, ms: u64, clients: &[u8]) -> Vec<Seen> {
+        /// Cost (v8.61 lesson: per-enemy ReadProcessMemory adds up): the enemy list, netIds,
+        /// HP and the boss class come from livesync's last scan (no reads here; it runs at
+        /// ~7 Hz anyway); `owned_here` is a direct game call (no read). Position (3 reads) and
+        /// the running manipulator (2-3 reads) are read each time only for enemies within
+        /// `ov::READ_NEAR_M` of a player and for bosses; farther ones once per
+        /// `ov::FAR_REFRESH_MS` from the cache. Without a fresh livesync scan (livesync off):
+        /// the old full walk.
+        fn observe(&mut self, ms: u64, clients: &[u8], players: &[[f32; 3]]) -> Vec<Seen> {
+            let scan: Vec<crate::livesync::Scanned> = match crate::livesync::last_scan(SCAN_MAX_AGE) {
+                Some(s) => s,
+                None => enemies()
+                    .into_iter()
+                    .filter_map(|c| {
+                        let n = netai::net_id(c)?;
+                        Some(crate::livesync::Scanned { n, chr: c.0, hp: c.hp().unwrap_or(0), boss: is_boss(c) })
+                    })
+                    .collect(),
+            };
+            let nearest = |p: Option<[f32; 3]>| p.and_then(|p| players.iter().map(|&q| crate::game::distance(p, q)).min_by(f32::total_cmp));
             let mut out = Vec::new();
             let mut dup = HashSet::new();
-            for c in enemies() {
-                let Some(n) = netai::net_id(c) else { continue };
-                if !alive(c) || !dup.insert(n) {
+            for s in scan {
+                let (n, c, boss) = (s.n, Chr(s.chr), s.boss);
+                if s.hp <= 0 || !dup.insert(n) {
                     continue;
                 }
+                let last = self.cache.get(&n).filter(|k| k.chr == s.chr).map(|k| (k.at_ms, k.dist));
+                if ov::read_due(boss, last, ms) {
+                    let pos = c.position();
+                    let running = netai::active_kind(c) == 1;
+                    self.cache.insert(n, Cached { chr: s.chr, at_ms: ms, pos, dist: nearest(pos), running });
+                }
+                let Some((pos, running)) = self.cache.get(&n).map(|k| (k.pos, k.running)) else { continue };
                 let here = owned_here(n);
                 let change = self.watch.observe(n, here);
                 if change != Change::Same {
-                    let boss = is_boss(c);
                     let e = c.entity_id().unwrap_or(-1);
                     if boss {
                         log::line(&format!(
@@ -3018,8 +3065,10 @@ mod ownlog {
                         }
                     }
                 }
-                out.push(Seen { n, c, pos: c.position(), running: netai::active_kind(c) == 1, here });
+                out.push(Seen { n, c, pos, running, here, boss });
             }
+            // Enemies gone (unloaded / dead) leave the cache.
+            self.cache.retain(|n, _| dup.contains(n));
             self.flaps.prune(ms);
             out
         }
@@ -3072,7 +3121,7 @@ mod ownlog {
                     log::line(&format!(
                         "own: OWNER-DOWN {} enemies ({} bosses) owned on a dead/spectating machine ({}) within {} m of the living player for {:.0} s",
                         near.len(),
-                        near.iter().filter(|e| is_boss(e.c)).count(),
+                        near.iter().filter(|e| e.boss).count(),
                         ov::who(s),
                         ov::NEAR_M,
                         held as f32 / 1000.0
@@ -3946,7 +3995,8 @@ pub(crate) mod dblock {
     // --- Fresh-take veto (test6) -------------------------------------------------------
 
     /// After a boss moves here from another machine (test14: the game's own 23 hands it over,
-    /// `boss_watch`; test11: the owner table; before: ownfill while another player waited dead), its AI starts
+    /// seen by `ownlog`'s observation; test11: the owner table; before: ownfill while another
+    /// player waited dead), its AI starts
     /// fresh here (live 2026-11-12: retaken at 21:02:18, a stealth deathblow, throw 59972, at
     /// 21:02:19 with 73 % HP and posture not broken). For this long our player's STEALTH
     /// deathblows on it are refused at the gate unless the boss is open to one (`take_vetoed`);
@@ -3978,8 +4028,8 @@ pub(crate) mod dblock {
         word != 0 && (word >> 48) as u16 == net && word & UNTIL_MASK > now
     }
 
-    /// `Engine::boss_watch`: boss `n` (entity `entity`) became ours from another machine (native
-    /// assignment of an engagement).
+    /// `ownlog` (`State::observe`, the native answer 0 -> 1 after the first sight): boss `n`
+    /// (entity `entity`) became ours from another machine.
     pub fn boss_taken(n: u16, entity: i32) {
         let now = crate::game::now_ms();
         let w = take_word(n, now + TAKE_VETO_MS);
