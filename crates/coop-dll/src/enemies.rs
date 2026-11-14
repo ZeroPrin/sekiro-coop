@@ -1609,7 +1609,7 @@ impl Enemies {
     }
 
     /// Native session (both roles): enemies we approach for a stealth / plunging
-    /// deathblow are claimed through the game's own ownership candidates (type 22,
+    /// deathblow are claimed as requests to the host's owner table (test11; before: type 22,
     /// nsession.rs `set_stealth_claims`), so they run on our AI like offline.
     fn stealth_claims(&mut self, player: Chr, others: &[[f32; 3]]) {
         let now = Instant::now();
@@ -1668,7 +1668,7 @@ impl Enemies {
                     if self.claim_logs < 40 {
                         self.claim_logs += 1;
                         log::line(&format!(
-                            "stealth: claiming enemy {id} (netId {net_id:#x}, {why}, height {dy:+.1} m) through the game's ownership list"
+                            "stealth: claiming enemy {id} (netId {net_id:#x}, {why}, height {dy:+.1} m): a request to the host's owner table"
                         ));
                     }
                 }

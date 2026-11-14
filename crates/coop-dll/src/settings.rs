@@ -465,11 +465,9 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     items::FIX_UNLOCKS.store(ini.flag("fix_debug_item_unlocks", true, warn), Relaxed);
     crate::audit::ENABLED.store(ini.flag("audit", true, warn), Relaxed);
     crate::audit::EVERY_S.store(ini.num("audit_every_s", 180, 30, 3600, warn), Relaxed);
-    // v7.8 bisect switches for the v7.7 behaviours (live 2026-10-24: input lock at join,
-    // fps drops, posture not reset after a deathblow). 0 = the v7.6 behaviour.
-    // v7.9: forced distribution back on by default (deflect timing was off without it).
-    crate::nsession::FORCE_DISTRIBUTION.store(ini.flag("ns_force_distribution", true, warn), Relaxed);
-    crate::nsession::THROW_CLAIMS_ON.store(ini.flag("ns_throw_claims", false, warn), Relaxed);
+    // v7.8 bisect switch for a v7.7 behaviour (live 2026-10-24). 0 = the v7.6 behaviour.
+    // test11: `ns_force_distribution` and `ns_throw_claims` are gone (the host's owner table
+    // decides; an old ini's keys are ignored).
     crate::nsession::THROW_COLLIDE_DROP.store(ini.flag("ns_throw_collide_drop", false, warn), Relaxed);
     crate::puppet::SCALE_ALL_LOADED.store(ini.flag("scale_all_loaded", false, warn), Relaxed);
     crate::posture::REST_GUARD.store(ini.flag("posture_rest_guard", true, warn), Relaxed);
@@ -972,11 +970,7 @@ ai_retarget = 1
 ; slows other players' characters down with distance: the friend stuttered beyond ~10 m).
 ; 0 = the game's rule (every frame only while you spectate). Enemies are not affected.
 remote_every_frame = 1
-; v7.7 behaviours, switchable for testing (0 = as in v7.6). Same value on both machines.
-; Claims / contests force the game's ownership hand-out at once (max once per second).
-ns_force_distribution = 1
-; Our deathblow claims its enemy for 4 s (it runs on our AI).
-ns_throw_claims = 0
+; v7.7 behaviour, switchable for testing (0 = as in v7.6). Same value on both machines.
 ; The friend's deathblow on an enemy ours is deathblowing is not applied here.
 ns_throw_collide_drop = 0
 ; 2-player scaling over every loaded enemy each second (0 = the 45 s scan list).

@@ -1694,197 +1694,46 @@ fn serve(t: u32, buf: *mut u8, cap: u32) -> i32 {
     0
 }
 
-// --- Stealth ownership claims (IMPLEMENTATION-NOTES §27) ---------------------------
+// --- Stealth ownership claims (IMPLEMENTATION-NOTES §27; test11: requests to the host) ---
 //
-// Type 22 is the client's ownership candidate list `{i32 n; u32 (netId | prio << 16)[n]}`
-// (`0xA1CED0` builds and sends it from `T+0x380..0x388`). The host keeps one list per
-// player (`0xA1D7E0` / `0xA1C6C0`) and settles each netId between every pair of players
-// in `0xA1C590` [VAR, N-generic: IDA §5.1c]: a player keeps a netId when the other
-// player's prio for it is 0, or lower, or equal with fewer candidates in total; the
-// loser's entry is removed (`0xA1B700`). Owner lists (23) are built from what is left
-// (`0xA1DD00`). Higher prio wins. So the game's own way to ask for an enemy is a high
-// prio in 22: a client gives the enemies it sneaks up on prio 0xFFFF; the host drops its
-// clients' entries for enemies the host sneaks up on (unless they claim them too).
-// enemies.rs decides the claims.
+// enemies.rs decides which enemies our player sneaks up on (behind / above / hang / cover in
+// the stealth window); they run on our AI for the deathblow. Since test11 a claim is a
+// request: a client sends its set to the host (`Claims`), the host's own set is read here,
+// and the host's owner table grants it unless the enemy is a boss or another player stands
+// within 20 m of it (`ownership::claim_refusal`). The old ways (prio 0xFFFF in our type 22,
+// host contests, stripping, `ns_throw_claims`) are gone: the game's 22 / 23 result is
+// ignored for enemies now.
 
 /// netIds we claim for a stealth / plunging deathblow (enemies.rs `stealth_claims`).
 static CLAIMS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
-/// Claims a client gave up because the host owns the enemy too (`double_claim_drop`).
-static DROPPED_CLAIMS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
-static CLAIM_PACKETS: AtomicU32 = AtomicU32::new(0);
-static CLAIM_ENTRIES: AtomicU32 = AtomicU32::new(0);
-static STRIPPED: AtomicU32 = AtomicU32::new(0);
-pub const CLAIM_PRIO: u32 = 0xFFFF;
+/// The claims changed since the owner table last read them (client: a Claims goes out; host:
+/// it decides at once).
+static CLAIMS_DIRTY: AtomicBool = AtomicBool::new(false);
 
-pub fn set_stealth_claims(ids: Vec<u16>) {
+pub fn set_stealth_claims(mut ids: Vec<u16>) {
+    ids.sort_unstable();
+    ids.dedup();
     if let Ok(mut g) = CLAIMS.lock() {
-        if ids.iter().any(|n| !g.contains(n)) {
-            CLAIMS_GREW.store(true, Ordering::Relaxed);
+        if *g != ids {
+            CLAIMS_DIRTY.store(true, Ordering::Relaxed);
         }
         *g = ids;
     }
 }
 
-/// A claim was added (stealth approach or our player's throw): the client sends its
-/// candidates on the next update, the host settles them again at once (instead of the
-/// game's 5 s / 3 s timers; live 2026-10-24 a host claim took up to 3 s, §34).
-static CLAIMS_GREW: AtomicBool = AtomicBool::new(false);
+/// Our claims now (sorted) and whether they changed since the last call.
+fn take_claims() -> (Vec<u16>, bool) {
+    let dirty = CLAIMS_DIRTY.swap(false, Ordering::Relaxed);
+    (CLAIMS.lock().map(|c| c.clone()).unwrap_or_default(), dirty)
+}
 
-// v7.7 behaviours behind ini keys (live 2026-10-24 bisect: fps drops / posture not
-// reset after a deathblow since v7.7). Default off = the v7.6 behaviour.
-/// `[NETWORK] ns_force_distribution`: a claim / contest change forces the game's 22 / 23
-/// on the next update and re-feeds the friend's last 22 (v7.7, §34). Off: the game's own
-/// 3 s / 5 s timers (v7.6). On: at most once per `FORCE_MIN_GAP`.
-pub static FORCE_DISTRIBUTION: AtomicBool = AtomicBool::new(false);
-/// `[NETWORK] ns_throw_claims`: our player's throw claims its defender for
-/// `THROW_CLAIM_MS` (ownership moves to us mid-deathblow, v7.7). Off: v7.6.
-pub static THROW_CLAIMS_ON: AtomicBool = AtomicBool::new(false);
 /// `[NETWORK] ns_throw_collide_drop`: the friend's throw on an enemy our player is
 /// deathblowing is not applied here (v7.7). Off: every friend's throw is applied (v7.6).
 pub static THROW_COLLIDE_DROP: AtomicBool = AtomicBool::new(false);
-const FORCE_MIN_GAP_MS: u64 = 1000;
-static FORCED_AT_MS: AtomicU64 = AtomicU64::new(0);
-static FORCES_SKIPPED: AtomicU32 = AtomicU32::new(0);
-
-/// `make_due` for the v7.7 forced distributions: only with `ns_force_distribution = 1`,
-/// at most once per second.
-fn force_due(off: usize) -> bool {
-    if !FORCE_DISTRIBUTION.load(Ordering::Relaxed) {
-        return false;
-    }
-    let now = crate::game::now_ms();
-    let last = FORCED_AT_MS.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < FORCE_MIN_GAP_MS {
-        FORCES_SKIPPED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    FORCED_AT_MS.store(now, Ordering::Relaxed);
-    make_due(off)
-}
-static CONTESTS_WON: AtomicU32 = AtomicU32::new(0);
-static CONTESTS_LOST: AtomicU32 = AtomicU32::new(0);
-static THROW_CLAIMS: AtomicU32 = AtomicU32::new(0);
-
-/// Everything we claim now: the stealth claims (enemies.rs) and the enemies our own
-/// player started a throw on in the last `THROW_CLAIM_MS` (the deathblow runs on our AI).
-fn claims_now() -> Vec<u16> {
-    let dropped = DROPPED_CLAIMS.try_lock().map(|d| d.clone()).unwrap_or_default();
-    let mut v = claims_raw();
-    v.retain(|n| !dropped.contains(n));
-    v
-}
-
-/// Every claim we would make, the ones dropped for a double claim included.
-fn claims_raw() -> Vec<u16> {
-    let mut v = CLAIMS.try_lock().map(|c| c.clone()).unwrap_or_default();
-    if !THROW_CLAIMS_ON.load(Ordering::Relaxed) {
-        return v;
-    }
-    if let Ok(g) = THROWS.try_lock() {
-        for n in our_throw_targets(&g[..], crate::game::now_ms(), THROW_CLAIM_MS) {
-            if enemy_net_id(n) && !v.contains(&n) {
-                v.push(n);
-            }
-        }
-    }
-    v
-}
-
-/// The netIds the friend claims (prio `CLAIM_PRIO`) in its candidate list.
-fn claimed_in_22(d: &[u8]) -> Vec<u16> {
-    let mut v: Vec<u16> =
-        list_22(d).unwrap_or_default().into_iter().filter(|x| x >> 16 == CLAIM_PRIO).map(|x| (x & 0xFFFF) as u16).collect();
-    v.sort_unstable();
-    v.dedup();
-    v
-}
-
-/// Host: both machines claim one enemy. Who runs it: a player throw (deathblow) decides
-/// first (the earlier one, the host on the same moment); else the nearer player
-/// (horizontal metres to the enemy) with `CONTEST_HYST_M` in favour of the current
-/// holder (`held` = the host won it last time). Live 2026-10-24: the friend's prio-0xFFFF
-/// claim beat every host claim, so the friend owned the miniboss 1120300 for the whole
-/// fight and the host deathblowed a NetAI copy.
-fn host_wins_contest(ours_age: Option<u64>, theirs_age: Option<u64>, d_host: Option<f32>, d_friend: Option<f32>, held: bool) -> bool {
-    match (ours_age, theirs_age) {
-        (Some(a), Some(b)) => return a >= b,
-        (Some(_), None) => return true,
-        (None, Some(_)) => return false,
-        (None, None) => {}
-    }
-    match (d_host, d_friend) {
-        (Some(h), Some(f)) => {
-            if held {
-                h <= f + CONTEST_HYST_M
-            } else {
-                h + CONTEST_HYST_M < f
-            }
-        }
-        (Some(_), None) => true,
-        _ => held,
-    }
-}
-
-const CONTEST_HYST_M: f32 = 1.5;
 
 /// The native session owns the enemies (engaged, stage >= 2): claims make sense.
 pub fn claims_wanted() -> bool {
     OWNS_ENEMIES.load(Ordering::Relaxed)
-}
-
-fn list_22(d: &[u8]) -> Option<Vec<u32>> {
-    parse_22(d)?;
-    Some(d[4..].chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
-}
-
-fn encode_22(list: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 4 * list.len());
-    out.extend_from_slice(&(list.len() as i32).to_le_bytes());
-    for e in list {
-        out.extend_from_slice(&e.to_le_bytes());
-    }
-    out
-}
-
-/// Client: our claims get prio 0xFFFF in our candidate list (appended when missing).
-/// Returns the new payload and how many entries carry a claim; None = malformed.
-fn claim_22(d: &[u8], claims: &[u16]) -> Option<(Vec<u8>, usize)> {
-    let mut list = list_22(d)?;
-    let mut n = 0;
-    for &id in claims {
-        let e = id as u32 | CLAIM_PRIO << 16;
-        match list.iter().position(|x| (*x & 0xFFFF) as u16 == id) {
-            Some(i) => {
-                list[i] = e;
-                n += 1;
-            }
-            None if list.len() < 1023 => {
-                list.push(e);
-                n += 1;
-            }
-            None => {}
-        }
-    }
-    Some((encode_22(&list), n))
-}
-
-/// Host: a client's entries for enemies in `claims` (ours, or contested ones another
-/// machine won) are removed, so the netId stays with its winner, unless that client
-/// claims it as well (prio 0xFFFF) and `won` (the contested ones it lost) does not name it
-/// (`host_candidates` passes the same set twice: the client keeps nothing of it).
-/// Returns the new payload and how many entries were removed; None = malformed.
-fn strip_22(d: &[u8], claims: &[u16], won: &[u16]) -> Option<(Vec<u8>, usize)> {
-    let list = list_22(d)?;
-    let kept: Vec<u32> = list
-        .iter()
-        .copied()
-        .filter(|&x| {
-            let n = (x & 0xFFFF) as u16;
-            !claims.contains(&n) || (x >> 16 == CLAIM_PRIO && !won.contains(&n))
-        })
-        .collect();
-    let n = list.len() - kept.len();
-    Some((encode_22(&kept), n))
 }
 
 /// Copies an outgoing game packet into our outbox. True = handled (the game's
@@ -1899,16 +1748,6 @@ fn route_send(t: u32, data: *const u8, size: u32, dst: Dst) -> bool {
     if !read_bytes(data as usize, &mut v) {
         bump(&DROP, t);
         return true;
-    }
-    // Client: stealth / throw claims ride in our ownership candidates (the game's own
-    // request path).
-    let c = if t == T_CAND as u32 && !ROLE_HOST.load(Ordering::Relaxed) { claims_now() } else { Vec::new() };
-    if !c.is_empty()
-        && let Some((claimed, n)) = claim_22(&v, &c)
-    {
-        v = claimed;
-        CLAIM_PACKETS.fetch_add(1, Ordering::Relaxed);
-        CLAIM_ENTRIES.store(n as u32, Ordering::Relaxed);
     }
     if !pnet_fields(t as u8).is_empty() {
         // Both forms of a player netId: `chr+0x78` (what the damage router writes) and `0xA4CE60`.
@@ -2536,9 +2375,6 @@ fn owned_ids() -> Vec<u16> {
 /// Our world update stood still this long while engaged: we are "paused" (absent for the
 /// host's owner table; a client says so in its Status).
 const WORLD_PAUSED_AFTER: Duration = Duration::from_millis(1500);
-/// Both machines own (and we claim) an enemy this long (> `OWNED_EVERY`, the lists lag):
-/// the lower slot wins.
-const DOUBLE_CLAIM_AFTER: Duration = Duration::from_millis(2500);
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum PauseStep {
@@ -2566,12 +2402,6 @@ impl PauseTracker {
             PauseStep::Idle
         }
     }
-}
-
-/// Client (or any non-lowest slot): drop our claim on an enemy that a lower slot owns
-/// too, once both have owned it for `DOUBLE_CLAIM_AFTER`. The host (slot 0) never drops.
-fn double_claim_drop(me: u8, we_claim: bool, we_own: bool, owners: &[u8], both_for: Duration) -> bool {
-    we_claim && we_own && owners.iter().any(|&s| s < me) && both_for >= DOUBLE_CLAIM_AFTER
 }
 
 /// The ownerless report's counters: every netId counts once (an enemy can sit in several
@@ -3259,10 +3089,20 @@ pub(crate) mod own {
         full_at: u64,
         /// netId -> last WARN line about a release ack wait.
         warn_at: HashMap<u16, u64>,
+        /// Each client's latest Claims (sorted).
+        claims: [Vec<u16>; SLOTS],
+        /// (netId, claimant) -> last "refused" line (one per 5 s).
+        refused_at: HashMap<(u16, u8), u64>,
         // --- client ---
         mirror: om::Mirror,
         ack_sent: u32,
         status_at: Option<Instant>,
+        claims_sent_at: Option<Instant>,
+        // --- both: our own claims, netId -> (claimed at ms, outcome logged) ---
+        claim_track: HashMap<u16, (u64, bool)>,
+        claims_made: u32,
+        claims_granted: u32,
+        grant_ms: Vec<u64>,
         // --- both: log caps and counters (10 s) ---
         lines_at: Option<Instant>,
         lines: u32,
@@ -3302,6 +3142,7 @@ pub(crate) mod own {
             self.links[s] = HostLink::default();
             self.acks[s] = 0;
             self.paused[s] = false;
+            self.claims[s].clear();
             self.decide_at = None;
             let mut g = book();
             let o = &mut g.origins[s];
@@ -3330,17 +3171,28 @@ pub(crate) mod own {
         /// Host, every frame while engaged at stage >= 2: decide every `DECIDE_EVERY_MS` (at
         /// once on a presence, ack or pause change), publish, send. `clients` = the engaged
         /// client slots.
-        pub fn host_step(&mut self, f: &Frame, clients: &[u8], world_running: bool) {
+        pub fn host_step(&mut self, f: &Frame, clients: &[u8], world_running: bool, ours: &[u16], ours_changed: bool) {
             if !installed() {
                 return;
             }
             let now = Instant::now();
             let ms = crate::game::now_ms();
-            let mut changed = false;
+            let mut changed = ours_changed;
             {
                 let mut g = book();
                 for &s in clients {
                     let o = &mut g.origins[s as usize % SLOTS];
+                    if let Some((link, generation, ids)) = o.claims.take()
+                        && accepts(link, generation)
+                    {
+                        let mut ids = ids;
+                        ids.sort_unstable();
+                        ids.dedup();
+                        if ids != self.claims[s as usize % SLOTS] {
+                            self.claims[s as usize % SLOTS] = ids;
+                            changed = true;
+                        }
+                    }
                     if let Some((link, generation, a)) = o.ack
                         && accepts(link, generation)
                         && a != self.acks[s as usize]
@@ -3399,8 +3251,18 @@ pub(crate) mod own {
                     players,
                 });
             }
+            let mut claims: Vec<(u8, Vec<u16>)> = vec![(HOST, ours.to_vec())];
+            claims.extend(clients.iter().map(|&s| (s, self.claims[s as usize % SLOTS].clone())).filter(|c| !c.1.is_empty()));
             let acks = self.acks;
-            let out = self.table.tick(&seen, &[], |s| acks.get(s as usize).copied().unwrap_or(0), |s| s == HOST || clients.contains(&s), ms);
+            let out = self.table.tick(&seen, &claims, |s| acks.get(s as usize).copied().unwrap_or(0), |s| s == HOST || clients.contains(&s), ms);
+            for (n, c, why) in &out.refused {
+                if self.refused_at.get(&(*n, *c)).is_some_and(|&t| ms.saturating_sub(t) < 5000) {
+                    continue;
+                }
+                self.refused_at.insert((*n, *c), ms);
+                log::line(&format!("own: claim by {} on {n:#x} refused ({why})", om::who(*c)));
+            }
+            self.refused_at.retain(|_, t| ms.saturating_sub(*t) < 5000);
             for w in &out.whys {
                 *self.changes.entry(*w).or_default() += 1;
             }
@@ -3444,6 +3306,32 @@ pub(crate) mod own {
             }
             self.send(clients, &out, ms);
             self.warn_waits(ms);
+            self.track_claims(HOST, ours, ms);
+        }
+
+        /// Both roles: our own claims, logged when the table grants them (`mine`) or not
+        /// within 2 s.
+        fn track_claims(&mut self, me: u8, ours: &[u16], ms: u64) {
+            self.claim_track.retain(|n, _| ours.contains(n));
+            for &n in ours {
+                if !self.claim_track.contains_key(&n) {
+                    self.claims_made += 1;
+                }
+                let t = self.claim_track.entry(n).or_insert((ms, false));
+                if t.1 {
+                    continue;
+                }
+                let waited = ms.saturating_sub(t.0);
+                if owner(n) == me {
+                    t.1 = true;
+                    self.claims_granted += 1;
+                    self.grant_ms.push(waited);
+                    log::line(&format!("stealth: claim on enemy {n:#x} granted after {waited} ms"));
+                } else if waited >= 2000 {
+                    t.1 = true;
+                    log::line(&format!("stealth: claim on enemy {n:#x} not granted within 2 s (table owner {})", om::who(owner(n))));
+                }
+            }
         }
 
         /// Host: deltas to every engaged client, a full to one that needs it (new, behind on
@@ -3514,7 +3402,7 @@ pub(crate) mod own {
 
         /// Client, every frame while engaged at stage >= 2: apply the host's Assigns, ack,
         /// Status every `STATUS_EVERY_MS` and at once when our pause state flips.
-        pub fn client_step(&mut self, me: u8, paused: bool, pause_flipped: bool) {
+        pub fn client_step(&mut self, me: u8, paused: bool, pause_flipped: bool, ours: &[u16], ours_changed: bool) {
             let ms = crate::game::now_ms();
             let msgs: Vec<AssignIn> = {
                 let mut g = book();
@@ -3559,7 +3447,15 @@ pub(crate) mod own {
                 self.ack_sent = self.mirror.applied;
                 queue_ctrl(0, &Msg::Ack { generation: GEN_OUT[0].load(Ordering::Relaxed), applied_seq: self.ack_sent });
             }
-            if pause_flipped || self.status_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(om::STATUS_EVERY_MS)) {
+            // Claims: at once when they change, and with every Status while there are any (the
+            // lane may skip a lost message after 3 s).
+            let status_due = pause_flipped || self.status_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(om::STATUS_EVERY_MS));
+            if ours_changed || (status_due && !ours.is_empty()) || (ours.is_empty() && self.claims_sent_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(10))) {
+                self.claims_sent_at = Some(Instant::now());
+                queue_ctrl(0, &Msg::Claims { generation: GEN_OUT[0].load(Ordering::Relaxed), origin: me, ids: ours.to_vec() });
+            }
+            self.track_claims(me, ours, ms);
+            if status_due {
                 self.status_at = Some(Instant::now());
                 let mut running: Vec<u16> = enemies()
                     .into_iter()
@@ -3607,11 +3503,8 @@ const THROW_ID: usize = 0x24;
 /// A received throw on an enemy our own player started a throw on this recently is not
 /// given to the game (IMPLEMENTATION-NOTES §34: two deathblows at once cancel each other).
 const THROW_COLLIDE_MS: u64 = 3000;
-/// Our player's throw on an enemy claims it this long (the deathblow runs on our AI).
-const THROW_CLAIM_MS: u64 = 4000;
 static THROW_DROPS: AtomicU32 = AtomicU32::new(0);
 static THROW_DROP_LOGS: AtomicU32 = AtomicU32::new(0);
-static THROW_CLAIM_LOGS: AtomicU32 = AtomicU32::new(0);
 
 /// An enemy netId (not a player in any form, not "none").
 fn enemy_net_id(n: u16) -> bool {
@@ -3714,18 +3607,6 @@ fn note_throw(d: &[u8], sent: bool, origin: u8) {
         let i = THROW_AT.fetch_add(1, Ordering::Relaxed) % 16;
         g[i] = note;
     }
-    if sent && by_player && enemy_net_id(defender) && THROW_CLAIMS_ON.load(Ordering::Relaxed) {
-        // A new claim (our deathblow): the candidates / the distribution go out now.
-        CLAIMS_GREW.store(true, Ordering::Relaxed);
-        THROW_CLAIMS.fetch_add(1, Ordering::Relaxed);
-        if THROW_CLAIM_LOGS.fetch_add(1, Ordering::Relaxed) < 40 {
-            log::line(&format!(
-                "stealth: our player's throw {} on enemy netId {defender:#x}: claimed for {} s (the deathblow runs on our AI)",
-                get_u16(d, THROW_ID).unwrap_or(0),
-                THROW_CLAIM_MS / 1000
-            ));
-        }
-    }
 }
 
 /// A throw with `net_id` as defender within `within_ms`: Some(sent by us).
@@ -3751,28 +3632,6 @@ fn player_throw_age(ring: &[ThrowNote], defender: u16, sent: bool, now: u64, wit
         .min()
 }
 
-/// Age (ms) of the newest throw of `slot`'s player on `defender` within `within_ms`
-/// (our own slot = our sent throws).
-fn slot_throw_age(ring: &[ThrowNote], defender: u16, slot: u8, now: u64, within_ms: u64) -> Option<u64> {
-    ring.iter()
-        .filter(|t| t.defender == defender && t.slot == slot && t.by_player && t.at != 0 && t.at <= now)
-        .map(|t| now - t.at)
-        .filter(|&age| age <= within_ms)
-        .min()
-}
-
-/// Enemies our own player started a throw on within `within_ms` (sorted, unique).
-fn our_throw_targets(ring: &[ThrowNote], now: u64, within_ms: u64) -> Vec<u16> {
-    let mut v: Vec<u16> = ring
-        .iter()
-        .filter(|t| t.sent && t.by_player && t.at != 0 && t.at <= now && now - t.at <= within_ms)
-        .map(|t| t.defender)
-        .collect();
-    v.sort_unstable();
-    v.dedup();
-    v
-}
-
 /// serve, a received throw of another machine's player (`remote` = that player's netIds
 /// here): drop it when our own player started a throw on the same enemy within
 /// `THROW_COLLIDE_MS` (Some(age of ours)).
@@ -3783,31 +3642,6 @@ fn throw_collides(ring: &[ThrowNote], d: &[u8], remote: &[u16], now: u64) -> Opt
         return None;
     }
     player_throw_age(ring, defender, true, now, THROW_COLLIDE_MS)
-}
-
-/// One machine claiming a contested enemy (host `contest`).
-#[derive(Clone, Copy, Debug)]
-struct Contender {
-    slot: u8,
-    /// Its player's throw (deathblow) on the enemy: ms ago.
-    throw_age: Option<u64>,
-    /// Its player's horizontal distance to the enemy.
-    dist: Option<f32>,
-}
-
-/// Host: who runs an enemy several machines claim (host first, then the clients in slot
-/// order). The candidates meet one by one: the one kept so far against the next, by
-/// `host_wins_contest` (a deathblow first, the earlier one, the one kept so far on a tie;
-/// else the nearer player with `CONTEST_HYST_M` for the last winner `held`). Two players:
-/// exactly `host_wins_contest` for the host.
-fn contest_winner(cands: &[Contender], held: Option<u8>) -> u8 {
-    let Some(mut best) = cands.first().copied() else { return 0 };
-    for c in &cands[1..] {
-        if !host_wins_contest(best.throw_age, c.throw_age, best.dist, c.dist, held == Some(best.slot)) {
-            best = *c;
-        }
-    }
-    best.slot
 }
 
 // --- Deathblow lock: one deathblow per enemy, first come (IMPLEMENTATION-NOTES §39) ---
@@ -4857,16 +4691,7 @@ struct Link {
     /// Client: when the host's sync packets first came in this engagement.
     host_live_at: Option<Instant>,
     owned23_logs: u32,
-    /// Host: this client's last candidate list (22, as received), re-settled when the
-    /// claims change (§34); its claimed netIds in it; what it may not keep (our claims it
-    /// did not win, contests another machine won) as last applied.
-    last22: Option<Vec<u8>>,
-    claimed: Vec<u16>,
-    blocked: Vec<u16>,
 }
-
-/// Host: contested claims are checked this often.
-const CONTEST_EVERY: Duration = Duration::from_millis(100);
 
 impl Link {
     fn new(id: PeerId, epoch: u64) -> Self {
@@ -4907,9 +4732,6 @@ impl Link {
             sync_in_at_engage: 0,
             host_live_at: None,
             owned23_logs: 0,
-            last22: None,
-            claimed: Vec::new(),
-            blocked: Vec::new(),
         }
     }
 
@@ -5075,17 +4897,8 @@ struct Engine {
     /// Every engaged link goes in this call (load, rest, our block change ...): the shared
     /// state comes down once at the end, no per-link record clearing (`disengage`).
     all_going: bool,
-    /// Host (§34): who runs each contested enemy (slot), the contested set last time, the
-    /// last contest check, contest log lines.
-    winners: BTreeMap<u16, u8>,
-    contested: Vec<u16>,
-    contest_at: Option<Instant>,
-    contest_logs: u32,
     /// Our world update paused (menu): absent for the owner table (a client's Status says so).
     pause: PauseTracker,
-    /// Double claims: since when both machines own a claimed enemy; logged once each.
-    both_since: HashMap<u16, Instant>,
-    double_logged: std::collections::HashSet<u16>,
 }
 
 impl Engine {
@@ -5119,13 +4932,7 @@ impl Engine {
             blockers: Vec::new(),
             blocker_since: BTreeMap::new(),
             all_going: false,
-            winners: BTreeMap::new(),
-            contested: Vec::new(),
-            contest_at: None,
-            contest_logs: 0,
             pause: PauseTracker::default(),
-            both_since: HashMap::new(),
-            double_logged: std::collections::HashSet::new(),
         }
     }
 
@@ -5193,11 +5000,6 @@ impl Engine {
         let _ = take_last23();
         self.own.reset();
         self.pause = PauseTracker::default();
-        self.both_since.clear();
-        self.double_logged.clear();
-        if let Ok(mut d) = DROPPED_CLAIMS.lock() {
-            d.clear();
-        }
         self.engaged_sent = 0;
         self.engaged_sent_at = None;
     }
@@ -5636,16 +5438,6 @@ impl Engine {
         l.sync_in_at_engage = SYNC_IN.load(Ordering::Relaxed);
         l.host_live_at = None;
         l.first22_forced = false;
-        // Host (§34): this client's candidates and claims start over; contests are settled
-        // again from the next lists (`host_candidates`).
-        l.last22 = None;
-        l.claimed.clear();
-        l.blocked.clear();
-        if first {
-            self.winners.clear();
-            self.contested.clear();
-            self.contest_at = None;
-        }
         if l.stage >= 2 {
             // Do not wait for the game's own timers (up to 3 s for 23, 5 s for 22): the
             // host distributes ownership on its next update, the client sends its
@@ -5867,29 +5659,22 @@ impl Engine {
                 queue_ctrl_engaged(|generation| Msg::Owned { generation, origin: me, ids: ids.clone() });
             }
         }
-        if self.stage >= 2 && self.owned_sent_at.is_some() {
-            self.resolve_double_claims(me, &comp_slots);
-        }
         if self.stage >= 2 && self.ownerless_at.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
             self.ownerless_at = Some(now);
             ownerless_report(f.player, &comps, owned_lists(&comp_slots).as_deref());
         }
-        // The owner table: the host decides and sends it, a client applies it.
+        // The owner table: the host decides and sends it, a client applies it; our stealth
+        // claims are requests to it.
         if self.stage >= 2 {
+            let (claims, claims_changed) = take_claims();
             if self.host {
                 let clients = mask_slots(engaged_links());
                 let running = self.world_running();
-                self.own.host_step(f, &clients, running);
+                self.own.host_step(f, &clients, running, &claims, claims_changed);
+                self.host_candidates(f);
             } else {
-                self.own.client_step(me, self.pause.active, pause_flipped);
+                self.own.client_step(me, self.pause.active, pause_flipped, &claims, claims_changed);
             }
-        }
-        if self.host && self.stage >= 2 {
-            self.host_candidates(f);
-        } else if !self.host && self.stage >= 2 && CLAIMS_GREW.swap(false, Ordering::Relaxed) {
-            // A new claim (stealth approach / our deathblow): our candidates go out on the
-            // next update instead of up to 5 s later (§34). ns_force_distribution only.
-            force_due(T_DUE_22);
         }
         if !self.timers_logged && self.engaged_at.elapsed() >= Duration::from_secs(3) {
             self.timers_logged = true;
@@ -5898,225 +5683,48 @@ impl Engine {
         }
     }
 
-    /// Double claims (live 2026-10-24: "claimed by both machines", up to 6): a claim of ours
-    /// on an enemy that a lower slot (the host first) owns too, for `DOUBLE_CLAIM_AFTER`,
-    /// is dropped; logged once per enemy per engagement. The host keeps its claims.
-    fn resolve_double_claims(&mut self, me: u8, comp_slots: &[u8]) {
-        let raw = claims_raw();
-        if me == 0 || raw.is_empty() {
-            self.both_since.clear();
-            if let Ok(mut d) = DROPPED_CLAIMS.lock() {
-                d.clear();
-            }
-            return;
-        }
-        let Some(theirs) = owned_lists(comp_slots) else { return };
-        let now = Instant::now();
-        let dropped: Vec<u16> = DROPPED_CLAIMS.lock().map(|d| d.clone()).unwrap_or_default();
-        let mut new_drop = Vec::new();
-        self.both_since.retain(|n, _| raw.contains(n));
-        for &n in &raw {
-            let owners: Vec<u8> = theirs.iter().filter(|(_, ids)| ids.binary_search(&n).is_ok()).map(|(s, _)| *s).collect();
-            let we_own = owned_here(n);
-            if dropped.contains(&n) || owners.is_empty() || !we_own {
-                self.both_since.remove(&n);
-                continue;
-            }
-            let since = *self.both_since.entry(n).or_insert(now);
-            if double_claim_drop(me, true, we_own, &owners, now.duration_since(since)) {
-                new_drop.push(n);
-                if self.double_logged.insert(n) {
-                    log::line(&format!(
-                        "nsession: enemy netId {n:#x} claimed by both machines: slot {} owns it, our claim is dropped",
-                        owners.iter().min().copied().unwrap_or(0)
-                    ));
-                }
-            }
-        }
-        if let Ok(mut d) = DROPPED_CLAIMS.lock() {
-            d.retain(|n| raw.contains(n));
-            for n in new_drop {
-                if !d.contains(&n) {
-                    d.push(n);
-                }
-            }
-        }
-    }
-
-    /// Host: each engaged client's candidate lists (22) with the claims applied (§27, §34).
-    /// A netId claimed by two or more machines (us and / or clients) is settled here
-    /// (`contest_winner`); the losers' entries for it go, as do every client's ordinary
-    /// entries for our own claims. A change of what a client may keep re-feeds its last list
-    /// at once and distributes (23) on the next update; a new claim of a client's too.
+    /// Host: each engaged client's candidate list (22) into its record (§4), as received.
+    /// Since test11 the game's distribution only keeps the client's first-23 liveness gate
+    /// running (its result is ignored for enemies: the owner table answers); the first 22 of
+    /// an engagement forces a 23 so that gate opens without the game's 3 s wait.
     fn host_candidates(&mut self, f: &Frame) {
-        let inbound = take_inbound(T_CAND);
-        let grew = CLAIMS_GREW.swap(false, Ordering::Relaxed);
-        let mut fresh: BTreeMap<PeerId, Vec<Vec<u8>>> = BTreeMap::new();
-        for (origin, p) in inbound {
+        for (origin, p) in take_inbound(T_CAND) {
             let Some(id) = PeerId::new(origin) else { continue };
-            match self.links.get_mut(&id).filter(|l| l.phase == Phase::Engaged) {
-                Some(l) => {
-                    l.last22 = Some(p.clone());
-                    fresh.entry(id).or_default().push(p);
-                }
-                None => bump(&DROP, T_CAND as u32),
-            }
-        }
-        let ours = claims_now();
-        // Who claims what: us (slot 0) and each engaged client from its last list.
-        let mut claimants: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
-        for &n in &ours {
-            claimants.entry(n).or_default().push(PeerId::HOST.slot());
-        }
-        let mut friend_new = false;
-        for l in self.links.values_mut().filter(|l| l.phase == Phase::Engaged) {
-            let c = l.last22.as_deref().map(claimed_in_22).unwrap_or_default();
-            friend_new |= c.iter().any(|n| !l.claimed.contains(n));
-            for &n in &c {
-                claimants.entry(n).or_default().push(l.slot());
-            }
-            l.claimed = c;
-        }
-        let contested: Vec<u16> = claimants.iter().filter(|(_, s)| s.len() >= 2).map(|(&n, _)| n).collect();
-        let due = !fresh.is_empty() || grew || self.contest_at.is_none_or(|t| t.elapsed() >= CONTEST_EVERY);
-        if due {
-            self.contest_at = Some(Instant::now());
-            let w = self.contest(f, &claimants, &contested);
-            self.winners = w;
-        } else {
-            self.winners.retain(|n, _| contested.contains(n));
-        }
-        self.contested = contested;
-        let mut any_change = false;
-        let ids: Vec<PeerId> = self.links.iter().filter(|(_, l)| l.phase == Phase::Engaged).map(|(&id, _)| id).collect();
-        for id in ids {
-            let Some(remote) = f.remote_of(id) else { continue };
+            let Some(remote) = f.remote_of(id) else {
+                bump(&DROP, T_CAND as u32);
+                continue;
+            };
+            let Some(l) = self.links.get_mut(&id).filter(|l| l.phase == Phase::Engaged) else {
+                bump(&DROP, T_CAND as u32);
+                continue;
+            };
             let slot = id.slot();
-            // What this client may not keep: our claims it did not win, and contested
-            // netIds another machine won.
-            let mut blocked: Vec<u16> = ours.iter().copied().filter(|n| self.winners.get(n).is_none_or(|&w| w != slot)).collect();
-            blocked.extend(self.winners.iter().filter(|&(n, &w)| w != slot && !ours.contains(n)).map(|(&n, _)| n));
-            blocked.sort_unstable();
-            blocked.dedup();
-            let Some(l) = self.links.get_mut(&id) else { continue };
-            let changed = blocked != l.blocked;
-            any_change |= changed;
-            l.blocked = blocked;
-            let lists = fresh.remove(&id).unwrap_or_default();
-            // Re-settling this client's last list at once: ns_force_distribution only (v7.6:
-            // our claims apply to its next 22).
-            let refeed = lists.is_empty() && (grew || changed) && FORCE_DISTRIBUTION.load(Ordering::Relaxed);
-            let lists: Vec<Vec<u8>> = if refeed { l.last22.clone().into_iter().collect() } else { lists };
-            for mut p in lists {
-                if !l.blocked.is_empty()
-                    && let Some((kept, n)) = strip_22(&p, &l.blocked, &l.blocked)
-                {
-                    p = kept;
-                    STRIPPED.fetch_add(n as u32, Ordering::Relaxed);
+            match feed_22(&p, remote) {
+                Ok(n) => {
+                    bump(&SRV, T_CAND as u32);
+                    if !l.first22_forced {
+                        // Give this client its candidates now, not at the next 3 s tick.
+                        l.first22_forced = true;
+                        let forced = make_due(T_DUE_23);
+                        log::line(&format!(
+                            "nsession: host: first 22 of peer {slot} this engagement ({n} cand, {} ms after engage): 23 distribution forced to the next update: {forced}",
+                            l.since.elapsed().as_millis()
+                        ));
+                    }
+                    if l.host22_logs < 10 {
+                        l.host22_logs += 1;
+                        log::line(&format!("nsession: host 22 from peer {slot}: {n} cand"));
+                    }
                 }
-                match feed_22(&p, remote) {
-                    Ok(n) if refeed => {
-                        if l.host22_logs < 30 {
-                            l.host22_logs += 1;
-                            log::line(&format!("nsession: host: our claims changed: peer {slot}'s last candidates ({n}) settled again"));
-                        }
-                    }
-                    Ok(n) => {
-                        bump(&SRV, T_CAND as u32);
-                        if !l.first22_forced {
-                            // Give this client its candidates now, not at the next 3 s tick.
-                            l.first22_forced = true;
-                            let forced = make_due(T_DUE_23);
-                            log::line(&format!(
-                                "nsession: host: first 22 of peer {slot} this engagement ({n} cand, {} ms after engage): 23 distribution forced to the next update: {forced}",
-                                l.since.elapsed().as_millis()
-                            ));
-                        }
-                        if l.host22_logs < 10 {
-                            l.host22_logs += 1;
-                            log::line(&format!("nsession: host 22 from peer {slot}: {n} cand"));
-                        }
-                    }
-                    Err(e) => {
-                        if !refeed {
-                            bump(&DROP, T_CAND as u32);
-                        }
-                        if l.host22_logs < 10 {
-                            l.host22_logs += 1;
-                            log::line(&format!("nsession: host 22 from peer {slot} dropped: {e}"));
-                        }
+                Err(e) => {
+                    bump(&DROP, T_CAND as u32);
+                    if l.host22_logs < 10 {
+                        l.host22_logs += 1;
+                        log::line(&format!("nsession: host 22 from peer {slot} dropped: {e}"));
                     }
                 }
             }
         }
-        if grew || any_change || friend_new {
-            // Ownership moves on the next update, not at the game's next 3 s tick
-            // (ns_force_distribution only, at most once per second).
-            force_due(T_DUE_23);
-        }
-    }
-
-    /// Host: who runs each contested enemy (two or more machines claim it): slot.
-    fn contest(&mut self, f: &Frame, claimants: &BTreeMap<u16, Vec<u8>>, contested: &[u16]) -> BTreeMap<u16, u8> {
-        let mut out = BTreeMap::new();
-        if contested.is_empty() {
-            return out;
-        }
-        let now = crate::game::now_ms();
-        let ring = THROWS.lock().map(|g| *g).unwrap_or([NO_THROW; 16]);
-        let horiz = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
-        let pos_of = |s: u8| -> Option<[f32; 3]> {
-            if s == PeerId::HOST.slot() { f.player.position() } else { PeerId::new(s).and_then(|id| f.remote_of(id)).and_then(|c| c.position()) }
-        };
-        let chrs: HashMap<u16, Chr> =
-            enemies().into_iter().filter_map(|c| Some((netai::net_id(c)?, c))).filter(|(n, _)| contested.contains(n)).collect();
-        for &n in contested {
-            let Some(slots) = claimants.get(&n) else { continue };
-            let ep = chrs.get(&n).and_then(|c| c.position());
-            let cands: Vec<Contender> = slots
-                .iter()
-                .map(|&s| Contender {
-                    slot: s,
-                    throw_age: slot_throw_age(&ring, n, s, now, THROW_CLAIM_MS),
-                    dist: pos_of(s).zip(ep).map(|(a, b)| horiz(a, b)),
-                })
-                .collect();
-            let held = self.winners.get(&n).copied();
-            let w = contest_winner(&cands, held);
-            out.insert(n, w);
-            if Some(w) != held || !self.contested.contains(&n) {
-                if w == PeerId::HOST.slot() { &CONTESTS_WON } else { &CONTESTS_LOST }.fetch_add(1, Ordering::Relaxed);
-                if self.contest_logs < 40 {
-                    self.contest_logs += 1;
-                    let e = chrs.get(&n).and_then(|c| c.entity_id()).unwrap_or(-1);
-                    let m = |d: Option<f32>| d.map_or("?".into(), |d| format!("{d:.1}"));
-                    if let [h, c] = cands.as_slice()
-                        && h.slot == PeerId::HOST.slot()
-                    {
-                        // Two machines, the host one of them: the 2-player line (§34).
-                        let why = match (h.throw_age, c.throw_age) {
-                            (Some(a), Some(b)) => format!("both deathblowed it, ours {a} ms ago, the friend's {b} ms ago"),
-                            (Some(a), None) => format!("our deathblow {a} ms ago"),
-                            (None, Some(b)) => format!("the friend's deathblow {b} ms ago"),
-                            (None, None) => format!("us {} m, the friend {} m", m(h.dist), m(c.dist)),
-                        };
-                        let runs = if w == PeerId::HOST.slot() { "the host".to_owned() } else { format!("the friend (peer {w})") };
-                        log::line(&format!("stealth: both claim enemy {e} netId {n:#x}: {runs} runs it ({why})"));
-                    } else {
-                        let who = |s: u8| if s == PeerId::HOST.slot() { "the host".to_owned() } else { format!("peer {s}") };
-                        let why: Vec<String> = cands
-                            .iter()
-                            .map(|c| match c.throw_age {
-                                Some(a) => format!("{} deathblow {a} ms ago", who(c.slot)),
-                                None => format!("{} {} m", who(c.slot), m(c.dist)),
-                            })
-                            .collect();
-                        log::line(&format!("stealth: {} machines claim enemy {e} netId {n:#x}: {} runs it ({})", cands.len(), who(w), why.join(", ")));
-                    }
-                }
-            }
-        }
-        out
     }
 
     fn stats(&mut self) {
@@ -6182,23 +5790,9 @@ impl Engine {
         if self.any_engaged() {
             let (com, net, other, here) = owners();
             log::line(&format!("nsession: owners: Com {com} / NetAI {net} / other {other} / owned-here {here}"));
-            let claims = claims_now().len();
-            let (pk, st) = (CLAIM_PACKETS.swap(0, Ordering::Relaxed), STRIPPED.swap(0, Ordering::Relaxed));
-            let (cw, cl) = (CONTESTS_WON.swap(0, Ordering::Relaxed), CONTESTS_LOST.swap(0, Ordering::Relaxed));
-            let (drops, tc) = (THROW_DROPS.swap(0, Ordering::Relaxed), THROW_CLAIMS.swap(0, Ordering::Relaxed));
-            let fskip = FORCES_SKIPPED.swap(0, Ordering::Relaxed);
-            if claims > 0 || pk > 0 || st > 0 || cw + cl + drops + tc + fskip > 0 {
-                log::line(&format!(
-                    "nsession: stealth claims (10 s): ours now {claims}; {}; our deathblows claimed {tc}, the friend's throws on them not applied {drops}; forced distributions rate-limited {fskip} (ns_force_distribution {}, ns_throw_claims {}, ns_throw_collide_drop {})",
-                    if self.host {
-                        format!("clients' candidates for them removed {st}, contests kept {cw} / given to a client {cl}")
-                    } else {
-                        format!("candidate lists sent with a claim {pk}, last with {} claimed entries", CLAIM_ENTRIES.load(Ordering::Relaxed))
-                    },
-                    FORCE_DISTRIBUTION.load(Ordering::Relaxed) as u8,
-                    THROW_CLAIMS_ON.load(Ordering::Relaxed) as u8,
-                    THROW_COLLIDE_DROP.load(Ordering::Relaxed) as u8
-                ));
+            let drops = THROW_DROPS.swap(0, Ordering::Relaxed);
+            if drops > 0 {
+                log::line(&format!("nsession: the friend's throws not applied (our own deathblow on it, ns_throw_collide_drop): {drops} (10 s)"));
             }
         }
     }
@@ -7251,34 +6845,6 @@ mod tests {
     }
 
     #[test]
-    fn stealth_claims_raise_our_prio_and_strip_the_friends() {
-        // {n; netId | prio << 16}: 0x850 prio 7, 0x851 prio 3.
-        let d = encode_22(&[0x850 | 7 << 16, 0x851 | 3 << 16]);
-        assert_eq!(list_22(&d), Some(vec![0x850 | 7 << 16, 0x851 | 3 << 16]));
-        // Client: a listed claim gets 0xFFFF, a missing one is appended.
-        let (c, n) = claim_22(&d, &[0x851, 0x900]).unwrap();
-        assert_eq!(n, 2);
-        assert_eq!(list_22(&c), Some(vec![0x850 | 7 << 16, 0x851 | CLAIM_PRIO << 16, 0x900 | CLAIM_PRIO << 16]));
-        assert_eq!(parse_22(&c), Some(3));
-        assert!(claim_22(&d[..7], &[0x850]).is_none());
-        // Host: the friend's ordinary entry for our claim goes, its own claim stays.
-        let (s, removed) = strip_22(&c, &[0x850, 0x851], &[]).unwrap();
-        assert_eq!(removed, 1);
-        assert_eq!(list_22(&s), Some(vec![0x851 | CLAIM_PRIO << 16, 0x900 | CLAIM_PRIO << 16]));
-        // ... unless the host won the contest for it (§34): then the friend's claim goes too.
-        let (w, removed) = strip_22(&c, &[0x850, 0x851], &[0x851]).unwrap();
-        assert_eq!(removed, 2);
-        assert_eq!(list_22(&w), Some(vec![0x900 | CLAIM_PRIO << 16]));
-        assert_eq!(claimed_in_22(&c), vec![0x851, 0x900]);
-        let (same, none) = strip_22(&d, &[], &[]).unwrap();
-        assert_eq!((same, none), (d.clone(), 0));
-        // A full list takes no new entry.
-        let full = encode_22(&(0..1023u32).collect::<Vec<_>>());
-        let (f, n) = claim_22(&full, &[0x7FFF]).unwrap();
-        assert_eq!((parse_22(&f), n), (Some(1023), 0));
-    }
-
-    #[test]
     fn two_deathblows_at_once_do_not_cancel_each_other() {
         // Live 2026-10-24 host 1792813226 (bytes from the log): the friend's throw 1200 on
         // 0x182e (attacker = the friend, our remote 0xa001 after the rewrite); both players
@@ -7300,76 +6866,14 @@ mod tests {
         assert_eq!(throw_collides(&ring, &friends, &[0xa001], 10_000), None);
         ring[0] = ThrowNote { defender: 0x182f, ..ours(9_200) };
         assert_eq!(throw_collides(&ring, &friends, &[0xa001], 10_000), None);
-        // Our throw targets (claims) and ages.
+        // Ages of a player's throw (ours / another machine's).
         ring[0] = ours(9_000);
-        ring[1] = ThrowNote { defender: 0x0900, at: 9_500, sent: true, by_player: true, slot: 0 };
         ring[2] = ThrowNote { defender: 0x0901, at: 9_500, sent: false, by_player: true, slot: 1 };
-        ring[3] = ThrowNote { defender: 0x0902, at: 1_000, sent: true, by_player: true, slot: 0 };
-        assert_eq!(our_throw_targets(&ring, 10_000, THROW_CLAIM_MS), vec![0x0900, 0x182e]);
-        assert_eq!(player_throw_age(&ring, 0x0901, false, 10_000, THROW_CLAIM_MS), Some(500));
-        assert_eq!(player_throw_age(&ring, 0x0901, true, 10_000, THROW_CLAIM_MS), None);
+        assert_eq!(player_throw_age(&ring, 0x0901, false, 10_000, THROW_COLLIDE_MS), Some(500));
+        assert_eq!(player_throw_age(&ring, 0x0901, true, 10_000, THROW_COLLIDE_MS), None);
         // A note "in the future" (clock skew between threads) is ignored, never underflows.
         ring[4] = ThrowNote { defender: 0x0903, at: 20_000, sent: true, by_player: true, slot: 0 };
-        assert_eq!(player_throw_age(&ring, 0x0903, true, 10_000, THROW_CLAIM_MS), None);
-    }
-
-    #[test]
-    fn contested_claims_go_to_the_deathblow_then_the_nearer_player() {
-        // Live 2026-10-24: host 13 m / friend 8 m from 1120300, both "behind": the friend.
-        assert!(!host_wins_contest(None, None, Some(13.0), Some(8.0), false));
-        // The host nearer by more than the margin takes it, and keeps it within the margin.
-        assert!(host_wins_contest(None, None, Some(3.0), Some(8.0), false));
-        assert!(!host_wins_contest(None, None, Some(7.0), Some(8.0), false));
-        assert!(host_wins_contest(None, None, Some(9.0), Some(8.0), true));
-        assert!(!host_wins_contest(None, None, Some(10.0), Some(8.0), true));
-        // A deathblow beats distance; two of them: the earlier one (the host on a tie).
-        assert!(host_wins_contest(Some(200), None, Some(13.0), Some(1.0), false));
-        assert!(!host_wins_contest(None, Some(200), Some(1.0), Some(13.0), true));
-        assert!(host_wins_contest(Some(900), Some(300), None, None, false));
-        assert!(!host_wins_contest(Some(300), Some(900), None, None, true));
-        assert!(host_wins_contest(Some(500), Some(500), None, None, false));
-        // No friend position: the host; no position of ours: whoever has it now.
-        assert!(host_wins_contest(None, None, Some(5.0), None, false));
-        assert!(host_wins_contest(None, None, None, Some(5.0), true) && !host_wins_contest(None, None, None, Some(5.0), false));
-    }
-
-    #[test]
-    fn contests_between_any_machines_are_settled_by_the_host() {
-        let c = |slot: u8, throw_age: Option<u64>, dist: Option<f32>| Contender { slot, throw_age, dist };
-        // Two players: exactly host_wins_contest for the host (held = the host won last time).
-        for (h, f, held) in [(13.0, 8.0, false), (3.0, 8.0, false), (9.0, 8.0, true), (10.0, 8.0, true)] {
-            let w = contest_winner(&[c(0, None, Some(h)), c(1, None, Some(f))], held.then_some(0));
-            assert_eq!(w == 0, host_wins_contest(None, None, Some(h), Some(f), held), "{h} {f} {held}");
-        }
-        // Two clients (the host does not claim it): the nearer one, the holder keeps within 1.5 m.
-        assert_eq!(contest_winner(&[c(1, None, Some(9.0)), c(2, None, Some(4.0))], None), 2);
-        assert_eq!(contest_winner(&[c(1, None, Some(5.0)), c(2, None, Some(4.0))], Some(1)), 1);
-        // Three machines: a deathblow beats distance; two of them: the earlier one.
-        assert_eq!(contest_winner(&[c(0, None, Some(1.0)), c(1, Some(300), Some(9.0)), c(2, None, Some(2.0))], None), 1);
-        assert_eq!(contest_winner(&[c(0, Some(200), None), c(1, Some(300), None), c(2, Some(900), None)], Some(0)), 2);
-        // The throw ring per machine.
-        let mut ring = [NO_THROW; 16];
-        ring[0] = ThrowNote { defender: 0x0900, at: 9_000, sent: false, by_player: true, slot: 2 };
-        ring[1] = ThrowNote { defender: 0x0900, at: 9_800, sent: true, by_player: true, slot: 0 };
-        assert_eq!(slot_throw_age(&ring, 0x0900, 2, 10_000, THROW_CLAIM_MS), Some(1_000));
-        assert_eq!(slot_throw_age(&ring, 0x0900, 0, 10_000, THROW_CLAIM_MS), Some(200));
-        assert_eq!(slot_throw_age(&ring, 0x0900, 1, 10_000, THROW_CLAIM_MS), None);
-    }
-
-    #[test]
-    fn double_claim_host_wins() {
-        let s = |m| Duration::from_millis(m);
-        // Client claims, the host owns too for 2.5 s: the client drops.
-        assert!(double_claim_drop(1, true, true, &[0], s(2500)));
-        assert!(!double_claim_drop(1, true, true, &[0], s(1000)));
-        // Not owned by the host / not ours / no claim: nothing to drop.
-        assert!(!double_claim_drop(1, true, true, &[], s(9000)));
-        assert!(!double_claim_drop(1, true, false, &[0], s(9000)));
-        assert!(!double_claim_drop(1, false, true, &[0], s(9000)));
-        // The host keeps, even when a client owns it too.
-        assert!(!double_claim_drop(0, true, true, &[1, 2], s(9000)));
-        // Between clients the lower slot wins.
-        assert!(double_claim_drop(2, true, true, &[1], s(2500)) && !double_claim_drop(1, true, true, &[2], s(9000)));
+        assert_eq!(player_throw_age(&ring, 0x0903, true, 10_000, THROW_COLLIDE_MS), None);
     }
 
     #[test]
