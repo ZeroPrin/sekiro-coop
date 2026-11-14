@@ -303,21 +303,21 @@ fn call_text(tramp: &AtomicUsize, missing_rva: usize, repo: usize, id: u32) -> *
 extern "C" fn name_detour(repo: usize, id: u32) -> *const u16 {
     match kind_of(id) {
         Some(k) => texts(k)[0],
-        None => call_text(&NAME_TRAMP, MISSING_NAME_RVA, repo, id),
+        None => crate::karma::text(id, 0).unwrap_or_else(|| call_text(&NAME_TRAMP, MISSING_NAME_RVA, repo, id)),
     }
 }
 
 extern "C" fn info_detour(repo: usize, id: u32) -> *const u16 {
     match kind_of(id) {
         Some(k) => texts(k)[1],
-        None => call_text(&INFO_TRAMP, MISSING_INFO_RVA, repo, id),
+        None => crate::karma::text(id, 1).unwrap_or_else(|| call_text(&INFO_TRAMP, MISSING_INFO_RVA, repo, id)),
     }
 }
 
 extern "C" fn caption_detour(repo: usize, id: u32) -> *const u16 {
     match kind_of(id) {
         Some(k) => texts(k)[2],
-        None => call_text(&CAPTION_TRAMP, MISSING_CAPTION_RVA, repo, id),
+        None => crate::karma::text(id, 2).unwrap_or_else(|| call_text(&CAPTION_TRAMP, MISSING_CAPTION_RVA, repo, id)),
     }
 }
 
@@ -448,9 +448,22 @@ pub(crate) fn goods_name(id: u32) -> Option<String> {
     Some(wide_text(p as *const u16)).filter(|s| !s.is_empty())
 }
 
-/// One of our three co-op item rows (Kindred Bell / Charm / Severed Thread): never shared.
+/// One of the mod's own goods rows: the three co-op items (Kindred Bell / Charm / Severed
+/// Thread) and Karma (karma.rs). Never shared, never an audit finding.
 pub(crate) fn is_coop_goods(param_id: u32) -> bool {
-    kind_of(param_id).is_some()
+    kind_of(param_id).is_some() || param_id == crate::karma::GOODS_ID
+}
+
+/// GrantItems with the normal "item received" popup (the row needs `is_notice_log`).
+/// `entries`: `{full id, count, u32::MAX, 0}` per item. False = the item manager is unreadable.
+pub(crate) fn grant_with_popup(entries: &[u32]) -> bool {
+    let Some(mim) = read_ptr(module_base() + MAP_ITEM_MAN) else { return false };
+    let mut buf: Vec<u32> = vec![(entries.len() / 4) as u32];
+    buf.extend_from_slice(entries);
+    let grant: extern "C" fn(usize, *const u32, usize, bool, *mut u32, bool) -> u64 =
+        unsafe { std::mem::transmute(module_base() + GRANT_RVA) };
+    grant(mim, buf.as_ptr(), 0, false, std::ptr::null_mut(), false);
+    true
 }
 
 fn place_name(repo: usize, id: i32) -> String {
@@ -537,7 +550,7 @@ fn goods_file(repo: &mut SoloParamRepository) -> Option<&mut sekiro::fd4::ParamF
 }
 
 /// Every goods id an item lot or a shop gives (any category: excluding more is harmless).
-fn referenced_ids(repo: &SoloParamRepository) -> Option<std::collections::HashSet<u32>> {
+pub(crate) fn referenced_ids(repo: &SoloParamRepository) -> Option<std::collections::HashSet<u32>> {
     let file = |name: &str| repo.params().find(|p| p.struct_name() == name).map(|p| &*p.data);
     let lots = file(ITEMLOT_PARAM_ST::NAME)?;
     let shops = file(SHOP_LINEUP_PARAM::NAME)?;
@@ -592,6 +605,7 @@ fn pick_rows(vanilla_unlocks: &[(u32, i32)]) -> Option<Rows> {
             if vanilla_text(msg, id, true) == base + MISSING_INFO_RVA
                 && !used.contains(&id)
                 && !RESERVED.contains(&id)
+                && id != crate::karma::GOODS_ID
                 && id < 0x0FFF_FFFF
             {
                 candidates.push(id);
@@ -944,13 +958,9 @@ impl State {
         if entries.is_empty() {
             return;
         }
-        let Some(mim) = read_ptr(module_base() + MAP_ITEM_MAN) else { return };
-        let mut buf: Vec<u32> = vec![(entries.len() / 4) as u32];
-        buf.extend_from_slice(&entries);
-        let grant: extern "C" fn(usize, *const u32, usize, bool, *mut u32, bool) -> u64 =
-            unsafe { std::mem::transmute(module_base() + GRANT_RVA) };
-        grant(mim, buf.as_ptr(), 0, false, std::ptr::null_mut(), false);
-        log::line(&format!("items: gave {names:?} (popup)"));
+        if grant_with_popup(&entries) {
+            log::line(&format!("items: gave {names:?} (popup)"));
+        }
     }
 
     fn refresh_stage(&mut self) {

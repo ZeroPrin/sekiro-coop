@@ -442,8 +442,6 @@ pub struct World {
     pub own_death_at: Option<Instant>,
     /// The `own_death_at` we already refilled after (death_refill, once per death reload).
     death_refilled_for: Option<Instant>,
-    /// We rested ourselves (not a mirrored rest); taken by the death debuff.
-    pub own_rest_now: bool,
     /// What each peer told us about itself (death, back, boss fight, down), keyed by the
     /// sender of the event (PLAN-MULTIPLAYER §5.3). Kept across a link drop, as the old
     /// single-friend fields were, so read it by the current peer's id: with two players
@@ -711,7 +709,6 @@ impl World {
             if !echo {
                 net.send_event(EV_REST, rest, game::current_block().unwrap_or(-1));
                 log::line(&format!("world: rested at idol {rest}, told the friend"));
-                self.own_rest_now = true;
                 // Rest = reset for both (restsync.rs): our enemies just respawned.
                 crate::restsync::note(crate::restsync::Kind::Own, rest);
                 // A rest while we wait / are dead and releasing ends the wait too.
@@ -935,6 +932,7 @@ impl World {
     /// without telling the friend again (it rests on its own resync event).
     pub fn resync_rest(&mut self, idol: i32) -> bool {
         self.rest_from_friend_at = Some(Instant::now());
+        crate::karma::note_mod_rest(idol);
         // Everyone rests: no peer is in a boss fight after it.
         for p in self.peer_world.values_mut() {
             p.boss = None;
@@ -1023,6 +1021,7 @@ impl World {
     /// our enemies back, the host must not respawn its own).
     pub fn silent_rest(&mut self, idol: i32) {
         self.rest_from_friend_at = Some(Instant::now());
+        crate::karma::note_mod_rest(idol);
         let ok = game::write(base() + REST_REQUEST, idol) && game::write(base() + RESPAWN_REQUEST, idol);
         log::line(&format!("world: join rest at idol {idol} (ok = {ok}), not told to the friend"));
     }
@@ -1071,6 +1070,8 @@ impl World {
             log::line(&format!("world: friend rested at idol {idol} in block {block}, we are in {here}: enemies reset directly (ok = {ok}), refilled and restocked directly (ok = {refilled})"));
             return;
         }
+        // Karma (karma.rs): the rest these mailboxes cause is the friend's, not ours.
+        crate::karma::note_mod_rest(idol);
         let ok = (!refill || game::write(base() + REST_REQUEST, idol)) && game::write(base() + RESPAWN_REQUEST, idol);
         // `OnEvent_BonfireRespawn` (0x69B030) = both mailboxes + the item restock 0x7A95B0: the
         // mailboxes alone left the friend's Spirit Emblems / pellets unrestocked (live 2026-10-25).

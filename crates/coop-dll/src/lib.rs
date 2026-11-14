@@ -18,7 +18,6 @@ mod anim;
 mod corpse;
 mod crash;
 mod cutscene;
-mod debuff;
 mod dialog;
 mod doors;
 mod doctor;
@@ -34,6 +33,7 @@ mod icons;
 mod idols;
 mod invguard;
 mod items;
+mod karma;
 mod join;
 mod keyitems;
 mod leave;
@@ -85,7 +85,6 @@ mod settings;
 // The testers' launcher scripts (PowerShell updaters) are embedded only in test builds.
 #[cfg(feature = "testsync")]
 mod shipfiles;
-mod speffect;
 mod statelog;
 mod talklock;
 mod spectate_cam;
@@ -229,7 +228,6 @@ fn init(hmodule: usize) {
     ngblock::install();
     nopause::install();
     talklock::install();
-    speffect::install_hook();
     // Enemy target scores, observed only (aitarget.rs, `[DEBUG] ai_retarget`).
     aitarget::install_at_start();
     // v8.60: the owner's type-5 HP does not kill a Puppeteer puppet here (puppetguard.rs).
@@ -317,6 +315,7 @@ fn init(hmodule: usize) {
                 // the puppet's frame right after.
                 let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                     items::on_frame();
+                    karma::prepare();
                     partskin::tick();
                     optmenu::on_frame();
                     quitblock::tick();

@@ -344,7 +344,6 @@ fn apply(ini: &Ini, warn: &mut Vec<String>) {
     tuning::INGAME_MENU_PAD.store(ini.flag("ingame_menu_pad", true, warn), Relaxed);
     tuning::NATIVE_MOD_MENU.store(ini.flag("native_mod_menu", true, warn), Relaxed);
     tuning::NATIVE_MOD_MENU_INWORLD.store(ini.flag("native_mod_menu_inworld", true, warn), Relaxed);
-    tuning::DEATH_DEBUFF_ICON.store(ini.num("death_debuff_icon", 0, 0, 1_000_000_000, warn), Relaxed);
     tuning::ENEMY_HEALTH_SCALING.store(ini.num("enemy_health_scaling", 60, 0, 1000, warn), Relaxed);
     tuning::BOSS_HEALTH_SCALING.store(ini.num("boss_health_scaling", 50, 0, 1000, warn), Relaxed);
     tuning::ENEMY_POSTURE_SCALING.store(ini.num("enemy_posture_scaling", 60, 0, 1000, warn), Relaxed);
@@ -574,19 +573,22 @@ boss_reward = 1
 auto_follow = 0
 ; 1 = when you join, rest at the arrival idol so enemies you had killed are alive again.
 join_rest = 1
-; 1 = every death in co-op lowers your max HP and posture by 10 % (max 5 stacks, 50 %).
-;     Resting at an idol yourself clears it. 0 = off.
+; 1 = Karma: every real death in co-op gives you one 'Karma' item (at most 6). Each Karma
+;     lowers your max HP and posture by 10 % and the damage you deal by 2 % (a status icon
+;     shows under the HP bar). Resting at an idol yourself removes all Karma. The host's value
+;     is used for everyone. 0 = no new Karma and no penalty (Karma you hold stays inert until
+;     your next rest).
 death_debuffs = 1
 ; 1 = while the game's System menu (the list with Quit Game) is open, a 'Mod settings' panel
 ;     appears at the right edge of the screen. The host edits the enemy / boss scaling and
-;     the death debuff there (applied at once, saved to this file, sent to the friend); a
+;     Karma there (applied at once, saved to this file, sent to the friend); a
 ;     client sees the host's values read-only. 0 = no panel at all.
 ingame_menu = 0
 ; Virtual-key code (decimal, 0..255) that collapses / expands the panel. 45 = Insert.
 ingame_menu_key = 45
 ; 1 = the panel can also be driven with the controller (host only): right stick up/down = row,
 ;     right stick left/right = value (hold LB or RB for steps of 25), right trigger = Apply,
-;     R3 = flip the death debuff. The D-pad, A and B are never used. If the game's System menu
+;     R3 = flip Karma. The D-pad, A and B are never used. If the game's System menu
 ;     also reacts to these inputs, set 0 and use the mouse. 0 = no controller control.
 ingame_menu_pad = 1
 ; 1 = replace the game's 'Network Settings' page in the Options menu with a native 'Co-op Settings'
@@ -595,9 +597,6 @@ native_mod_menu = 1
 ; 1 = the native page is also used when Options is opened inside a world (v8.43: the crash was the 32-bit
 ;     truncated parent pointer, fixed). 0 = inside a world the game shows its original page.
 native_mod_menu_inworld = 1
-; 1 = the death debuff is a status effect with an icon that also lowers attack power by 5 %
-;     per stack. 0 = max HP / posture only, no icon. A larger number = use that icon id.
-death_debuff_icon = 0
 ; Percent added to enemy and boss health / posture for the second player
 ; (0 = no scaling). The host's values are used on both machines. Each further player
 ; adds less: health 85 % of the step before, posture 60 % (six players with the
@@ -860,7 +859,8 @@ connection_items = 1
 ;     Zeroed before the save loads; the unlocks are rebuilt after each load. 0 = old behaviour.
 fix_debug_item_unlocks = 1
 ; 1 = F8 wakes you at the idol while waiting on the boss death screen, F9 goes to the friend,
-; F11 writes a MARK line to the log, F3 resyncs the world (both players rest).
+; F11 writes a MARK line to the log, F3 resyncs the world (both players rest), F2 gives you
+; one Karma (to test Karma alone, without a friend).
 debug_hotkeys = 0
 ; 1 = log-only probe of the same Options menu (menu entries, page kinds, text ids) for a later
 ; native Co-op Settings page. Changes nothing in the game. 0 = install nothing. Start-up only.

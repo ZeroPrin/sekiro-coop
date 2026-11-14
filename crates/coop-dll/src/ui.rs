@@ -334,7 +334,7 @@ impl Panel {
                     ui.slider("Boss posture %", 0, 1000, &mut v);
                     d.boss_posture = menu::clamp_pct(v as i64);
                     mark(ui, 4);
-                    ui.checkbox("Death debuff (-10 % max HP/posture per death)", &mut d.death_debuffs);
+                    ui.checkbox("Karma (per co-op death: -10 % HP/posture, -2 % damage)", &mut d.death_debuffs);
                     mark(ui, 5);
                     ui.checkbox("Friendly fire (players' hits reach each other)", &mut d.friendly_fire);
                     mark(ui, 6);

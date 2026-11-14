@@ -311,11 +311,9 @@ pub fn ghost_motion() -> bool {
     GHOST_MOTION.load(Ordering::Relaxed)
 }
 
-/// Settings file `death_debuffs`: max HP / posture lowered per co-op death (debuff.rs).
+/// Settings file `death_debuffs`: Karma on (karma.rs: an item per co-op death, a status
+/// effect per Karma held). The host's value wins on a client.
 pub static DEATH_DEBUFFS: AtomicBool = AtomicBool::new(true);
-/// Settings file `death_debuff_icon`: 0 = base value writes only (phase 1), 1 = own SpEffect rows
-/// with an icon and attack penalty (speffect.rs), > 1 = the same with this icon id.
-pub static DEATH_DEBUFF_ICON: AtomicU32 = AtomicU32::new(0);
 /// Settings file `*_scaling`: percent added per extra player (scaling.rs; host's values).
 pub static ENEMY_HEALTH_SCALING: AtomicU32 = AtomicU32::new(60);
 pub static BOSS_HEALTH_SCALING: AtomicU32 = AtomicU32::new(50);

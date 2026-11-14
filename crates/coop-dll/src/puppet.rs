@@ -90,7 +90,6 @@ pub struct Puppet {
     activation_log_at: Option<std::time::Instant>,
     /// N0 clones: the FPS line every 10 s.
     n0_log_at: Option<std::time::Instant>,
-    debuff: crate::debuff::Debuff,
     scaling: crate::scaling::Scaling,
     scale_at: Option<std::time::Instant>,
     scale_remote: Option<crate::scaling::ScaleCfg>,
@@ -609,21 +608,20 @@ impl Puppet {
             self.activation_log_at = Some(std::time::Instant::now());
             crate::activation::log_stats(&self.native.remotes().map(|(_, c)| c.0).collect::<Vec<_>>());
         }
-        // Death debuff (settings death_debuffs) and enemy scaling by player count.
-        // Not while our warp tears the world down: no character may be touched then.
+        // Karma (settings death_debuffs, karma.rs) and enemy scaling by player count.
+        // Not while our warp tears the world down: no character may be touched then
+        // (karma.rs still watches deaths and rests then, it only acts later).
         let linked = matches!(self.net.as_ref(), Some(Some(n)) if n.connected());
-        if !hands_off {
-            let own_rest = std::mem::take(&mut self.world.own_rest_now);
-            self.debuff.on_frame(
-                // The host's death_debuffs wins on a client (ScaleCfg 10th byte, v8.31a).
-                self.scale_remote
-                    .and_then(|c| c.debuffs)
-                    .unwrap_or_else(|| crate::tuning::DEATH_DEBUFFS.load(std::sync::atomic::Ordering::Relaxed)),
-                linked,
-                own_rest,
-                DEBUFF_PCT,
-            );
-        }
+        crash::breadcrumb("karma");
+        crate::karma::on_frame(
+            // The host's death_debuffs wins on a client (ScaleCfg 10th byte, v8.31a).
+            self.scale_remote
+                .and_then(|c| c.debuffs)
+                .unwrap_or_else(|| crate::tuning::DEATH_DEBUFFS.load(std::sync::atomic::Ordering::Relaxed)),
+            linked,
+            hands_off,
+            in_world_since.elapsed(),
+        );
         if !linked {
             self.scale_remote = None;
         }
@@ -1582,8 +1580,6 @@ fn all_dead(dead: &[bool]) -> bool {
     !dead.is_empty() && dead.iter().all(|&d| d)
 }
 
-/// Max HP and posture lost per death stack (ER Seamless uses about 20 %).
-const DEBUFF_PCT: u32 = 10;
 /// Bulk kind of the host's scaling percentages (world.rs uses 1, 5 and 6).
 pub(crate) const BULK_SCALE_CFG: u8 = 7;
 

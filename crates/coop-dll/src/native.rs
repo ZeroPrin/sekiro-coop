@@ -552,14 +552,15 @@ fn tee_note(ptype: u32, data: *const u8, size: u32) {
 /// Type 61 = the player's SpEffect list, `n * {u32 time bits, i32 id}`. In IDA it
 /// is only sent by `0x8DAE90` through the FrpgSessionManager broadcast `0x8E7210`
 /// (with the type-60 header `{u32 n, u32 time}`), never through PlayerSession
-/// slot 1/3, so this tee should never see it. If it ever does, our own death
-/// debuff rows (speffect.rs, only this machine has them) go out as id -1, which
-/// the receiver `0xA32790` skips (it also drops ids whose row is missing or whose
-/// stateInfo is not 95). The size stays, so the type-60 count still matches.
+/// slot 1/3, so this tee should never see it. If it ever does, our Karma rows
+/// (karma.rs: vanilla test rows rewritten in memory, a vanilla peer has other
+/// contents under these ids) go out as id -1, which the receiver `0xA32790` skips
+/// (it also drops ids whose row is missing or whose stateInfo is not 95; ours is 0).
+/// The size stays, so the type-60 count still matches.
 fn hide_own_speffects(list: &mut [u8]) {
     for e in list.chunks_exact_mut(8) {
         let id = i32::from_le_bytes([e[4], e[5], e[6], e[7]]);
-        if crate::speffect::is_own_row(id) {
+        if crate::karma::is_karma_sp(id) {
             e[4..8].copy_from_slice(&(-1i32).to_le_bytes());
         }
     }
@@ -2166,11 +2167,13 @@ mod tests {
 
     #[test]
     fn own_speffect_rows_leave_as_minus_one() {
-        let ids = [3000i32, 2_140_000_001, 2_140_000_005, 2_140_000_006];
+        let first = crate::karma::SP_ROWS[0] as i32;
+        let last = crate::karma::SP_ROWS[5] as i32;
+        let ids = [3000i32, first, last, 2_140_000_001];
         let mut list: Vec<u8> = ids.iter().flat_map(|id| [0x11u8, 0x22, 0x33, 0x44].into_iter().chain(id.to_le_bytes())).collect();
         hide_own_speffects(&mut list);
         let out: Vec<i32> = list.chunks_exact(8).map(|e| i32::from_le_bytes([e[4], e[5], e[6], e[7]])).collect();
-        assert_eq!(out, [3000, -1, -1, 2_140_000_006]);
+        assert_eq!(out, [3000, -1, -1, 2_140_000_001]);
         // The time bits and the size stay.
         assert_eq!(list.len(), 32);
         assert!(list.chunks_exact(8).all(|e| e[..4] == [0x11, 0x22, 0x33, 0x44]));
