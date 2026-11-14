@@ -2917,8 +2917,8 @@ pub(crate) mod own {
         paused: [bool; SLOTS],
         links: [om::LinkOut; SLOTS],
         full_at: u64,
-        /// netId -> last WARN line about a release ack wait.
-        warn_at: HashMap<u16, u64>,
+        /// Per client: the last WARN line about its release ack waits (ms).
+        warn_at: [Option<u64>; SLOTS],
         /// Each client's latest Claims (sorted).
         claims: [Vec<u16>; SLOTS],
         /// (netId, claimant) -> last "refused" line (one per 5 s).
@@ -2995,6 +2995,7 @@ pub(crate) mod own {
             self.links[s] = om::LinkOut::default();
             self.acks[s] = 0;
             self.paused[s] = false;
+            self.warn_at[s] = None;
             self.claims[s].clear();
             self.watch.forget(slot);
             self.decide_at = None;
@@ -3401,27 +3402,35 @@ pub(crate) mod own {
         }
 
         /// Host: entries waiting for a client's release ack longer than `ACK_WARN_MS` (they
-        /// stay nobody meanwhile, never double): one line per netId per `ACK_WARN_MS`.
+        /// stay nobody meanwhile, never double): one line per client per `ACK_WARN_MS`, with
+        /// the count and the longest waits.
         fn warn_waits(&mut self, ms: u64) {
-            let mut lines = Vec::new();
+            // Per client: (netId, entity, kind, waited ms, seq it must ack).
+            let mut per: BTreeMap<u8, Vec<(u16, i32, Kind, u64, u32)>> = BTreeMap::new();
             for (&n, r) in &self.table.rows {
                 let Some((x, s1, since)) = r.publ.wait else { continue };
-                if ms.saturating_sub(since) < om::ACK_WARN_MS || self.warn_at.get(&n).is_some_and(|&t| ms.saturating_sub(t) < om::ACK_WARN_MS) {
+                let waited = ms.saturating_sub(since);
+                if waited >= om::ACK_WARN_MS {
+                    per.entry(x).or_default().push((n, r.entity, r.kind, waited, s1));
+                }
+            }
+            for (x, mut v) in per {
+                let i = x as usize % SLOTS;
+                if self.warn_at[i].is_some_and(|t| ms.saturating_sub(t) < om::ACK_WARN_MS) {
                     continue;
                 }
-                self.warn_at.insert(n, ms);
-                lines.push(format!(
-                    "own: WARN {n:#x} e{}{} waits {} ms for {}'s release ack (seq {s1}, it acked {}): nobody runs it meanwhile",
-                    r.entity,
-                    tag(r.kind),
-                    ms.saturating_sub(since),
+                self.warn_at[i] = Some(ms);
+                v.sort_by(|a, b| b.3.cmp(&a.3).then(a.0.cmp(&b.0)));
+                let first: Vec<String> =
+                    v.iter().take(4).map(|&(n, e, k, w, s1)| format!("{n:#x} e{e}{} {w} ms (seq {s1})", tag(k))).collect();
+                log::line(&format!(
+                    "own: WARN {} enemies wait for {}'s release ack (it acked {}): {}{}; nobody runs them meanwhile",
+                    v.len(),
                     om::who(x),
-                    self.acks[x as usize % SLOTS]
+                    self.acks[i],
+                    first.join(", "),
+                    if v.len() > first.len() { ", ..." } else { "" }
                 ));
-            }
-            self.warn_at.retain(|n, _| self.table.rows.get(n).is_some_and(|r| r.publ.wait.is_some()));
-            for l in lines {
-                log::line(&l);
             }
         }
 
