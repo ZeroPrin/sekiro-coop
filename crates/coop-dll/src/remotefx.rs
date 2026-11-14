@@ -15,7 +15,8 @@
 //!    (PlayerRaw type `PTYPE`), the watcher applies / removes exactly those ids on the
 //!    owner's replica (`0x9E9C00` / `0xC00340`, the calls speffect.rs uses). The add is
 //!    FORCED: unforced, `0x9E9D10` refuses every SpEffect on a remote player (test4: 7735 x
-//!    "present false"). Level 2 also mirrors the enchant stateInfos the art events test.
+//!    "present false"). Level 1 also mirrors the prosthetic tool stateInfos (`GATES_TOOL`),
+//!    level 2 also the enchant stateInfos the art events test.
 //! 2. **Full-detail parts** (`native_full_parts`, default 1). The ChrAsm model builder
 //!    `0xA361C0` passes "not the local player" as the 6th argument of `0xE7B000`, which
 //!    stores it at model+0x2B and appends `_L` to every part name (`0x10D1CE0`) [V]. The
@@ -106,6 +107,16 @@ const EV_BEGIN: usize = 0x18;
 /// StateInfos the art events test (FINDINGS.txt § 4): 914 no enchantment (106000),
 /// 993 / 994 / 995 Mortal Draw / Floating Passage / Dragon Flash upgrades (EMEVD 9930-9932).
 const GATES_ART: [u16; 4] = [914, 993, 994, 995];
+/// Prosthetic tool stateInfos (level 1 too), docs/RE-REMOTE-FX.md "Протезы на реплике": the
+/// resident SpEffect of the active tool (SpEffectParam 127000..127921, e.g. 127010 shuriken
+/// = 905, 127810 spear = 941) and the coin-throw upgrades 127060..127063 (996..999, set by
+/// common.emevd on 10000 only) gate the tool FFX / sounds of the c0000 prosthetic animations
+/// [V params]. The replica loses its tool resident when loadout.rs dresses it and never gets
+/// the owner's (test9 client log: 0 "has" of any tool stateInfo on replica0, ~200 MISSING).
+const GATES_TOOL: [u16; 29] = [
+    905, 907, 908, 911, 913, 915, 916, 918, 919, 920, 922, 923, 925, 926, 927, 929, 930, 931, 934, 935, 941, 942, 943, 945, 946, 996,
+    997, 998, 999,
+];
 /// Enchant stateInfos the same events test (level 2).
 const GATES_ENCHANT: [u16; 9] = [62, 64, 152, 153, 356, 357, 358, 917, 940];
 
@@ -121,8 +132,8 @@ const MIRROR_LOGS: u32 = 40;
 pub fn gate_allowed(state_info: u16, level: u8) -> bool {
     match level {
         0 => false,
-        1 => GATES_ART.contains(&state_info),
-        _ => GATES_ART.contains(&state_info) || GATES_ENCHANT.contains(&state_info),
+        1 => GATES_ART.contains(&state_info) || GATES_TOOL.contains(&state_info),
+        _ => GATES_ART.contains(&state_info) || GATES_TOOL.contains(&state_info) || GATES_ENCHANT.contains(&state_info),
     }
 }
 
@@ -807,6 +818,27 @@ mod tests {
         assert!(gate_allowed(152, 2));
         assert!(!gate_allowed(0, 2));
         assert!(!gate_allowed(95, 2));
+    }
+
+    #[test]
+    fn prosthetic_tool_gates_are_mirrored_at_level_1() {
+        // 127010 shuriken (905), 127810 spear (941), 127330 axe LV4 (920), 127063 coin throw (996).
+        for si in [905, 941, 920, 996, 999, 946] {
+            assert!(gate_allowed(si, 1) && gate_allowed(si, 2), "tool stateInfo {si}");
+            assert!(!gate_allowed(si, 0));
+        }
+        // Deflect spark variants 902 / 906 (105025 / 105026) are set by the game on the replica
+        // itself: never mirrored. 940 is an enchant gate (level 2 only).
+        for si in [902, 906, 909, 910, 900, 901] {
+            assert!(!gate_allowed(si, 2), "stateInfo {si}");
+        }
+        assert!(!gate_allowed(940, 1) && gate_allowed(940, 2));
+        // Disjoint sets, no duplicates.
+        let mut all: Vec<u16> = GATES_ART.iter().chain(&GATES_TOOL).chain(&GATES_ENCHANT).copied().collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n);
     }
 
     #[test]

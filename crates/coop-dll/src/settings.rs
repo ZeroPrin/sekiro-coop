@@ -957,7 +957,8 @@ freeze_skip_driver_threads = 1
 ; The friend's combat art effects (docs/RE-REMOTE-FX.md): art slashes, Dragon Flash sounds and
 ; the extra Floating Passage / Mortal Draw effects need SpEffects the game's event script gives
 ; only to your own character. 1 = the friend's character on your screen gets the ones the friend
-; has (106000, 140310, 140510, 140610); 2 = also the enchant (buff) states the art events test;
+; has (106000, 140310, 140510, 140610) and its prosthetic tool states (127xxx: tool effects and
+; sounds); 2 = also the enchant (buff) states the art events test;
 ; 0 = off. Both players need this build (each sends its own).
 fx_speffect_mirror = 1
 ; 1 = the friend's character uses the full-detail parts (sharper textures) instead of the

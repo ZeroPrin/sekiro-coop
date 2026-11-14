@@ -67,7 +67,7 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `pvp_death_guard` | DEBUG | 1 (patches `0x66CE5C` even with PvP off) | Friendly fire |
 | `wardrobe`, `wardrobe_key`, `wardrobe_pad`, `wardrobe_pad_button`, `wardrobe_reload` | DISPLAY | 1, 113 (F2), 1, none, 0 | Wardrobe |
 | `wardrobe_skin`, `wardrobe_head`, `wardrobe_original`, `wardrobe_added`, `wardrobe_owner` | DISPLAY | game, skin, empty, empty, empty (written by the panel; older builds' `wardrobe_legs` / `wardrobe_all_parts` are ignored) | Wardrobe |
-| `fx_speffect_mirror` | DEBUG | 1 (0 off, 2 = also enchant states) | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
+| `fx_speffect_mirror` | DEBUG | 1 (art gates and, since test10, prosthetic tool states; 0 off, 2 = also enchant states) | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 | `native_full_parts` | DEBUG | 1 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 | `rest_refills_partner` | GAMEPLAY | 1 (as before) | 0 = the friend's rest respawns enemies and wakes a dead you, but does not refill a living you (HP, gourd, items). NOT verified live |
 | `remote_every_frame` | DEBUG | 1 | The friend's character updates every frame at any distance (0 = only while spectating) |
