@@ -3054,16 +3054,23 @@ pub(crate) mod own {
                             changed = true;
                         }
                     }
-                    if let Some((link, generation, a)) = o.ack
+                    // The ack: the Ack message, or a Status's applied seq (a lost Ack must not
+                    // stall a release wait); only ever forward.
+                    let i = s as usize % SLOTS;
+                    if let Some((link, generation, a)) = o.ack.take()
                         && accepts(link, generation)
-                        && a != self.acks[s as usize]
+                        && om::newer(a, self.acks[i])
                     {
-                        self.acks[s as usize] = a;
+                        self.acks[i] = a;
                         changed = true;
                     }
                     for st in o.status.drain(..) {
                         if !accepts(st.link, st.generation) {
                             continue;
+                        }
+                        if om::newer(st.applied, self.acks[i]) {
+                            self.acks[i] = st.applied;
+                            changed = true;
                         }
                         let p = st.flags & STATUS_PAUSED != 0;
                         if p != self.paused[s as usize] {
@@ -3454,7 +3461,10 @@ pub(crate) mod own {
                     self.mirror.rows.len()
                 ));
             }
-            if self.mirror.applied != 0 && self.mirror.applied != self.ack_sent {
+            // After every full the Ack goes again even when the seq did not move: the host
+            // re-sends a full while our ack is behind, so a lost Ack is repaired by it.
+            let got_full = msgs.iter().any(|a| a.full);
+            if self.mirror.applied != 0 && (self.mirror.applied != self.ack_sent || got_full) {
                 self.ack_sent = self.mirror.applied;
                 queue_ctrl(0, &Msg::Ack { generation: GEN_OUT[0].load(Ordering::Relaxed), applied_seq: self.ack_sent });
             }

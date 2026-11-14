@@ -1009,6 +1009,128 @@ mod tests {
         assert!(w.report(C, 60, &[0x802], &host, seq).is_empty());
     }
 
+    /// Deterministic pseudo-random numbers for the lossy-lane simulation.
+    struct Lcg(u64);
+    impl Lcg {
+        fn lose(&mut self, pct: u64) -> bool {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % 100 < pct
+        }
+    }
+
+    /// What the simulation counted.
+    #[derive(Debug)]
+    struct SimOut {
+        /// Hand-overs client -> host completed (the release acked).
+        back_to_host: u32,
+        /// The longest release wait (ms).
+        longest_wait: u64,
+        /// Host-near phases that ended with the host not owning the enemy.
+        stuck_phases: u32,
+    }
+
+    /// The host's table, `LinkOut` and the client's real `Mirror` over a lossy lane: host ->
+    /// client Assigns lost at `lose_assign` % (the lane skipping a gap: later messages still
+    /// arrive in order), client -> host Acks at `lose_ack` %, Status reports at
+    /// `lose_status` %. Every message arrives 120 ms after it is sent. The players swap
+    /// sides every 10 s, so the enemy goes host -> client -> host ... Panics on two owners.
+    fn simulate(seed: u64, lose_assign: u64, lose_ack: u64, lose_status: u64) -> SimOut {
+        const N: u16 = 0x800;
+        const LAG: u64 = 120;
+        let mut rng = Lcg(seed);
+        let mut t = HostTable::default();
+        let mut link = LinkOut::default();
+        let mut acked = 0u32;
+        let mut full_at = 0u64;
+        let mut m = Mirror::default();
+        let mut ack_sent = 0u32;
+        let mut status_at = 0u64;
+        type Assign = (u64, bool, u32, u32, Vec<(u16, u8, u32)>);
+        let mut to_client: VecDeque<Assign> = VecDeque::new();
+        let mut to_host: VecDeque<(u64, u32)> = VecDeque::new();
+        let mut out = SimOut { back_to_host: 0, longest_wait: 0, stuck_phases: 0 };
+        for i in 0..2400u64 {
+            let now = i * 250;
+            let host_near = (i / 40) % 2 == 0;
+            let players = if host_near { two(10.0, 30.0) } else { two(40.0, 2.0) };
+            // Host: acks in, decide, send.
+            while to_host.front().is_some_and(|a| a.0 <= now) {
+                let (_, a) = to_host.pop_front().unwrap();
+                if newer(a, acked) {
+                    acked = a;
+                }
+            }
+            let ack = acked;
+            let tick = t.tick(&[Seen { net: N, entity: 1, kind: Kind::Ordinary, dead: false, players }], &[], |_| ack, |_| true, now);
+            for d in &tick.decided {
+                if let Some((x, waited, true)) = d.change.after {
+                    assert_eq!((x, d.change.to), (C, HOST));
+                    out.back_to_host += 1;
+                    out.longest_wait = out.longest_wait.max(waited);
+                }
+            }
+            let full_all = now.saturating_sub(full_at) >= FULL_EVERY_MS;
+            if full_all {
+                full_at = now;
+            }
+            let delta: Vec<(u16, u8, u32)> = tick.decided.iter().map(|d| (d.net, d.change.to, d.change.seq)).collect();
+            if let Some((send, _)) = link.plan(acked, t.seq, !delta.is_empty(), full_all, t.wait_overdue(C, now), false, now) {
+                let (full, base, entries) = match send {
+                    Send::Full => (true, 0, t.full()),
+                    Send::Delta { base } => (false, base, delta),
+                };
+                if !rng.lose(lose_assign) {
+                    to_client.push_back((now + LAG, full, t.seq, base, entries));
+                }
+            }
+            // Client: apply, ack (again after every full), Status every 2 s.
+            let mut got_full = false;
+            while to_client.front().is_some_and(|a| a.0 <= now) {
+                let (_, full, seq, base, entries) = to_client.pop_front().unwrap();
+                m.apply(full, seq, base, &entries, now);
+                got_full |= full;
+            }
+            if m.applied != 0 && (m.applied != ack_sent || got_full) {
+                ack_sent = m.applied;
+                if !rng.lose(lose_ack) {
+                    to_host.push_back((now + LAG, ack_sent));
+                }
+            }
+            if now.saturating_sub(status_at) >= STATUS_EVERY_MS {
+                status_at = now;
+                if !rng.lose(lose_status) {
+                    to_host.push_back((now + LAG, m.applied));
+                }
+            }
+            // Never two brains: the host runs it by its own publication, the client by what it
+            // applied.
+            assert!(!(t.published(N) == HOST && m.owner(N) == C), "two owners at {now} ms (seed {seed})");
+            if host_near && i % 40 == 39 && t.published(N) != HOST {
+                out.stuck_phases += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn hand_overs_complete_over_a_lossy_lane_and_never_double() {
+        for seed in 1..=20u64 {
+            // Everything lossy.
+            let o = simulate(seed, 15, 30, 30);
+            assert!(o.back_to_host >= 25 && o.stuck_phases == 0, "seed {seed}: {o:?}");
+            // Every Ack lost: the Status reports carry the ack.
+            let o = simulate(seed, 15, 100, 0);
+            assert!(o.back_to_host >= 25 && o.stuck_phases == 0, "seed {seed}, no Acks: {o:?}");
+            // No Status at all: the Ack sent again after every full repairs a lost one.
+            let o = simulate(seed, 15, 30, 100);
+            assert!(o.back_to_host >= 25 && o.stuck_phases == 0, "seed {seed}, no Status: {o:?}");
+        }
+        // The hand-over itself is quick when nothing is lost: one round trip.
+        let o = simulate(7, 0, 0, 0);
+        assert_eq!((o.back_to_host, o.stuck_phases), (29, 0));
+        assert!(o.longest_wait <= 500, "{o:?}");
+    }
+
     #[test]
     fn link_out_resends_a_full_only_when_an_old_send_is_unacked() {
         let mut l = LinkOut::default();
