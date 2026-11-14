@@ -53,7 +53,8 @@
 //! generation for that link. The host's type 23 reaches the right client through the
 //! recipient wrap at `0xA1DFC1` (rcx = the recipient chr) or `0xA1DFDD` (rcx = its
 //! record). `MSG_ENGAGED` tells the clients who is engaged. Enemy ownership
-//! (PROTO 7): the game's own 22/23 distribution, no override (docs/PLAN-NATIVE-OWNERSHIP.md).
+//! (PROTO 7, final test14 wire format PROTO 8): the game's own 22/23 distribution, no
+//! override (docs/PLAN-NATIVE-OWNERSHIP.md).
 //! Safety rules for N: a peer's own trouble disengages only that peer; our block
 //! change, a rest, a load disengage all; a same-block peer that cannot join the native
 //! session (unavailable, latched failure, fallback world, no hello) keeps everyone in
@@ -154,8 +155,10 @@ const LANE_ACK: u32 = 0xFF;
 /// player netIds `0xFFF0 | slot`, game frames with origin + send mode, Owned / Lives with
 /// origin, Engaged; 6: host-authored enemy ownership, Status / Assign / Claims / Ack,
 /// docs/PLAN-OWNERSHIP.md; 7: that table removed, the game's own 22/23
-/// distribution decides, docs/PLAN-NATIVE-OWNERSHIP.md).
-const PROTO: u8 = 7;
+/// distribution decides, docs/PLAN-NATIVE-OWNERSHIP.md; 8: the final test14 wire format,
+/// OwnView (5) and the lives byte after every type 21: PROTO 7 builds inside the test14
+/// series differ in both, so they never meet a test14 release).
+const PROTO: u8 = 8;
 
 const MSG_HELLO: u8 = 1;
 const MSG_LIST: u8 = 2;
