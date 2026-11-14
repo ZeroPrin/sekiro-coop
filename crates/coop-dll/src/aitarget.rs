@@ -19,11 +19,21 @@
 //! frames come (the +50 is dropped only then) and whether a friend's hit on the enemy shows on
 //! this machine's record of the friend's replica (hitF 2).
 //!
-//! Log volume (review): per-enemy lines only on a replan frame with both players sampled (at
-//! most one a second per enemy) and on a top change; 10 s summaries only for enemies with a
-//! replan frame, a hit or a top change in the window and a friend in their list; every
-//! `aitarget:` line shares a budget of `LineBudget::PER_SEC` a second, the rest is counted
-//! and reported at most once per 10 s.
+//! Log volume (test10, after the per-record fix): nothing is logged per sample. Events
+//! (TARGET between players, HIT, "knows") and the 10 s per-enemy summaries (only for enemies
+//! with a replan frame, a hit or a top change in the window and a friend in their list) share
+//! the `EventBudget` (30 lines a second: a safety valve that a normal fight never reaches,
+//! test9 had ~1 real event a minute per side); replan lines (a replan frame with 2+ players
+//! scored, at most one a second per enemy, the rest counted in the summary) have their own
+//! `ReplanBudget` (10 a second), so they can never starve the events. What a budget holds back
+//! is counted and reported at most once per 10 s. The hook statistics line comes once a
+//! minute. Expected: ~600-700 lines an hour per side in a fight-heavy session (estimate from
+//! the test9 logs in FORK.md "Enemy target choice, observed").
+//!
+//! The hook writes into one of `SHARDS` tables chosen by the enemy (`shard_of`): AI updates of
+//! different enemies run on several worker threads at once, and with one table their
+//! `try_lock` collided (test9 host: 40,761 samples dropped as "table busy", up to 25% in a
+//! big fight). A busy shard still drops the sample: the hook never waits.
 //!
 //! Offsets (all RVAs / offsets for 1.06; [VAR] = read in the decompiled code):
 //! - `0x61DE40` prologue `48 89 5C 24 18 48 89 74 24 20 57 48 83 EC 60` (15 bytes, read from
@@ -153,17 +163,22 @@ pub fn due(last: u64, now: u64, gap: u64) -> bool {
     last == 0 || now.saturating_sub(last) >= gap
 }
 
-/// Shared budget of every `aitarget:` line: `PER_SEC` a second, the rest counted.
+/// A line budget: `PER_SEC` lines a second, the rest counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct LineBudget {
+pub struct LineBudget<const PER_SEC: u32> {
     sec_start: u64,
     used: u32,
     pub suppressed: u32,
     last_note: u64,
 }
 
-impl LineBudget {
-    pub const PER_SEC: u32 = 10;
+/// Events (TARGET, HIT, knows) and summaries: a safety valve only.
+pub type EventBudget = LineBudget<30>;
+/// Replan lines (already at most one a second per enemy).
+pub type ReplanBudget = LineBudget<10>;
+
+impl<const PER_SEC: u32> LineBudget<PER_SEC> {
+    pub const PER_SEC: u32 = PER_SEC;
     pub const NOTE_GAP_MS: u64 = 10_000;
 
     pub fn allow(&mut self, now: u64) -> bool {
@@ -238,6 +253,8 @@ pub const STALE_MS: u64 = 5_000;
 /// Per-enemy replan line gap and summary window.
 pub const LINE_GAP_MS: u64 = 1_000;
 pub const SUMMARY_MS: u64 = 10_000;
+/// Hook statistics line (calls, busy drops) gap.
+pub const PERF_MS: u64 = 60_000;
 
 fn is_friend(slot: usize) -> bool {
     (1..SLOTS).contains(&slot)
@@ -404,8 +421,15 @@ pub fn worth_logging(ev: &Event, multi: bool) -> bool {
         }
 }
 
-pub const EVENTS: usize = 64;
-pub const ENEMIES: usize = 64;
+/// Per shard (`SHARDS` of them: 256 events a frame, 128 enemies in all).
+pub const EVENTS: usize = 32;
+pub const ENEMIES: usize = 16;
+pub const SHARDS: usize = 8;
+
+/// The shard of an enemy (its ChrIns address; Fibonacci hash, top 3 bits).
+pub fn shard_of(ai: usize) -> usize {
+    ((ai as u64 >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 61) as usize % SHARDS
+}
 
 /// Everything the hook writes. Fixed size: the hook never allocates.
 pub struct Table {
@@ -606,7 +630,7 @@ static PLAYER_CALLS: AtomicU64 = AtomicU64::new(0);
 static BUSY: AtomicU64 = AtomicU64::new(0);
 static BAD_OWNER: AtomicU64 = AtomicU64::new(0);
 static NO_REPLAN: AtomicU64 = AtomicU64::new(0);
-static TABLE: Mutex<Table> = Mutex::new(Table::new());
+static TABLES: [Mutex<Table>; SHARDS] = [const { Mutex::new(Table::new()) }; SHARDS];
 
 enum Install {
     NotTried,
@@ -621,8 +645,9 @@ static BUSY_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
 type ScoreFn = extern "C" fn(usize, usize) -> f32;
 
-fn table() -> MutexGuard<'static, Table> {
-    TABLE.lock().unwrap_or_else(PoisonError::into_inner)
+/// Frame task only: waits for shard `i` (the hook only try-locks).
+fn shard(i: usize) -> MutexGuard<'static, Table> {
+    TABLES[i % SHARDS].lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn start() -> Instant {
@@ -705,8 +730,8 @@ fn observe(rec: usize, ctx: usize, score: f32) {
             is_top: field::<u8>(rec + REC_IS_TOP) != 0,
             replan,
         };
-        // Never wait in the AI update: a busy table drops this sample.
-        match TABLE.try_lock() {
+        // Never wait in the AI update: a busy shard drops this sample.
+        match TABLES[shard_of(ai)].try_lock() {
             Ok(mut t) => t.record(ai, rec, slot, s),
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().record(ai, rec, slot, s),
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -781,7 +806,8 @@ struct Frame {
 #[derive(Default)]
 pub struct AiTarget {
     frame: Frame,
-    budget: LineBudget,
+    events: EventBudget,
+    replans: ReplanBudget,
     dropped: u32,
     dropped_log_ms: u64,
     last_perf_ms: u64,
@@ -793,7 +819,9 @@ pub fn on_loading() {
     for h in &HANDLES {
         h.store(NO_HANDLE, Relaxed);
     }
-    *table() = Table::new();
+    for i in 0..SHARDS {
+        *shard(i) = Table::new();
+    }
 }
 
 fn enemy_name(ai: usize) -> String {
@@ -818,9 +846,15 @@ impl AiTarget {
         format!("{} (hp {})", self.label(slot as u8), hp.map_or_else(|| "?".to_string(), |h| h.to_string()))
     }
 
-    /// Every `aitarget:` line except the budget's own notes goes through here.
+    /// Events and summaries (everything but replan lines and the notes).
     fn line(&mut self, now: u64, msg: &str) {
-        if self.budget.allow(now) {
+        if self.events.allow(now) {
+            log::line(msg);
+        }
+    }
+
+    fn replan_line(&mut self, now: u64, msg: &str) {
+        if self.replans.allow(now) {
             log::line(msg);
         }
     }
@@ -870,19 +904,20 @@ impl AiTarget {
     }
 
     fn drain(&mut self, now: u64) {
-        // Copy out under the lock (only the enemies seen lately), format after: the hook only
-        // try-locks. Nothing to do: no copy at all.
-        let got = {
-            let mut t = table();
-            if t.active(now) {
-                let (ev, n, d) = t.take_events();
-                let live: Vec<Enemy> = t.enemies.iter().filter(|e| e.ai != 0 && now.saturating_sub(e.last_ms) <= PRESENT_MS).copied().collect();
-                Some((ev, n, d, live))
-            } else {
-                None
-            }
-        };
-        if let Some((events, n, dropped, live)) = got {
+        // Copy out under each shard's lock (only the enemies seen lately), format after: the
+        // hook only try-locks. An idle shard: no copy at all.
+        for i in 0..SHARDS {
+            let got = {
+                let mut t = shard(i);
+                if t.active(now) {
+                    let (ev, n, d) = t.take_events();
+                    let live: Vec<Enemy> = t.enemies.iter().filter(|e| e.ai != 0 && now.saturating_sub(e.last_ms) <= PRESENT_MS).copied().collect();
+                    Some((ev, n, d, live))
+                } else {
+                    None
+                }
+            };
+            let Some((events, n, dropped, live)) = got else { continue };
             self.dropped += dropped;
             for ev in events.iter().take(n).flatten() {
                 let multi = live.iter().find(|e| e.ai == ev.ai()).is_some_and(|e| e.present(now).len() >= 2);
@@ -891,12 +926,12 @@ impl AiTarget {
                     self.line(now, &text);
                 }
             }
-            self.enemy_lines(now, &live);
+            self.enemy_lines(now, i, &live);
         }
         self.notes(now);
     }
 
-    fn enemy_lines(&mut self, now: u64, live: &[Enemy]) {
+    fn enemy_lines(&mut self, now: u64, shard_index: usize, live: &[Enemy]) {
         let mut marks: Vec<(usize, Option<u64>, bool)> = Vec::new();
         for e in live {
             if e.replan_line_due(now) {
@@ -911,7 +946,7 @@ impl AiTarget {
                     self.label(e.top),
                     now.saturating_sub(e.top_since_ms) as f32 / 1000.0,
                 );
-                self.line(now, &text);
+                self.replan_line(now, &text);
                 marks.push((e.ai, Some(e.replan_frame), false));
             }
             if let Some(log_it) = e.summary_due(now) {
@@ -934,7 +969,7 @@ impl AiTarget {
         if marks.is_empty() {
             return;
         }
-        let mut t = table();
+        let mut t = shard(shard_index);
         for (ai, logged, window) in marks {
             if let Some(e) = t.enemies.iter_mut().find(|e| e.ai == ai) {
                 if let Some(f) = logged {
@@ -956,19 +991,25 @@ impl AiTarget {
     /// Rate-limited notes outside the line budget (each at most once per 10 s).
     fn notes(&mut self, now: u64) {
         if self.dropped > 0 && due(self.dropped_log_ms, now, SUMMARY_MS) {
-            log::line(&format!("aitarget: {} event(s) dropped (more than {EVENTS} in one frame) in the last 10 s or so", self.dropped));
+            log::line(&format!(
+                "aitarget: {} event(s) dropped (more than {EVENTS} in one frame in one table shard) in the last 10 s or so",
+                self.dropped
+            ));
             self.dropped = 0;
             self.dropped_log_ms = now;
         }
-        if let Some(n) = self.budget.note(now) {
-            log::line(&format!("aitarget: {n} line(s) suppressed (more than {} a second)", LineBudget::PER_SEC));
+        if let Some(n) = self.events.note(now) {
+            log::line(&format!("aitarget: {n} event / summary line(s) suppressed (more than {} a second)", EventBudget::PER_SEC));
         }
-        if due(self.last_perf_ms, now, SUMMARY_MS) {
+        if let Some(n) = self.replans.note(now) {
+            log::line(&format!("aitarget: {n} replan line(s) suppressed (more than {} a second)", ReplanBudget::PER_SEC));
+        }
+        if due(self.last_perf_ms, now, PERF_MS) {
             let cur = [&CALLS, &PLAYER_CALLS, &BUSY, &BAD_OWNER, &NO_REPLAN].map(|a| a.load(Relaxed));
             if self.last_perf_ms != 0 && cur[0] > self.last[0] {
                 let secs = now.saturating_sub(self.last_perf_ms) as f32 / 1000.0;
                 log::line(&format!(
-                    "aitarget: score calls {:.0}/s, {:.0}/s about a player; in {secs:.0}s {} sample(s) dropped (table busy), {} skipped (owner vtable not 0x142961690), {} with the replan state unknown",
+                    "aitarget: score calls {:.0}/s, {:.0}/s about a player; in {secs:.0}s {} sample(s) dropped (table shard busy), {} skipped (owner vtable not 0x142961690), {} with the replan state unknown",
                     (cur[0] - self.last[0]) as f32 / secs,
                     (cur[1] - self.last[1]) as f32 / secs,
                     cur[2] - self.last[2],
@@ -1322,10 +1363,11 @@ mod tests {
         assert_eq!(top(0, 1).ai(), 1);
     }
 
-    /// Review: the global budget holds every second, the rest is counted and reported at
-    /// most once per 10 s.
+    /// Review: a budget holds every second, the rest is counted and reported at most once
+    /// per 10 s.
     #[test]
     fn line_budget_bounds() {
+        type LineBudget = ReplanBudget;
         let mut b = LineBudget::default();
         let mut logged = 0;
         // 100 lines a second for 30 s (every 10 ms).
@@ -1351,6 +1393,70 @@ mod tests {
         let mut q = LineBudget::default();
         assert!(q.allow(5));
         assert_eq!(q.note(20_000), None);
+    }
+
+    #[test]
+    fn shards_cover_every_enemy() {
+        let mut seen = [0u32; SHARDS];
+        // ChrIns addresses: 16-byte aligned, a few KB apart (heap).
+        for k in 0..800usize {
+            let ai = 0x7ff3_a7ef_0000 + k * 0x2A60;
+            let i = shard_of(ai);
+            assert!(i < SHARDS);
+            assert_eq!(i, shard_of(ai), "stable");
+            seen[i] += 1;
+        }
+        assert!(seen.iter().all(|&n| n >= 50), "spread {seen:?}");
+    }
+
+    /// test10 volume: a long fight of 4 enemies against both players logs only what happens
+    /// (first notice, real hits, real switches) and at most one replan line a second per
+    /// enemy; nothing per sample, and the event budget is never reached.
+    #[test]
+    fn steady_fight_is_quiet() {
+        let mut t = Table::new();
+        let enemies = [0x1000usize, 0x2000, 0x3000, 0x4000];
+        let mut events_per_sec = std::collections::HashMap::<u64, u32>::new();
+        let (mut hits, mut tops, mut appears, mut replan_lines) = (0, 0, 0, 0);
+        for f in 1..=3600u64 {
+            // 60 s at 60 fps. Replan every 30 frames; a hit by the friend on enemy 0 every
+            // 10 s; enemy 1 switches to the friend at 20 s and back at 40 s.
+            let ms = f * 16;
+            let replan = f % 30 == 0;
+            for (n, &ai) in enemies.iter().enumerate() {
+                let friend_top = n == 1 && (1250..2500).contains(&f);
+                let hit_age = (f % 600) as f32 / 60.0;
+                let friend_hit = if n == 0 { (10.0 - hit_age).max(0.0) } else { 0.0 };
+                let base = |score, top: bool| Sample { is_top: top, replan: Some(replan), perceived: true, ..s(ms, f, score) };
+                // Two records of us (current + stale) and one of the friend.
+                t.record(ai, ai + 0x10, 0, base(51.0, !friend_top));
+                t.record(ai, ai + 0x18, 0, Sample { forget: 5.0, ..base(0.5, false) });
+                t.record(ai, ai + 0x20, 1, Sample { hit_timer: friend_hit, ..base(1.0, friend_top) });
+                let e = &mut t.enemies[t.entry(ai, ms)];
+                if e.replan_line_due(ms) {
+                    replan_lines += 1;
+                    e.line_ms = ms;
+                    e.logged_replan = e.replan_frame;
+                }
+            }
+            let (ev, n, d) = t.take_events();
+            assert_eq!(d, 0);
+            for e in ev.into_iter().take(n).flatten() {
+                match e {
+                    Event::Hit { .. } => hits += 1,
+                    Event::Top { .. } => tops += 1,
+                    Event::Appear { .. } => appears += 1,
+                }
+                *events_per_sec.entry(ms / 1000).or_default() += 1;
+            }
+        }
+        assert_eq!(appears, 8, "each enemy notices each player once");
+        // The friend's record appears with a fresh timer at frame 1 (counted), then a hit
+        // every 10 s (frames 600, 1200, .., 3600).
+        assert_eq!(hits, 7, "one HIT per real hit");
+        assert_eq!(tops, 4 + 2, "first target of each enemy + the two real switches");
+        assert!(replan_lines <= 4 * 61, "{replan_lines}");
+        assert!(events_per_sec.values().all(|&n| n <= EventBudget::PER_SEC), "{events_per_sec:?}");
     }
 
     /// Review: per-enemy lines only on a new replan frame with 2+ players, at most one a

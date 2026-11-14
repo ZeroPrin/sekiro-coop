@@ -1014,10 +1014,24 @@ Log lines (only enemies that know both players, or events that involve the frien
   peer1 1 (at least)`: how often the engine replans (§9.1); only for enemies with a replan frame, a
   hit or a top change in the window and the friend in their list (an idle boss stays silent). Hits
   are every rise of the record's hit timer; two hits between two samples count once.
-- `aitarget: score calls N/s, M/s about a player; ... dropped (table busy), ... skipped (owner vtable
-  not 0x142961690), ... with the replan state unknown`: cost and sanity check every 10 s.
-- All `aitarget:` lines share a budget of 10 a second; the rest is counted in one
-  `aitarget: N line(s) suppressed` line at most every 10 s (the same for dropped events).
+- `aitarget: score calls N/s, M/s about a player; ... dropped (table shard busy), ... skipped (owner
+  vtable not 0x142961690), ... with the replan state unknown`: cost and sanity check once a minute
+  (every 10 s before test10).
+- Budgets (test10): events (TARGET, HIT, knows) and summaries share 30 lines a second, a safety
+  valve a normal fight does not reach; replan lines have their own 10 a second, so they cannot
+  starve the events. What a budget holds back is counted in `aitarget: N event / summary line(s)
+  suppressed` / `N replan line(s) suppressed`, at most every 10 s (the same for dropped events).
+  Before test10 all lines shared 10 a second, and the per-record bug's fake lines used it up
+  (test9 host: 155,356 lines suppressed, real events among them).
+- "Table busy" (test9 host: 40,761 samples, up to 25% in big fights): AI updates of different
+  enemies run on several threads at once and collided on the one table's `try_lock`. Since test10
+  the hook writes into one of 8 tables chosen by the enemy's address; a busy one still drops the
+  sample (the hook never waits).
+- Volume estimate for test10 from the test9 logs (2.7 h, per side): ~60-90 real switches + ~50
+  first targets, ~160-360 real hits, ~280 knows, ~550 replan lines (at most one a second per
+  enemy; test9 counted ~610-720 replan frames with both players), ~240 summaries, ~160 hook
+  statistics: about 1500-1800 lines per side, ~600-700 an hour (test9 host: 7,200 logged + 58,000
+  suppressed an hour).
 
 Records are keyed by their address within each enemy, not by player: an enemy can hold two
 records for the same player (the current one and a stale "unseen / forget" one), and keyed per
