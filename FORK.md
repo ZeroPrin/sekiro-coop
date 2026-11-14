@@ -571,7 +571,13 @@ Left/Right = change, applied 200 ms after the last press (Enter = at once), Esc 
 close. The panel closes by itself when a loading screen starts (`game::load_pending` in the
 wardrobe tick, and the world reset of a load) and does not open again until the load is
 over: left open it kept holding the keyboard (`ui.rs` `message_filter`) through the load,
-and F7 / F11 did not get through (live 2026-11-13). Controller: right stick + right trigger while the panel is open (`wardrobe_pad`), an
+and F7 / F11 did not get through (live 2026-11-13). Two paths: `wardrobe: panel closed (loading)`
+when an in-world frame sees GameMan+0x10 (set by `0x832EE0` / `0x6D7070` for idol travel and the
+death reload) before the player goes [ARV: whether such a frame exists is not seen live], and
+`wardrobe: panel closed (world reset)` from `invalidate_world` on the first frame without a player
+(every area load, our own warp, a re-created player) at the latest. The test9 logs have neither
+line because the panel was never open when a load started (five open windows of 4-88 s in the
+client's three runs, none in the host's; no load in any of them), not because the path failed. Controller: right stick + right trigger while the panel is open (`wardrobe_pad`), an
 open button only if `wardrobe_pad_button` names one. Nothing is read or written until a
 choice other than "As in game" is made. The native Co-op Settings page has no rows for it:
 the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
