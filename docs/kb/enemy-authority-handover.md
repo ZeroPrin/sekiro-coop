@@ -2,6 +2,10 @@
 
 Research note, 2026-11-14. Read-only research: nothing was built or run.
 
+> **test14 (2026-11-15): the test11 implementation below is deleted.** The owner table, the
+> `IsOwnedHere` detour and the claims are gone; the game's native 22 / 23 decides, with a passive
+> owner view for evidence (`docs/PLAN-NATIVE-OWNERSHIP.md`). Read the test11 banner as history.
+
 > **Implemented in test11** (`docs/PLAN-OWNERSHIP.md`, `crates/coop-dll/src/ownership.rs`, nsession.rs
 > `own`): suggestion (1) as a host-authored owner table on our control lane instead of writing the
 > native records, with (2) release-then-acquire, (3) per-entry seq + full resync, (5) the boss pin

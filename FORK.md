@@ -2,9 +2,9 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test13`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test14`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test13`: nothing in the sections below marked experimental or
+> **Test build `1.0.9-pickups.3-test14`: nothing in the sections below marked experimental or
 > "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
 > onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
@@ -35,7 +35,60 @@ Version string: `1.0.9-pickups.3-test13`. Everybody in a session needs the same 
 > cleared on warps; the auditor ranks bosses before elites and labels elites; throwprobe logs posture
 > and the AI target with a `+0 s` line (budget 536 lines). Known leftover: a solo world whose Senpou lift
 > was killed by a test5 session stays dead (not repaired automatically; joining a host whose lift works
-> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. `test10` adds Reed as a separate skin (`reed.rs`, section "Wardrobe"; only with all eight Reed part files in the parts package), fixes the `aitarget:` logger (records keyed by address: no fake `TARGET me -> me` / HIT lines; separate event and replan budgets, a sharded sample table, section "Enemy target choice, observed"), mirrors the friend's prosthetic tool states onto its replica (`fx_speffect_mirror = 1`: tool flashes and sounds, `docs/RE-REMOTE-FX.md` "Протезы на реплике"; the 906 deflect-spark "gap" was none) and removes `fx_debug`; the wardrobe close-on-load was checked (works, never triggered in test9). Checklist: section "test10 co-op checklist". `test11` replaces enemy AI ownership: the host alone decides which machine runs each enemy (an owner table sent on our control lane, PROTO 6), and `IsOwnedHere` answers only from that table on both machines; ownfill, the boss stripping, the pause hand-over, the prio-0xFFFF stealth claims and contests are gone, stealth claims are requests to the host, and the ini keys `ns_force_distribution` / `ns_throw_claims` are removed (`docs/PLAN-OWNERSHIP.md`; section "test11 co-op checklist"). `test12` is test11 plus the Red Armour outfit as a separate skin with its own head (`red.rs`, section "Wardrobe"; only with all eight Red part files in the parts package); Reed and Red share one table-driven module (`partskin.rs`). `test13` replaces the death debuff with Karma (`karma.rs`, section "test13 additions (Karma)"; `death_debuff_icon` is gone). The oracle is a playtest with both logs.
+> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. `test10` adds Reed as a separate skin (`reed.rs`, section "Wardrobe"; only with all eight Reed part files in the parts package), fixes the `aitarget:` logger (records keyed by address: no fake `TARGET me -> me` / HIT lines; separate event and replan budgets, a sharded sample table, section "Enemy target choice, observed"), mirrors the friend's prosthetic tool states onto its replica (`fx_speffect_mirror = 1`: tool flashes and sounds, `docs/RE-REMOTE-FX.md` "Протезы на реплике"; the 906 deflect-spark "gap" was none) and removes `fx_debug`; the wardrobe close-on-load was checked (works, never triggered in test9). Checklist: section "test10 co-op checklist". `test11` replaces enemy AI ownership: the host alone decides which machine runs each enemy (an owner table sent on our control lane, PROTO 6), and `IsOwnedHere` answers only from that table on both machines; ownfill, the boss stripping, the pause hand-over, the prio-0xFFFF stealth claims and contests are gone, stealth claims are requests to the host, and the ini keys `ns_force_distribution` / `ns_throw_claims` are removed (`docs/PLAN-OWNERSHIP.md`; section "test11 co-op checklist"). `test12` is test11 plus the Red Armour outfit as a separate skin with its own head (`red.rs`, section "Wardrobe"; only with all eight Red part files in the parts package); Reed and Red share one table-driven module (`partskin.rs`). `test13` replaces the death debuff with Karma (`karma.rs`, section "test13 additions (Karma)"; `death_debuff_icon` is gone). `test14` deletes test11's owner table again: the game's own 22 / 23 decides which PC runs each enemy, as in LukeYui's mods (PROTO 7), with a passive owner view (`own:` lines), the attacker's lives on every relayed hit, a shape check of behaviour packets (type 70) before the game parses them, hits aimed at our own player counted (dropped while friendly fire is off) and a `deathblow: TRACE` line per deathblow (`docs/PLAN-NATIVE-OWNERSHIP.md`; section "test14 co-op checklist"). The oracle is a playtest with both logs.
+
+## test14 co-op checklist (native enemy ownership)
+
+Both players on `1.0.9-pickups.3-test14` (PROTO 7: an older build is refused at the hello),
+`native_session_stage = 3`. Plan: `docs/PLAN-NATIVE-OWNERSHIP.md`; notes:
+`docs/IMPLEMENTATION-NOTES.md` section "test14". The mod no longer decides which PC runs an enemy:
+the game does it, as in LukeYui's Sekiro Online. The new lines only watch. Mark each step with F11
+on both sides. Nothing in this list needs a setting.
+
+1. **Join and load in.** The enemies around you should move and attack normally on both screens
+   right after the loading screen. Client log: `nsession: the host's sync runs (...); its first 23
+   is due within 5 s`, then `nsession: first 23 N ms after engage, owned here K: members chr loop
+   patched ...`; both: `nsession: load -> ENGAGED in T ms (enemies local on both meanwhile)`. Every
+   10 s the host logs `own (10 s): host H / peer1 C (OwnView), owned here K, doubles 0,
+   ownerless-near 0, ...` and the client `own (10 s): owned here H, running here R, 23 rx T, ...`.
+   No `own:` line may mention a "table" (that was test11).
+2. **Fight a group together, standing close.** Every enemy fights, none stands frozen or walks in
+   place. Summaries: `doubles 0`, `ownerless-near 0`, few `own: FLAP` lines.
+3. **The client runs about 40 m ahead into a new group.** Those enemies fight the client on both
+   screens. Within about 8 s the host's summary moves them from `host` to `peer1`. If the client
+   feels its deflects land late on enemies right next to it while the host is far away, look for
+   `own: SLOW 0x.. eE peer1 nearer by D m for T s, still the host's (...)`.
+4. **Posture deathblow on an enemy the other PC runs** (host does one, then the client).
+   - A miniboss with two lives (two red dots): after the deathblow one dot is gone on BOTH screens
+     and it does not stand up with the old dot. The PC that runs it logs `hit: lives byte 1 for
+     0x.. eE (ours 2): lowered and refilled before the hit`. The attacker logs `deathblow: TRACE
+     0x.. eE owned elsewhere, lives 2->1 ..., outcome life lost`.
+   - An ordinary enemy: it dies on both screens; TRACE `outcome died`.
+   - Any TRACE `outcome stood up` after a real deathblow animation is the bug to report.
+5. **Both press deathblow on the same enemy at once.** Only one deathblow animation plays. The
+   `deathblow:` lock lines are as in test6 (`locked by us` / `suppressed (peer first)`).
+6. **Sneak up on an enemy the other PC runs and backstab it** (stealth deathblow). Note whether
+   the red deathblow marker appears and whether the enemy noticed you early. The TRACE line says
+   `owned elsewhere`; `the gate showed our stealth deathblow on it while owned elsewhere` means
+   the marker was there.
+7. **Boss or miniboss** (Guardian Ape, the Blazing Bull, a headless). The fight should feel like
+   solo. Both logs: `own: BOSS 0x.. eE owner here|elsewhere (native 23, first seen), prio here P,
+   peer Q` once, then one BOSS line per change. Several owner changes in a short time
+   (`own: FLAP ... [boss]`) or a boss that jumps / resets its stance is worth a note with the time.
+8. **The host dies in a boss fight and watches (spectates).** Can the client still finish the
+   boss? Host log every 10 s while it lasts: `own: OWNER-DOWN N enemies (B bosses) owned on a
+   dead/spectating machine (host) within 40 m of the living player for T s`. Note whether the boss
+   stopped fighting.
+9. **The host opens a menu that pauses its game.** Enemies run by the host freeze on the client's
+   screen until the menu closes (expected: the game cannot help here). Client log: `own:
+   HOST-SILENT T s: K enemies near us owned by the host stand still`.
+10. **Load, rest at an idol, disconnect and reconnect.** After each: a new `load -> ENGAGED in T ms`
+    and the step-1 lines again.
+11. **Long session (1-2 h).** The host's summaries keep `doubles` near 0. Every `own: DOUBLE 0x..
+    eE runs on host and peer1 (2 reports); host copy +0x2040 a, ...` and every `own:
+    OWNERLESS-NEAR ...` line is worth a look with the time. Also grep for `nsession: type 70 from
+    peer` (`refused` = a malformed behaviour packet was kept away from the game) and `hit: a 21 from
+    peer N aimed at our own player` (counted; dropped while friendly fire is off).
 
 ## test13 additions (Karma)
 
@@ -48,8 +101,8 @@ item (key item, count shown, at most 6) after the reload; each one lowers max HP
 Resting at an idol yourself removes all of it (solo too); the friend's rest does not. Setting
 `death_debuffs` turns it on / off (host's value while linked; off = no new Karma, held Karma
 inert). Solo test: `[DEBUG] debug_hotkeys = 1`, F1 = one Karma (F2 stays the wardrobe). Also: the replica SpEffect
-mirror now really removes effects (`0xBFB6D0` instead of `0xC00340`, remotefx.rs). The test11 and
-test12 checklists below still apply (test11 was never played in co-op). Log prefix `karma:`.
+mirror now really removes effects (`0xBFB6D0` instead of `0xC00340`, remotefx.rs). The test12
+checklist below still applies; the test11 one is superseded by test14. Log prefix `karma:`.
 
 ## test12 additions (Red Armour)
 
@@ -62,6 +115,8 @@ sees the other's outfit; with the Red files renamed on B, B sees A as Ashina and
 peer slot N wears Red Armour but Red Armour is not available on this PC ...`.
 
 ## test11 co-op checklist (host-authored enemy ownership)
+
+**Superseded by test14:** the owner table below is deleted; kept for reading old logs.
 
 Both players on `1.0.9-pickups.3-test11` (PROTO 6: an older build is refused at the hello).
 Design: `docs/PLAN-OWNERSHIP.md`; notes: `docs/IMPLEMENTATION-NOTES.md` section "test11". The

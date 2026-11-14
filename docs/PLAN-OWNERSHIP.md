@@ -1,5 +1,9 @@
 # Plan: one host-authored owner table for enemy AI (Sekiro Together, branch anton/test7 @ 6e6358f)
 
+> **Superseded (test14, 2026-11-15).** Implemented in test11 and deleted in test14: the game's own
+> 22 / 23 distribution decides again, as in LukeYui's mods. See `docs/PLAN-NATIVE-OWNERSHIP.md`.
+> The code is on `anton/test11-ownership`.
+
 ## 0. Summary
 
 Native type-22/23 cannot be the only decider (§3 has the evidence), so the plan uses the fallback the user named.
