@@ -2940,6 +2940,9 @@ pub(crate) mod own {
         unowned_near: Vec<(u16, i32, f32)>,
         /// When the table went active here (ms): an enemy without an entry counts from then.
         active_at_ms: u64,
+        /// Client: when its late chr-loop patch went in (ms; 0 = not yet). Before it every
+        /// enemy keeps its own AI here whatever the table says, so DISOBEY counts from then.
+        chr_loop_at_ms: u64,
         disobey_at: Option<Instant>,
         /// netId -> last DISOBEY / DOUBLE line.
         detect_at: HashMap<u16, u64>,
@@ -2961,6 +2964,11 @@ pub(crate) mod own {
         /// Client: the first full Assign of this engagement is in.
         pub fn ready(&self) -> bool {
             self.mirror.ready
+        }
+
+        /// Client: the late chr-loop patch is in (enemies not ours go to NetAI from now).
+        pub fn chr_loop_in(&mut self) {
+            self.chr_loop_at_ms = crate::game::now_ms();
         }
 
         /// Teardown: everything goes (the host's seq counter keeps counting).
@@ -3258,7 +3266,7 @@ pub(crate) mod own {
                 } else {
                     self.table.rows.get(&n).map_or((0, self.active_at_ms), |r| (r.publ.seq, r.published_ms))
                 };
-                let age = ms.saturating_sub(at.max(self.active_at_ms));
+                let age = ms.saturating_sub(at.max(self.active_at_ms).max(self.chr_loop_at_ms));
                 if age <= DISOBEY_AFTER_MS {
                     continue;
                 }
@@ -3419,7 +3427,10 @@ pub(crate) mod own {
 
         /// Client, every frame while engaged at stage >= 2: apply the host's Assigns, ack,
         /// Status every `STATUS_EVERY_MS` and at once when our pause state flips.
-        pub fn client_step(&mut self, me: u8, paused: bool, pause_flipped: bool, ours: &[u16], ours_changed: bool) {
+        /// `chr_loop_in` = our late chr-loop patch is in; before it every enemy runs its own
+        /// AI here whatever the table says, so the Status names none of them as running (the
+        /// host's DOUBLE detector would count them all).
+        pub fn client_step(&mut self, me: u8, paused: bool, pause_flipped: bool, chr_loop_in: bool, ours: &[u16], ours_changed: bool) {
             let ms = crate::game::now_ms();
             let msgs: Vec<AssignIn> = {
                 let mut g = book();
@@ -3478,11 +3489,15 @@ pub(crate) mod own {
             self.track_claims(me, ours, ms);
             if status_due {
                 self.status_at = Some(Instant::now());
-                let mut running: Vec<u16> = enemies()
-                    .into_iter()
-                    .filter(|c| c.hp().is_some_and(|hp| hp > 0) && netai::active_kind(*c) == 1)
-                    .filter_map(netai::net_id)
-                    .collect();
+                let mut running: Vec<u16> = if chr_loop_in {
+                    enemies()
+                        .into_iter()
+                        .filter(|c| c.hp().is_some_and(|hp| hp > 0) && netai::active_kind(*c) == 1)
+                        .filter_map(netai::net_id)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 running.sort_unstable();
                 running.dedup();
                 running.truncate(MAX_OWNED);
@@ -5574,6 +5589,7 @@ impl Engine {
                     ));
                     self.applied.extend(a);
                     self.late.clear();
+                    self.own.chr_loop_in();
                 }
                 Err((true, e)) => {
                     self.late_busy += 1;
@@ -5654,7 +5670,7 @@ impl Engine {
                 self.own.host_step(f, &clients, running, &claims, claims_changed);
                 self.host_candidates(f);
             } else {
-                self.own.client_step(me, self.pause.active, pause_flipped, &claims, claims_changed);
+                self.own.client_step(me, self.pause.active, pause_flipped, self.late.is_empty(), &claims, claims_changed);
             }
             // A client's enemies all keep their own AI until its chr-loop patch is in.
             if self.host || self.late.is_empty() {
