@@ -2,9 +2,9 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test9`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test10`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test9`: nothing in the sections below marked experimental or
+> **Test build `1.0.9-pickups.3-test10`: nothing in the sections below marked experimental or
 > "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
 > onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
@@ -35,7 +35,39 @@ Version string: `1.0.9-pickups.3-test9`. Everybody in a session needs the same b
 > cleared on warps; the auditor ranks bosses before elites and labels elites; throwprobe logs posture
 > and the AI target with a `+0 s` line (budget 536 lines). Known leftover: a solo world whose Senpou lift
 > was killed by a test5 session stays dead (not repaired automatically; joining a host whose lift works
-> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. The oracle is a playtest with both logs.
+> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. `test10` adds Reed as a separate skin (`reed.rs`, section "Wardrobe"; only with all eight Reed part files in the parts package), fixes the `aitarget:` logger (records keyed by address: no fake `TARGET me -> me` / HIT lines; separate event and replan budgets, a sharded sample table, section "Enemy target choice, observed"), mirrors the friend's prosthetic tool states onto its replica (`fx_speffect_mirror = 1`: tool flashes and sounds, `docs/RE-REMOTE-FX.md` "Протезы на реплике"; the 906 deflect-spark "gap" was none) and removes `fx_debug`; the wardrobe close-on-load was checked (works, never triggered in test9). Checklist: section "test10 co-op checklist". The oracle is a playtest with both logs.
+
+## test10 co-op checklist
+
+Both players on `1.0.9-pickups.3-test10` (the doctor warns on a version mismatch). Mark each step
+with F11 on both sides.
+
+1. **Reed on both screens.** A picks the Reed skin (F2), B looks at A. With and without the Mortal
+   Blade equipped (torso 641000 vs 201000). B's own Reed choice the other way round.
+   A's log: `reed: ... skin offered`, `wardrobe: applied skin reed ...`. B sees Reed, not the
+   Ashina ninja / Sculptor models.
+2. **Reed when one side lacks the files.** Remove (rename) the Reed part files on B only. B's log:
+   `reed: skin not offered: ...` and, once A wears Reed, `reed: peer slot N wears Reed but Reed is
+   not available on this PC ...`; B sees A as the Wolf, no crash, no invisible parts.
+3. **Lift.** Senpou temple lift: A pulls the lever, both ride; then B pulls. Both logs: `objact:`
+   lines for the lever (`peer ... replayed ... EMEVD kicked`), the lift moves on both screens and
+   is not stuck halfway; after a reload both lifts agree again on the next pull.
+4. **Hanbei hits.** B hits Hanbei (or any enemy whose AI runs on A). A's log: `aitarget: ... HIT by
+   peerN ... registered on this PC's AI`, one line per hit (no streams of HIT lines), and A's
+   `TARGET` lines only between different players.
+5. **Double ownership watch.** In a fight with several enemies near both players, look for one
+   enemy acting on both machines (two bodies, double attacks, HP jumping back). Note the enemy
+   and the time (F11 on both); both logs: `nsession:` owned-list / `ownerless` / `ownfill:` lines
+   and `aitarget:` lines for that enemy on BOTH machines at once (its AI scoring targets on two
+   PCs = two owners).
+6. **Prosthetics on the replica.** A throws the shuriken / swings the axe / uses the spear next to
+   B. B's log: `fx: mirror: replica of slot N ...: +127xxx(forced, present true)`; B sees the tool
+   flash and hears the tool sound as on A's own screen. A switches tools: `-old +new`.
+7. **Wardrobe panel and loads.** Open the panel (F2), then travel from an idol / die / reload with
+   it open. Log: `wardrobe: panel closed (loading)` or `(world reset)`; F7 / F11 work on the
+   loading screen.
+8. **Log volume.** After a long fight: `aitarget:` lines a few hundred an hour, few or no
+   `line(s) suppressed`, `sample(s) dropped (table shard busy)` near 0.
 
 ## New settings in this build
 
