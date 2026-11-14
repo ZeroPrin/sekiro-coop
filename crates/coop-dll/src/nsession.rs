@@ -898,6 +898,19 @@ const NO_NET_ID: u16 = 0xFFFF;
 /// Player netIds by slot (ours at our slot, each native remote at its peer's slot).
 type PnetMap = [u16; SLOTS];
 
+/// Type 21: `+0x00` the chr the hit is applied to (victim), `+0x0C` the attacker.
+const DAMAGE_VICTIM: usize = 0x00;
+
+/// Pure: the lives byte goes after the game's 21 bytes (test14, docs/PLAN-NATIVE-OWNERSHIP.md §2.4).
+fn put_lives_byte(v: &mut Vec<u8>, byte: u8) {
+    v.push(byte);
+}
+
+/// Pure: strips the lives byte off a received 21 (0 for an empty packet).
+fn take_lives_byte(p: &mut Vec<u8>) -> u8 {
+    p.pop().unwrap_or(0)
+}
+
 fn pnet_fields(t: u8) -> &'static [usize] {
     match t {
         T_DAMAGE => &[0x00, 0x0C],
@@ -1527,6 +1540,8 @@ fn serve(t: u32, buf: *mut u8, cap: u32) -> i32 {
     let Ok(mut g) = INBOX.try_lock() else { return 0 };
     let Some(q) = g.get_mut(t as usize) else { return 0 };
     while let Some((origin, mut p)) = q.pop_front() {
+        // test14: every 21 on the wire ends with the attacker's lives byte (`route_send`).
+        let lives_byte = if t == T_DAMAGE as u32 { take_lives_byte(&mut p) } else { 0 };
         if p.is_empty() || p.len() > cap as usize {
             bump(&BIG, t);
             continue;
@@ -1566,6 +1581,14 @@ fn serve(t: u32, buf: *mut u8, cap: u32) -> i32 {
                 continue;
             }
             note_throw(&p, false, origin);
+        }
+        // The attacker's copy lost a life ours still has (a deathblow, multi-life enemy):
+        // lowered and refilled now, so the hit applies on top of the right life (livesync.rs
+        // `lives_byte_action`; the Lives message would come later, out of order with the hit).
+        if lives_byte != 0
+            && let Some(victim) = get_u16(&p, DAMAGE_VICTIM).filter(|&n| enemy_net_id(n))
+        {
+            crate::livesync::apply_lives_byte(victim, lives_byte);
         }
         // SAFETY: the game passes a buffer of `cap` bytes (checked above).
         unsafe { std::ptr::copy_nonoverlapping(p.as_ptr(), buf, p.len()) };
@@ -1607,6 +1630,12 @@ fn route_send(t: u32, data: *const u8, size: u32, dst: Dst) -> bool {
     }
     if t == T_OWNERS as u32 {
         ownlog::TX23.fetch_add(1, Ordering::Relaxed);
+    }
+    if t == T_DAMAGE as u32 {
+        // The victim enemy's lives here (0 = unknown / a player), appended after the
+        // game's bytes so the player netId offsets stay put; relays keep it.
+        let byte = get_u16(&v, DAMAGE_VICTIM).filter(|&n| enemy_net_id(n)).map_or(0, crate::livesync::lives_byte_for);
+        put_lives_byte(&mut v, byte);
     }
     queue_out(t as u8, dst, v);
     true
@@ -6276,6 +6305,26 @@ mod tests {
         assert_eq!(d, vec![1u8; 8]);
         // Short buffers do not panic.
         pnet_from_wire(&mut [0u8; 3], T_DAMAGE, &h);
+    }
+
+    #[test]
+    fn the_lives_byte_rides_after_the_hit_and_keeps_the_netid_offsets() {
+        let mut d = vec![0u8; 0xD0];
+        put_u16(&mut d, DAMAGE_VICTIM, 0x0850);
+        put_u16(&mut d, 0x0C, 0xA000);
+        let game = d.clone();
+        let mut wire = d;
+        pnet_to_wire(&mut wire, T_DAMAGE, &map_of(1, 0xA000, &[(0, 0xA002)]));
+        put_lives_byte(&mut wire, 2);
+        assert_eq!(wire.len(), 0xD1);
+        assert_eq!((get_u16(&wire, 0), get_u16(&wire, 0x0C)), (Some(0x0850), Some(WIRE_SLOT | 1)));
+        // The receiver: the byte off first, the game's size again, then the netIds.
+        let mut rx = wire;
+        assert_eq!(take_lives_byte(&mut rx), 2);
+        pnet_from_wire(&mut rx, T_DAMAGE, &map_of(0, 0xA002, &[(1, 0xA001)]));
+        assert_eq!(rx.len(), game.len());
+        assert_eq!((get_u16(&rx, 0), get_u16(&rx, 0x0C)), (Some(0x0850), Some(0xA001)));
+        assert_eq!(take_lives_byte(&mut Vec::new()), 0);
     }
 
     #[test]

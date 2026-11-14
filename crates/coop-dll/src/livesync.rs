@@ -263,6 +263,20 @@ pub fn getup_guard(elapsed: Duration, hp: i32, max_hp: i32) -> bool {
     elapsed < GETUP_HOLD && max_hp > 1 && hp <= 1
 }
 
+/// test14, the lives byte on relayed hits (type 21, nsession.rs `route_send` / `serve`;
+/// LukeYui's relay does the same): the attacker's copy had `byte` lives when it sent the
+/// hit, ours has `ours`. Lower ours to `byte` (refilled, before the hit applies) only when
+/// both are known (> 0) and the byte is lower: the min-merge of the Lives messages stays
+/// authoritative, a stale or higher byte changes nothing. Single-life enemies read 0.
+pub fn lives_byte_action(ours: i32, byte: u8) -> Option<i32> {
+    (ours > 0 && byte > 0 && (byte as i32) < ours).then_some(byte as i32)
+}
+
+/// The lives byte to send for a hit on `lives` (0 = unknown, a player, out of range).
+pub fn lives_byte_of(lives: Option<i32>) -> u8 {
+    lives.filter(|&l| (1..=255).contains(&l)).map_or(0, |l| l as u8)
+}
+
 /// Lives only go down (rests and wipes revive through the game's own reset, not here).
 pub fn lives_write_ok(cur: i32, to: i32) -> bool {
     to <= cur.max(0)
@@ -378,6 +392,47 @@ impl State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// netId -> chr of the enemies of the last scan while engaged (empty otherwise): the hit
+/// relay's lives byte (nsession.rs, game threads: `try_lock` only, never blocks).
+static CHRS: Mutex<Vec<(u16, usize)>> = Mutex::new(Vec::new());
+/// Lives bytes applied (lowered + refilled before the hit), for the log cap.
+static BYTE_APPLIED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The enemy with netId `n` from the last scan, still that enemy (its netId re-read).
+fn chr_of(n: u16) -> Option<Chr> {
+    let g = CHRS.try_lock().ok()?;
+    let chr = g.iter().find(|e| e.0 == n).map(|e| Chr(e.1))?;
+    drop(g);
+    (netai::net_id(chr) == Some(n)).then_some(chr)
+}
+
+/// Sender side: the lives byte for a hit on enemy `n` (0 = unknown).
+pub(crate) fn lives_byte_for(n: u16) -> u8 {
+    lives_byte_of(chr_of(n).and_then(read_data).map(|d| d.4))
+}
+
+/// Receiver side, before the relayed hit is handed to the game: our copy of `n` takes the
+/// attacker's lower lives count, with full HP and posture (`lives_byte_action`).
+pub(crate) fn apply_lives_byte(n: u16, byte: u8) {
+    if byte == 0 || !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(chr) = chr_of(n) else { return };
+    let Some((data, hp, max_hp, max_posture, ours)) = read_data(chr) else { return };
+    let Some(to) = lives_byte_action(ours, byte).filter(|_| hp > 0) else { return };
+    if !set_lives(data, ours, to, "lives byte") {
+        return;
+    }
+    refill(chr, data, max_hp, max_posture);
+    let k = BYTE_APPLIED.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= MAX_LOGS || k % 50 == 0 {
+        log::line(&format!(
+            "hit: lives byte {byte} for {n:#x} e{} (ours {ours}): lowered and refilled before the hit ({k} so far)",
+            chr.entity_id().unwrap_or(-1)
+        ));
+    }
+}
+
 pub(crate) fn lives0_of(chr: Chr) -> i32 {
     read_ptr(chr.0 + CHR_PARAM_REF)
         .and_then(|r| read_ptr(r + REF_ROW))
@@ -436,6 +491,9 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
     if key == 0 {
         // Not engaged: whatever the friend sent is for another engagement.
         let _ = nsession::take_lives();
+        if let Ok(mut c) = CHRS.lock() {
+            c.clear();
+        }
         return;
     }
     // Right after a death reload of ours the others' states can still be the old world's
@@ -493,8 +551,10 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
     }
     let mut out: Vec<LifeEntry> = Vec::new();
     let gauge = game::boss_state().map(|b| b.entity);
+    let mut chrs: Vec<(u16, usize)> = Vec::new();
     for chr in nsession::enemy_chrs() {
         let Some(n) = netai::net_id(chr) else { continue };
+        chrs.push((n, chr.0));
         let Some((data, mut hp, max_hp, max_posture, mut lives)) = read_data(chr) else { continue };
         let prev = st.local.get(&n).copied().filter(|p| p.chr == chr.0);
         let lives0 = prev.map_or_else(|| lives0_of(chr), |p| p.lives0);
@@ -754,6 +814,9 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
             out.push(e);
         }
     }
+    if let Ok(mut c) = CHRS.lock() {
+        *c = chrs;
+    }
     if !out.is_empty() {
         st.stats.sent += out.len() as u32;
         for chunk in out.chunks(nsession::MAX_LIVES) {
@@ -946,6 +1009,32 @@ mod tests {
         assert!(!corpse_raised(true, 0, 0, 0, 2));
         // Killed by a script with every life left: a revive looks the same, left alone.
         assert!(!corpse_raised(true, 152, 1, 1, 1));
+    }
+}
+
+#[cfg(test)]
+mod lives_byte_tests {
+    use super::*;
+
+    #[test]
+    fn the_lives_byte_only_lowers_known_lives() {
+        assert_eq!(lives_byte_action(2, 1), Some(1), "the attacker's deathblow took a life first");
+        assert_eq!(lives_byte_action(3, 1), Some(1));
+        assert_eq!(lives_byte_action(2, 2), None, "equal: nothing");
+        assert_eq!(lives_byte_action(1, 2), None, "higher (stale): never raises");
+        assert_eq!(lives_byte_action(2, 0), None, "0 = unknown");
+        assert_eq!(lives_byte_action(0, 1), None, "single-life enemies read 0");
+        assert_eq!(lives_byte_action(-1, 1), None);
+        assert_eq!(lives_byte_action(300, 255), Some(255));
+    }
+
+    #[test]
+    fn the_sent_byte_is_zero_when_unknown() {
+        assert_eq!(lives_byte_of(Some(2)), 2);
+        assert_eq!(lives_byte_of(Some(0)), 0);
+        assert_eq!(lives_byte_of(Some(-3)), 0);
+        assert_eq!(lives_byte_of(Some(256)), 0);
+        assert_eq!(lives_byte_of(None), 0);
     }
 }
 
