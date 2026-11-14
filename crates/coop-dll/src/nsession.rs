@@ -898,6 +898,86 @@ const NO_NET_ID: u16 = 0xFFFF;
 /// Player netIds by slot (ours at our slot, each native remote at its peer's slot).
 type PnetMap = [u16; SLOTS];
 
+// --- Type 70 check (test14, docs/PLAN-NATIVE-OWNERSHIP.md §2.4) -------------------------
+//
+// The receiver `0xA1AF40` (Ghidra, E:\RE\work_net\f\f_a1af40.c) and its record decoder
+// `0x8E0530` trust the peer's bytes: `{u32 count; count x {u32 key (netId in the low 16
+// bits); u8 a; u32[a]; u8 b; u64[b]; 0x16 bytes}}`. The walk is never compared with the
+// received length, and the decoder copies `a` u32s / `b` u64s into a stack record that holds
+// 16 / 32 of them. Its own per-record checks (netId != 0xFFFF, block `netId >> 11` <
+// `*(T+8)`, block `*(T+0x10+8*idx)` != 0, `netId & 0x7FF` < block `+0x10`) skip a record that
+// does not resolve, so only the shape is a crash risk; unresolved netIds are counted.
+
+/// Type 70 buffer of the receiver (`0xA1AF40` allocates 0x5700).
+const BEHAVIOR_MAX: usize = 0x5700;
+/// `0x8E0530`'s destination: 16 u32 (`+0x00..0x40`) and 32 u64 (`+0x40..0x140`).
+const BEHAVIOR_MAX_A: usize = 16;
+const BEHAVIOR_MAX_B: usize = 32;
+/// The fixed tail of a record after its two arrays.
+const BEHAVIOR_TAIL: usize = 0x16;
+
+/// Why a type-70 packet was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bad70 {
+    Short,
+    TooBig,
+    /// Record `i` runs past the end of the packet.
+    Truncated(usize),
+    /// Record `i` has more u32 / u64 entries than the game's record holds.
+    ArrayA(usize, u8),
+    ArrayB(usize, u8),
+    /// Bytes left after the last record.
+    Trailing(usize),
+}
+
+/// Pure: the shape of a type-70 packet against `0xA1AF40` / `0x8E0530`. Ok = (records, of
+/// them with a netId that does not resolve here (`resolves`): the game skips those itself).
+fn check_70(d: &[u8], resolves: impl Fn(u16) -> bool) -> Result<(usize, usize), Bad70> {
+    if d.len() > BEHAVIOR_MAX {
+        return Err(Bad70::TooBig);
+    }
+    let count = d.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok_or(Bad70::Short)? as usize;
+    let mut at = 4;
+    let mut unresolved = 0;
+    for i in 0..count {
+        let key = get_u16(d, at).filter(|_| at + 4 <= d.len()).ok_or(Bad70::Truncated(i))?;
+        at += 4;
+        let a = *d.get(at).ok_or(Bad70::Truncated(i))?;
+        if a as usize > BEHAVIOR_MAX_A {
+            return Err(Bad70::ArrayA(i, a));
+        }
+        at += 1 + 4 * a as usize;
+        let b = *d.get(at).ok_or(Bad70::Truncated(i))?;
+        if b as usize > BEHAVIOR_MAX_B {
+            return Err(Bad70::ArrayB(i, b));
+        }
+        at += 1 + 8 * b as usize + BEHAVIOR_TAIL;
+        if at > d.len() {
+            return Err(Bad70::Truncated(i));
+        }
+        if key == NO_NET_ID || !resolves(key) {
+            unresolved += 1;
+        }
+    }
+    if at != d.len() {
+        return Err(Bad70::Trailing(d.len() - at));
+    }
+    Ok((count, unresolved))
+}
+
+/// The game's own lookup of a type-70 netId (`0xA1AF40`'s checks) on the sync table now.
+fn netid_resolves(t: Option<usize>, n: u16) -> bool {
+    let Some(t) = t else { return false };
+    let (block, index) = ((n >> 11) as i32, (n & 0x7FF) as i32);
+    read::<i32>(t + 8).is_some_and(|c| block < c)
+        && read_ptr(t + 0x10 + 8 * block as usize).filter(|&b| b != 0).and_then(|b| read::<i32>(b + 0x10)).is_some_and(|cap| index < cap)
+}
+
+/// Type-70 packets refused by `check_70`, and records the game skips (10 s, `types` line).
+static INVALID: [AtomicU32; TYPES] = [const { AtomicU32::new(0) }; TYPES];
+static UNRESOLVED_70: AtomicU32 = AtomicU32::new(0);
+static INVALID_LOGS: AtomicU32 = AtomicU32::new(0);
+
 /// Type 21: `+0x00` the chr the hit is applied to (victim), `+0x0C` the attacker.
 const DAMAGE_VICTIM: usize = 0x00;
 
@@ -1557,6 +1637,27 @@ fn serve(t: u32, buf: *mut u8, cap: u32) -> i32 {
             pnet_from_wire(&mut p, t as u8, &map);
         }
         evidence("rx", t as u8, &p);
+        if t == T_BEHAVIOR as u32 {
+            let table = sync_table();
+            match check_70(&p, |n| netid_resolves(table, n)) {
+                Ok((_, 0)) => {}
+                Ok((_, unresolved)) => {
+                    UNRESOLVED_70.fetch_add(unresolved as u32, Ordering::Relaxed);
+                }
+                Err(why) => {
+                    bump(&INVALID, t);
+                    let k = INVALID_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if k < 10 || k % 100 == 0 {
+                        log::line(&format!(
+                            "nsession: type 70 from peer {origin} refused before the game parses it: {why:?} ({} B, {} so far)",
+                            p.len(),
+                            k + 1
+                        ));
+                    }
+                    continue;
+                }
+            }
+        }
         if t == T_THROW as u32 {
             // Both players' deathblows on one enemy within a second (live 2026-10-24,
             // 1120300): each received throw re-placed the defender into the remote's throw
@@ -5305,7 +5406,9 @@ impl Engine {
         for t in 0..TYPES {
             let (tx, rx, srv, dr, big) = (take(&TX, t), take(&RX, t), take(&SRV, t), take(&DROP, t), take(&BIG, t));
             let (rl, un, pd) = (take(&RELAY, t), take(&UNMAPPED, t), take(&PNET_DROP, t));
-            if tx + rx + srv + dr + big + rl + un + pd > 0 {
+            let inv = take(&INVALID, t);
+            let unres = if t == T_BEHAVIOR as usize { UNRESOLVED_70.swap(0, Ordering::Relaxed) } else { 0 };
+            if tx + rx + srv + dr + big + rl + un + pd + inv + unres > 0 {
                 let mut s = format!("{t}: tx {tx} rx {rx} srv {srv} drop {dr} big {big}");
                 if rl > 0 {
                     s.push_str(&format!(" relay {rl}"));
@@ -5315,6 +5418,12 @@ impl Engine {
                 }
                 if pd > 0 {
                     s.push_str(&format!(" player-not-here {pd}"));
+                }
+                if inv > 0 {
+                    s.push_str(&format!(" invalid {inv}"));
+                }
+                if unres > 0 {
+                    s.push_str(&format!(" unresolved-records {unres}"));
                 }
                 parts.push(s);
             }
@@ -6305,6 +6414,56 @@ mod tests {
         assert_eq!(d, vec![1u8; 8]);
         // Short buffers do not panic.
         pnet_from_wire(&mut [0u8; 3], T_DAMAGE, &h);
+    }
+
+    /// One type-70 record: key, `a` u32s, `b` u64s, the 0x16-byte tail.
+    fn rec70(net: u16, a: u8, b: u8) -> Vec<u8> {
+        let mut v = (net as u32 | 0xAB << 16).to_le_bytes().to_vec();
+        v.push(a);
+        v.extend(std::iter::repeat_n(0x11u8, 4 * a as usize));
+        v.push(b);
+        v.extend(std::iter::repeat_n(0x22u8, 8 * b as usize));
+        v.extend([0x33u8; BEHAVIOR_TAIL]);
+        v
+    }
+
+    fn pkt70(recs: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = (recs.len() as u32).to_le_bytes().to_vec();
+        for r in recs {
+            v.extend_from_slice(r);
+        }
+        v
+    }
+
+    #[test]
+    fn type_70_shape_is_checked_before_the_game_parses_it() {
+        let all = |_: u16| true;
+        // Well formed, including the largest record the game's stack record holds.
+        let ok = pkt70(&[rec70(0x0801, 3, 2), rec70(0x0802, 0, 0), rec70(0x5822, 16, 32)]);
+        assert_eq!(check_70(&ok, all), Ok((3, 0)));
+        assert_eq!(rec70(1, 16, 32).len(), 4 + 0x158);
+        assert_eq!(check_70(&pkt70(&[]), all), Ok((0, 0)));
+        // Unresolved netIds are counted, not refused (0xA1AF40 skips them itself).
+        assert_eq!(check_70(&ok, |n| n != 0x0802), Ok((3, 1)));
+        assert_eq!(check_70(&pkt70(&[rec70(NO_NET_ID, 0, 0)]), all), Ok((1, 1)));
+        // Too short for the count, a count larger than the records, every cut.
+        assert_eq!(check_70(&[1, 0, 0], all), Err(Bad70::Short));
+        let mut more = ok.clone();
+        more[0] = 4;
+        assert_eq!(check_70(&more, all), Err(Bad70::Truncated(3)));
+        for cut in 4..ok.len() {
+            assert!(check_70(&ok[..cut], all).is_err(), "cut at {cut}");
+        }
+        // Arrays larger than the game's record: a stack overflow in 0x8E0530.
+        assert_eq!(check_70(&pkt70(&[rec70(1, 0, 0), rec70(2, 17, 0)]), all), Err(Bad70::ArrayA(1, 17)));
+        assert_eq!(check_70(&pkt70(&[rec70(1, 2, 33)]), all), Err(Bad70::ArrayB(0, 33)));
+        // A huge count with nothing behind it.
+        assert_eq!(check_70(&u32::MAX.to_le_bytes(), all), Err(Bad70::Truncated(0)));
+        // Trailing bytes, an oversized packet.
+        let mut tail = ok.clone();
+        tail.push(0);
+        assert_eq!(check_70(&tail, all), Err(Bad70::Trailing(1)));
+        assert_eq!(check_70(&vec![0u8; BEHAVIOR_MAX + 1], all), Err(Bad70::TooBig));
     }
 
     #[test]
