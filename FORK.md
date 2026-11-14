@@ -46,17 +46,25 @@ host alone decides which machine runs each enemy's AI; `ns_force_distribution` a
 Every line below is `own:` unless written otherwise.
 
 1. **Engage.** Host: `own: host table active: N enemies seen, H owned here, C by clients; ...`,
-   then every 10 s `own (10 s): seq S; host H / peer1 C / waiting 0 / unowned-within-40m U; changes
-   ...; fulls F, ack resends R; doubles 0; disobeyed 0`. Client: `own: table active here: first full
-   Assign seq S, N entries, M ours; ...`, `nsession: first 23 and owner table, N ms after engage,
-   owned here K: members chr loop patched ...`, then `own (10 s): applied seq S (fulls F, deltas D,
-   stale ignored 0, gaps 0); mine M; ...; disobeyed 0; ...`. No `own: DISOBEY`, `own: DOUBLE` or
-   `own: WARN`.
+   then every 10 s `own (10 s): seq S; host H / peer1 C / waiting 0 / unowned-within-40m U;
+   client-only owned K (new N); changes ...; fulls F, ack resends R; doubles 0; disobeyed 0`
+   (`ack resends` stays near 0 in a steady fight: a full is re-sent only when a send 1 s old is
+   unacked). Client: `own: table active here: first full Assign seq S, N entries, M ours; ...`,
+   `nsession: first 23 and owner table, N ms after engage, owned here K: members chr loop patched
+   ...`, then `own (10 s): applied seq S (fulls F, deltas D, stale ignored 0, gaps 0); mine M; near,
+   no table row 0; reported R; ...; disobeyed 0; ...`. No `own: DISOBEY`, `own: DOUBLE`, `own: WARN`
+   (one line per client: `own: WARN N enemies wait for peer1's release ack ...`) or `own: NO OWNER
+   TABLE` (the host's IsOwnedHere hook is missing; the client then leaves with "no ownership table
+   within 5 s").
 2. **Group fight, both near.** Few `own: 0x.. eE host -> peer1 (nearer) d host 21.0 / peer1 9.0 seq S`
    lines, never two for the same netId less than 4 s apart. A move to the host is two lines (step 5).
    Summaries: `doubles 0`, `disobeyed 0`.
 3. **Client walks 40 m ahead into a new group.** Host: `own: 0x.. eE none -> peer1 (in range) d ...`.
-   The enemies move and attack on both screens.
+   The enemies move and attack on both screens. Near an area border (enemies loaded on the client
+   only): host `own: 0x.. reported by peer1 near it and not loaded on the host: a row with peer1 as
+   its only candidate` and `own: 0x.. e-1 [client-only] none -> peer1 (in range) ...`; the client's
+   `near, no table row` goes back to 0 within ~2 s. A count that stays above 0 with enemies
+   standing frozen next to the client is the bug this step looks for.
 4. **Client stealth deathblow.** Client: `stealth: claiming enemy E (netId 0x.., behind, ...): a
    request to the host's owner table`, then `stealth: claim on enemy 0x.. granted after N ms` (N
    under ~300) and the deathblow works; host: `own: 0x.. eE host -> peer1 (claim) d ... seq S`. With
@@ -68,7 +76,16 @@ Every line below is `own:` unless written otherwise.
    eE [B] host -> peer1 (Assign seq S)` and `deathblow: boss E netId 0x.. taken while its AI moves
    here from another machine: ...`. Host back (within 130 m, 4 s after the move): `own: 0x.. eE [B]
    peer1 -> none (to host, waiting for peer1's ack) ...` then `own: 0x.. eE [B] none -> host (peer1
-   acked after N ms) ...`. No `own: DOUBLE` at any point.
+   acked after N ms) ...`. No `own: DOUBLE` at any point. A miniboss first seen before its param
+   row was readable: `own: 0x.. eE is a boss now (lives 2), first seen as an ordinary enemy`
+   (expected rare or never; it shows how late the lives become readable).
+   - **Watch (live only): resurrections.** A resurrecting player counts as absent while dead, so
+     the boss moves to the client when the host dies and comes back about 4 s after the host
+     resurrects (the hold). Watch whether these two moves look bad (a snap, a re-aggro, a
+     stance reset) and note the times.
+   - **Watch (live only): the boss pin at range.** A miniboss stays with a living host up to 150 m
+     away (170 m once held) while the client fights it alone. Watch the client's deflect timing
+     on it there (the client sees records from a host far away).
 6. **Host opens a menu that pauses its world (1.5 s+).** Host: `nsession: our world update paused
    (menu): absent for the owner table`, then `own: ... host -> peer1 (host absent)` for its enemies
    within 40 m of the client (the rest stay). After `nsession: our world update runs again after a

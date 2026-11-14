@@ -248,7 +248,7 @@ All go on the control lane (key 0, class 0, `queue_ctrl`, 1434). None is relayed
 
 | Id | Message | Direction | Layout after the id byte |
 |---|---|---|---|
-| 5 | `Status` (replaces `Owned`) | client -> host, every 2 s and on a paused change | `u32 generation, u8 origin, u32 applied_seq, u8 flags (bit0 paused), u16 n, u16 running[n]`. `running` = alive enemies whose ComManipulator is active here (`netai::active_kind(c) == 1`), cap `MAX_OWNED` (2048) |
+| 5 | `Status` (replaces `Owned`) | client -> host, every 2 s and on a paused change | `u32 generation, u8 origin, u32 applied_seq, u8 flags (bit0 paused), u16 n, u16 running[n], u16 m, u16 near[m]`. `running` = alive enemies whose ComManipulator is active here (`netai::active_kind(c) == 1`), cap `MAX_OWNED` (2048), empty until the client's late chr-loop patch is in. `near` = alive enemies within 40 m with no table row, plus ones got that way and still owned within 60 m, cap `MAX_REPORTED` (32); see §8. The host also takes `applied_seq` as an ack |
 | 9 | `Assign` | host -> each engaged client | `u32 generation, u8 full, u32 seq, u16 n, {u16 netId, u8 owner (0xFF = nobody), u32 entry_seq}[n]`, cap 2048 |
 | 10 | `Claims` | client -> host, on change | `u32 generation, u8 origin, u16 n, u16 ids[n]`, cap 64 |
 | 11 | `Ack` | client -> host, after applying an Assign | `u32 generation, u32 applied_seq` |
@@ -343,7 +343,8 @@ For a remote release, two lines:
 - **Removing `ns_force_distribution` affects deflect timing.** v7.9 said "deflect timing was off without it". The cause was slow moves of ownership to the nearer player, and Assign is now immediate. Check parry timing on client-near enemies.
 - **The ack wait gives a short ownerless gap** (~RTT) on client -> host moves. Check the boss returning to a resurrected host for snaps.
 - **The host's view of the client lags** (native remote interpolation). Only decision quality suffers, never consistency.
-- **Enemies loaded on the client but not on the host** (block border) have no owner and freeze. The engage netId check reduces this.
+- **Enemies loaded on the client but not on the host** (block border). Fixed after review (§8): the client reports them, the host gives them a client-only row. Live: watch the client's `near, no table row` count.
+- **The host disengages a client first (not fixed, by decision).** When the host drops a link (its block-change grace, a missing remote, the peer's leave seen first), that client is no longer engaged on the host, so its entries are re-decided at once (absent owner, no ack wait) and the host may take them. Until the client's own disengage runs its teardown (which clears `ACTIVE` and restores its patches), the client still answers from its old table: a short window, about one RTT plus the client's frame, in which an enemy can run on both. It ends by itself; a fix would need an ack-wait for disengaged clients, which a client that is really gone never answers.
 - **The host's own world pause** makes the host absent, so its enemies near the client move. Confirm that our frame runs while the world is paused (the existing pause code assumes it does).
 
 **Co-op test checklist (test11, expected lines):**
@@ -392,3 +393,15 @@ For a remote release, two lines:
 - E:\REPOS\sekiro-coop-wt\anton-test7\crates\coop-dll\src\enemies.rs (`stealth_claims` 1614-1708, unchanged API, the input to Claims)
 - E:\REPOS\sekiro-coop-wt\anton-test7\crates\coop-dll\src\settings.rs (delete 471-472 and template 975-979)
 - E:\REPOS\sekiro-coop-wt\anton-test7\crates\coop-dll\src\statelog.rs (424-426: table owner instead of forced)
+
+---
+
+## 8. Review fixes (after the first implementation, not verified live)
+
+- **Client-only enemies.** The host made rows only from its own scan, so an enemy loaded only on the client had no row: NetAI without records there, frozen, no log line. The client's Status now carries `near` (above). The host gives a reported netId that is absent from its own scan a row whose only candidates are the reporting clients (`ownership::Report`, `HostTable::tick`), so `decide` gives it to such a client. It goes to nobody once no client reports it for `UNLOAD_GRACE` (out of range, left, disengaged). Logs: host `reported by peerN near it and not loaded on the host` (10 per 10 s), decision lines tagged `[client-only]`, summary `client-only owned K (new N)`; client summary `near, no table row N`.
+- **A lost Ack.** The client acked only when `applied` changed, and the host ignored `Status.applied_seq`. Now the host takes both (forward only), and the client sends its Ack again after every full. The test `hand_overs_complete_over_a_lossy_lane_and_never_double` runs `HostTable` + `LinkOut` + the real `Mirror` with lost Assigns, lost Acks and lost Status reports.
+- **Full resends under churn.** `LinkOut::behind` compares the ack with the newest seq sent at least `ACK_RESEND_MS` ago, not with the newest send.
+- **Boss kind.** `KindCache` keeps a Boss answer and asks again for an Ordinary one at most once a second (the entity id or the NpcParam row may be unreadable on the first sight; `lives0_of` reads 1 then). A late answer is logged as `is a boss now`.
+- **The client's chr-loop gate.** Its Status names no running enemy until the late chr-loop patch is in, and DISOBEY counts from then.
+- **WARN.** One line per client per 5 s (count, the seq it acked, the four longest waits).
+- **No hook on the host.** One `own: NO OWNER TABLE` line per engagement.
