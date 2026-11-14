@@ -763,7 +763,9 @@ pub fn alloc_near_pub(target: usize) -> Option<usize> {
 }
 
 /// `patch_jmp` for other modules: a 5-byte `jmp rel32` at `site`, the rest of
-/// `len` filled with int3 (`len` covers the whole relocated prologue).
+/// `len` filled with int3 (`len` covers the whole relocated prologue). Only observe.rs
+/// uses it, which exists only with `testsync` (the public build has neither).
+#[cfg(feature = "testsync")]
 pub fn patch_jmp_pub(site: usize, to: usize, len: usize) -> bool {
     let Some(rel) = rel32(site + 5, to) else { return false };
     let mut patch = vec![0xCCu8; len];
