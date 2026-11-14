@@ -11,14 +11,15 @@
 //!   boss pin, stealth claims judged on the host);
 //! - `publish_step`: release-then-acquire; a hand-over away from a client goes through
 //!   NOBODY until that client acks, so a lost or late message never makes two brains;
-//! - `HostTable`: both of the above over every enemy the host sees;
+//! - `HostTable`: both of the above over every enemy the host sees, plus the enemies a
+//!   client reports near it that the host has not loaded (`Report`);
 //! - `LinkOut`: what the host sends one client (delta, full, a full again when its ack is
 //!   behind);
 //! - `Mirror`: the receiver side (per-entry sequence numbers, full resync, contiguous ack);
 //! - `DoubleWatch`: the host's cross-machine two-brains detector;
 //! - `KindCache`: boss or ordinary per enemy (a boss answer kept, an ordinary one re-checked).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Owner "nobody": NetAI on every machine, no records anywhere (frozen until in range).
 pub const NOBODY: u8 = 0xFF;
@@ -62,6 +63,9 @@ pub const UNLOAD_GRACE_MS: u64 = 1000;
 /// An enemy classified Ordinary is classified again at most this often (a Boss answer is
 /// kept): its entity id or NpcParam row may not be readable when it is first seen.
 pub const KIND_RECHECK_MS: u64 = 1000;
+/// A client reports at most this many enemies near it that the host's table does not name
+/// (enemies loaded only on the client, see `Report`).
+pub const MAX_REPORTED: usize = 32;
 
 /// One player as an enemy's rule sees it. `present` = engaged, alive, not waiting dead in a
 /// boss fight, world not paused; `dist` = metres to the enemy (None = position unknown).
@@ -392,11 +396,27 @@ pub struct Seen {
     pub players: Vec<Player>,
 }
 
+/// A client's report (its Status): the alive enemies near its player that the host's table
+/// did not name (`MAX_REPORTED` at most, nearest first), and the ones it got that way and
+/// still has near. An enemy loaded only on that client (a block border, a later load)
+/// is not in the host's scan, so without this nobody would ever own it there: NetAI with
+/// no records, frozen next to that player.
+#[derive(Clone, Debug)]
+pub struct Report {
+    pub slot: u8,
+    /// The client is present (alive, world running) as the host sees it.
+    pub present: bool,
+    pub ids: Vec<u16>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Row {
     pub entry: Entry,
     pub kind: Kind,
     pub entity: i32,
+    /// Not in the host's scan: only clients' reports keep it (its candidates are those
+    /// clients alone).
+    pub client_only: bool,
     pub publ: Pub,
     /// When this entry was last published (ms).
     pub published_ms: u64,
@@ -413,6 +433,7 @@ pub struct Decided {
     pub net: u16,
     pub entity: i32,
     pub kind: Kind,
+    pub client_only: bool,
     pub why: Why,
     pub change: Change,
     pub players: Vec<Player>,
@@ -425,6 +446,8 @@ pub struct TickOut {
     pub refused: Vec<(u16, u8, String)>,
     /// Decisions by reason (publications to nobody for a release are not decisions).
     pub whys: Vec<Why>,
+    /// Rows that became client-only this tick: (netId, the lowest reporting slot).
+    pub client_only: Vec<(u16, u8)>,
 }
 
 /// The host's whole table. `seq` is one counter per process: it never resets.
@@ -435,41 +458,41 @@ pub struct HostTable {
 }
 
 impl HostTable {
-    /// One decision tick. `claims` = (slot, its claimed netIds); `acked` / `engaged` as in
-    /// `publish_step`.
-    pub fn tick(&mut self, seen: &[Seen], claims: &[(u8, Vec<u16>)], acked: impl Fn(u8) -> u32, engaged: impl Fn(u8) -> bool, now: u64) -> TickOut {
+    /// One decision tick. `reported` = the clients' reports of enemies near them the table
+    /// did not name: one the host's scan lacks gets a row whose only candidates are the
+    /// reporting clients (so it goes to such a client, and to nobody once no client reports
+    /// it for `UNLOAD_GRACE_MS`); one in the scan is the host's to decide as usual.
+    /// `claims` = (slot, its claimed netIds); `acked` / `engaged` as in `publish_step`.
+    pub fn tick(&mut self, seen: &[Seen], reported: &[Report], claims: &[(u8, Vec<u16>)], acked: impl Fn(u8) -> u32, engaged: impl Fn(u8) -> bool, now: u64) -> TickOut {
         let mut out = TickOut::default();
         let mut here: HashSet<u16> = HashSet::with_capacity(seen.len());
         for s in seen {
-            if !here.insert(s.net) {
-                continue;
+            if here.insert(s.net) {
+                self.observe(s, false, claims, now, &mut out);
             }
-            let row = self.rows.entry(s.net).or_insert_with(|| Row {
-                entry: Entry::new(now),
-                kind: s.kind,
-                entity: s.entity,
-                publ: Pub::default(),
-                published_ms: now,
-                seen_ms: now,
-                why: Why::InRange,
-                players: Vec::new(),
-            });
-            row.seen_ms = now;
-            row.kind = s.kind;
-            row.entity = s.entity;
-            row.players.clone_from(&s.players);
-            if !s.dead {
-                let claimants: Vec<u8> = claims.iter().filter(|(_, ids)| ids.contains(&s.net)).map(|(c, _)| *c).collect();
-                for &c in &claimants {
-                    if let Some(why) = claim_refusal(s.kind, c, &s.players) {
-                        out.refused.push((s.net, c, why));
-                    }
+        }
+        // Enemies only clients have loaded: the reporting clients, as if at the enemy (each
+        // reported it within `TAKE_M`, or within `KEEP_M` while it owns it).
+        let mut only: BTreeMap<u16, Vec<Player>> = BTreeMap::new();
+        for r in reported {
+            for &n in &r.ids {
+                if here.contains(&n) {
+                    continue;
                 }
-                if let Some((_, why)) = decide(s.kind, &mut row.entry, &s.players, &claimants, now) {
-                    row.why = why;
-                    out.whys.push(why);
+                let v = only.entry(n).or_default();
+                if !v.iter().any(|p| p.slot == r.slot) {
+                    v.push(Player { slot: r.slot, present: r.present, dist: Some(0.0) });
                 }
             }
+        }
+        for (n, players) in only {
+            here.insert(n);
+            let old = self.rows.get(&n);
+            let (entity, kind) = old.map_or((-1, Kind::Ordinary), |r| (r.entity, r.kind));
+            if !old.is_some_and(|r| r.client_only) {
+                out.client_only.push((n, players.iter().map(|p| p.slot).min().unwrap_or(NOBODY)));
+            }
+            self.observe(&Seen { net: n, entity, kind, dead: false, players }, true, claims, now, &mut out);
         }
         for (&net, row) in self.rows.iter_mut() {
             if !here.contains(&net) && now.saturating_sub(row.seen_ms) >= UNLOAD_GRACE_MS && row.entry.owner != NOBODY {
@@ -479,13 +502,59 @@ impl HostTable {
             }
             if let Some(change) = publish_step(&mut row.publ, row.entry.owner, &acked, &engaged, &mut self.seq, now) {
                 row.published_ms = now;
-                out.decided.push(Decided { net, entity: row.entity, kind: row.kind, why: row.why, change, players: row.players.clone() });
+                out.decided.push(Decided {
+                    net,
+                    entity: row.entity,
+                    kind: row.kind,
+                    client_only: row.client_only,
+                    why: row.why,
+                    change,
+                    players: row.players.clone(),
+                });
             }
         }
         // Unloaded and settled: forgotten (a full no longer names it = nobody there).
         self.rows.retain(|n, r| here.contains(n) || r.entry.owner != NOBODY || r.publ.published != NOBODY || r.publ.wait.is_some());
         out.decided.sort_by_key(|d| d.change.seq);
         out
+    }
+
+    /// One enemy of this tick: its row (made on the first sight), then `decide` unless dead.
+    fn observe(&mut self, s: &Seen, client_only: bool, claims: &[(u8, Vec<u16>)], now: u64, out: &mut TickOut) {
+        let row = self.rows.entry(s.net).or_insert_with(|| Row {
+            entry: Entry::new(now),
+            kind: s.kind,
+            entity: s.entity,
+            client_only,
+            publ: Pub::default(),
+            published_ms: now,
+            seen_ms: now,
+            why: Why::InRange,
+            players: Vec::new(),
+        });
+        row.seen_ms = now;
+        row.kind = s.kind;
+        row.entity = s.entity;
+        row.client_only = client_only;
+        row.players.clone_from(&s.players);
+        if s.dead {
+            return;
+        }
+        let claimants: Vec<u8> = claims.iter().filter(|(_, ids)| ids.contains(&s.net)).map(|(c, _)| *c).collect();
+        for &c in &claimants {
+            if let Some(why) = claim_refusal(s.kind, c, &s.players) {
+                out.refused.push((s.net, c, why));
+            }
+        }
+        if let Some((_, why)) = decide(s.kind, &mut row.entry, &s.players, &claimants, now) {
+            row.why = why;
+            out.whys.push(why);
+        }
+    }
+
+    /// Client-only rows some client owns (published).
+    pub fn client_only_owned(&self) -> usize {
+        self.rows.values().filter(|r| r.client_only && r.publ.published != NOBODY).count()
     }
 
     /// Every published owner (a full): (netId, owner, entry seq), owners only.
@@ -895,23 +964,76 @@ mod tests {
         let seen = |dead: bool, h: f32| Seen { net: 0x800, entity: 1, kind: Kind::Ordinary, dead, players: two(h, 200.0) };
         let all = |_: u8| true;
         let none = |_: u8| 0u32;
-        let out = t.tick(&[seen(false, 10.0)], &[], none, all, 1000);
+        let out = t.tick(&[seen(false, 10.0)], &[], &[], none, all, 1000);
         assert_eq!(out.decided.len(), 1);
         assert_eq!(t.published(0x800), HOST);
         // Dead at 500 m: no change.
-        let out = t.tick(&[seen(true, 500.0)], &[], none, all, 20_000);
+        let out = t.tick(&[seen(true, 500.0)], &[], &[], none, all, 20_000);
         assert!(out.decided.is_empty());
         assert_eq!(t.published(0x800), HOST);
         // Not in the scan: kept for UNLOAD_GRACE, then nobody, then forgotten.
-        assert!(t.tick(&[], &[], none, all, 20_500).decided.is_empty());
-        let out = t.tick(&[], &[], none, all, 21_000);
+        assert!(t.tick(&[], &[], &[], none, all, 20_500).decided.is_empty());
+        let out = t.tick(&[], &[], &[], none, all, 21_000);
         assert_eq!(out.decided[0].change.to, NOBODY);
         assert_eq!(out.decided[0].why, Why::Unloaded);
         assert!(t.rows.is_empty());
         assert!(t.full().is_empty());
         // Duplicated scan entries count once.
-        let out = t.tick(&[seen(false, 10.0), seen(false, 10.0)], &[], none, all, 30_000);
+        let out = t.tick(&[seen(false, 10.0), seen(false, 10.0)], &[], &[], none, all, 30_000);
         assert_eq!(out.decided.len(), 1);
+    }
+
+    #[test]
+    fn an_enemy_only_a_client_has_loaded_goes_to_that_client() {
+        let mut t = HostTable::default();
+        let all = |_: u8| true;
+        // Every release acked at once (no seq in this test reaches 1000).
+        let acked = |_: u8| 1000u32;
+        let rep = |ids: &[u16], present: bool| vec![Report { slot: C, present, ids: ids.to_vec() }];
+        let host_sees = |net: u16| Seen { net, entity: 7, kind: Kind::Ordinary, dead: false, players: two(10.0, 15.0) };
+        // 0x900 is reported and not in the host's scan: a client-only row, given to the client.
+        let out = t.tick(&[], &rep(&[0x900], true), &[], acked, all, 1000);
+        assert_eq!(out.client_only, vec![(0x900, C)]);
+        assert_eq!(t.published(0x900), C);
+        assert_eq!((out.decided[0].why, out.decided[0].client_only), (Why::InRange, true));
+        assert_eq!(t.client_only_owned(), 1);
+        // Reported again: kept, not "new" again.
+        let out = t.tick(&[], &rep(&[0x900], true), &[], acked, all, 3000);
+        assert!(out.client_only.is_empty() && out.decided.is_empty());
+        // A reported netId the host has in its scan: the host decides it as usual (the host is
+        // nearer: the host's, not the reporter's).
+        let out = t.tick(&[host_sees(0x901)], &rep(&[0x900, 0x901], true), &[], acked, all, 3250);
+        assert!(out.client_only.is_empty());
+        assert_eq!((t.published(0x901), t.rows[&0x901].client_only), (HOST, false));
+        // The client dies: absent and nobody else listed, so it holds (no flip to nobody).
+        assert!(t.tick(&[], &rep(&[0x900], false), &[], acked, all, 4000).decided.iter().all(|d| d.net != 0x900));
+        assert_eq!(t.published(0x900), C);
+        // It stops reporting it (out of range, or it left): nobody after UNLOAD_GRACE, through
+        // the release wait while it is engaged.
+        assert!(t.tick(&[], &[], &[], acked, all, 4500).decided.iter().all(|d| d.net != 0x900));
+        let out = t.tick(&[], &[], &[], acked, all, 5000);
+        let d = out.decided.iter().find(|d| d.net == 0x900).unwrap();
+        assert_eq!((d.change.from, d.change.to, d.why), (C, NOBODY, Why::Unloaded));
+        t.tick(&[], &[], &[], acked, all, 5250);
+        assert!(!t.rows.contains_key(&0x900), "forgotten once released");
+        // A disengaged client's rows go to nobody at once (no ack wait).
+        t.tick(&[], &rep(&[0x902], true), &[], acked, all, 6000);
+        assert_eq!(t.published(0x902), C);
+        t.tick(&[], &[], &[], acked, |s| s != C, 6500);
+        let out = t.tick(&[], &[], &[], acked, |s| s != C, 7000);
+        let d = out.decided.iter().find(|d| d.net == 0x902).unwrap();
+        assert_eq!((d.change.to, d.change.pending), (NOBODY, None));
+        // The host loads it later: its own scan decides from then on (no longer client-only).
+        let out = t.tick(&[], &rep(&[0x903], true), &[], acked, all, 8000);
+        assert_eq!(out.client_only, vec![(0x903, C)]);
+        t.tick(&[host_sees(0x903)], &rep(&[0x903], true), &[], acked, all, 8250);
+        assert!(!t.rows[&0x903].client_only);
+        // Two clients report the same enemy: the lowest slot (both "at" the enemy).
+        let mut t = HostTable::default();
+        let reps = vec![Report { slot: 2, present: true, ids: vec![0x910] }, Report { slot: 1, present: true, ids: vec![0x910, 0x910] }];
+        let out = t.tick(&[], &reps, &[], acked, all, 1000);
+        assert_eq!(out.client_only, vec![(0x910, 1)]);
+        assert_eq!(t.published(0x910), 1);
     }
 
     #[test]
@@ -1061,7 +1183,7 @@ mod tests {
                 }
             }
             let ack = acked;
-            let tick = t.tick(&[Seen { net: N, entity: 1, kind: Kind::Ordinary, dead: false, players }], &[], |_| ack, |_| true, now);
+            let tick = t.tick(&[Seen { net: N, entity: 1, kind: Kind::Ordinary, dead: false, players }], &[], &[], |_| ack, |_| true, now);
             for d in &tick.decided {
                 if let Some((x, waited, true)) = d.change.after {
                     assert_eq!((x, d.change.to), (C, HOST));
@@ -1202,7 +1324,7 @@ mod tests {
             let now = i * 250;
             let (h, c) = if (i / 40) % 2 == 0 { (10.0, 30.0) } else { (40.0, 2.0) };
             let applied = client_applied;
-            let out = t.tick(&[Seen { net: 0x800, entity: 1, kind: Kind::Ordinary, dead: false, players: two(h, c) }], &[], |_| applied, |_| true, now);
+            let out = t.tick(&[Seen { net: 0x800, entity: 1, kind: Kind::Ordinary, dead: false, players: two(h, c) }], &[], &[], |_| applied, |_| true, now);
             for d in out.decided {
                 // The lane delivers in order, each message 100-1000 ms late.
                 last_at = last_at.max(now + 100 + (i % 7) * 150);

@@ -266,8 +266,10 @@ enum Msg {
     MaxHp { generation: u32, max: Vec<(i32, i32)> },
     /// Client -> host, every `ownership::STATUS_EVERY_MS` and at once when its pause state
     /// flips: the newest Assign seq it applied, flags (`STATUS_PAUSED`), and the alive
-    /// enemies whose own AI (ComManipulator) runs on it (the host's DOUBLE detector).
-    Status { generation: u32, origin: u8, applied_seq: u32, flags: u8, running: Vec<u16> },
+    /// enemies whose own AI (ComManipulator) runs on it (the host's DOUBLE detector), and
+    /// the alive enemies near its player the table did not name (`ownership::Report`: the
+    /// host may not have them loaded), at most `ownership::MAX_REPORTED`, nearest first.
+    Status { generation: u32, origin: u8, applied_seq: u32, flags: u8, running: Vec<u16>, near: Vec<u16> },
     /// Host -> each engaged client: owner table entries `{netId, owner slot (0xFF =
     /// nobody), entry seq}`. `full` = the whole table (an entry missing = nobody); a delta
     /// names `base`, the seq of the previous Assign on this link (a gap = no ack until the
@@ -339,16 +341,18 @@ fn encode(m: &Msg) -> Vec<u8> {
                 v.extend_from_slice(&m.to_le_bytes());
             }
         }
-        Msg::Status { generation, origin, applied_seq, flags, running } => {
+        Msg::Status { generation, origin, applied_seq, flags, running, near } => {
             v.push(MSG_STATUS);
             v.extend_from_slice(&generation.to_le_bytes());
             v.push(*origin);
             v.extend_from_slice(&applied_seq.to_le_bytes());
             v.push(*flags);
-            let running = &running[..running.len().min(MAX_OWNED)];
-            v.extend_from_slice(&(running.len() as u16).to_le_bytes());
-            for n in running {
-                v.extend_from_slice(&n.to_le_bytes());
+            for (ids, cap) in [(running, MAX_OWNED), (near, crate::ownership::MAX_REPORTED)] {
+                let ids = &ids[..ids.len().min(cap)];
+                v.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+                for n in ids {
+                    v.extend_from_slice(&n.to_le_bytes());
+                }
             }
         }
         Msg::Assign { generation, full, seq, base, entries } => {
@@ -487,7 +491,15 @@ fn decode(b: &[u8]) -> Option<Msg> {
             for _ in 0..n {
                 running.push(r.u16()?);
             }
-            Msg::Status { generation, origin, applied_seq, flags, running }
+            let n = r.u16()? as usize;
+            if n > crate::ownership::MAX_REPORTED {
+                return None;
+            }
+            let mut near = Vec::with_capacity(n);
+            for _ in 0..n {
+                near.push(r.u16()?);
+            }
+            Msg::Status { generation, origin, applied_seq, flags, running, near }
         }
         MSG_ASSIGN => {
             let generation = r.u32()?;
@@ -2479,6 +2491,7 @@ struct StatusIn {
     applied: u32,
     flags: u8,
     running: Vec<u16>,
+    near: Vec<u16>,
 }
 
 /// A received Assign (client side).
@@ -2646,7 +2659,7 @@ fn on_control(from: u8, data: &[u8], epoch: u64) {
             }
             // Ownership (PROTO 6): never relayed; a client's own messages to the host, the
             // host's to a client. Kept here, taken under `accepts` by the engine.
-            Msg::Status { generation, origin, applied_seq, flags, running } => {
+            Msg::Status { generation, origin, applied_seq, flags, running, near } => {
                 if !host || origin != from {
                     return;
                 }
@@ -2654,7 +2667,7 @@ fn on_control(from: u8, data: &[u8], epoch: u64) {
                 if q.len() >= MAX_QUEUED_STATUS {
                     q.pop_front();
                 }
-                q.push_back(StatusIn { link: from, generation, applied: applied_seq, flags, running });
+                q.push_back(StatusIn { link: from, generation, applied: applied_seq, flags, running, near });
             }
             Msg::Claims { generation, origin, ids } => {
                 if !host || origin != from {
@@ -2815,6 +2828,8 @@ pub(crate) mod own {
     const DISOBEY_AFTER_MS: u64 = 1000;
     const DETECT_LINE_GAP_MS: u64 = 30_000;
     const MAX_DETECT_LINES: u32 = 10;
+    /// Host: "reported by a client, not loaded here" lines per `STATS_EVERY` (all counted).
+    const MAX_CLIENT_ONLY_LINES: u32 = 10;
     /// `chr+0x2040`: the game forces this enemy's AI local (`0x9F33F0`, RE-FINDINGS-2 §AI).
     const CHR_FORCED_LOCAL: usize = 0x2040;
 
@@ -2921,12 +2936,22 @@ pub(crate) mod own {
         warn_at: [Option<u64>; SLOTS],
         /// Each client's latest Claims (sorted).
         claims: [Vec<u16>; SLOTS],
+        /// Each client's latest Status `near` (enemies near it the table did not name).
+        reported: [Vec<u16>; SLOTS],
+        /// Client-only rows made (10 s) and their lines (at most `MAX_CLIENT_ONLY_LINES`).
+        client_only_new: u32,
+        client_only_lines: u32,
         /// (netId, claimant) -> last "refused" line (one per 5 s).
         refused_at: HashMap<(u16, u8), u64>,
         // --- client ---
         mirror: om::Mirror,
         ack_sent: u32,
         status_at: Option<Instant>,
+        /// The netIds our last Status reported as near and not named by the table (or ours
+        /// through such a report).
+        reported_here: std::collections::HashSet<u16>,
+        /// At the last Status: alive enemies within `TAKE_M` with no table row (netId, m).
+        near_unlisted: Vec<(u16, f32)>,
         claims_sent_at: Option<Instant>,
         // --- both: our own claims, netId -> (claimed at ms, outcome logged) ---
         claim_track: HashMap<u16, (u64, bool)>,
@@ -2999,6 +3024,7 @@ pub(crate) mod own {
             self.paused[s] = false;
             self.warn_at[s] = None;
             self.claims[s].clear();
+            self.reported[s].clear();
             self.watch.forget(slot);
             self.decide_at = None;
             let mut g = book();
@@ -3089,6 +3115,10 @@ pub(crate) mod own {
                             self.acks[i] = st.applied;
                             changed = true;
                         }
+                        if st.near != self.reported[i] {
+                            self.reported[i].clone_from(&st.near);
+                            changed = true;
+                        }
                         let p = st.flags & STATUS_PAUSED != 0;
                         if p != self.paused[s as usize] {
                             self.paused[s as usize] = p;
@@ -3142,8 +3172,29 @@ pub(crate) mod own {
             }
             let mut claims: Vec<(u8, Vec<u16>)> = vec![(HOST, ours.to_vec())];
             claims.extend(clients.iter().map(|&s| (s, self.claims[s as usize % SLOTS].clone())).filter(|c| !c.1.is_empty()));
+            // Enemies the clients report near them that the table does not name (loaded only
+            // there): rows whose only candidates are those clients.
+            let reports: Vec<om::Report> = clients
+                .iter()
+                .map(|&s| om::Report {
+                    slot: s,
+                    present: pl.iter().any(|p| p.0 == s && p.1),
+                    ids: self.reported[s as usize % SLOTS].clone(),
+                })
+                .filter(|r| !r.ids.is_empty())
+                .collect();
             let acks = self.acks;
-            let out = self.table.tick(&seen, &claims, |s| acks.get(s as usize).copied().unwrap_or(0), |s| s == HOST || clients.contains(&s), ms);
+            let out = self.table.tick(&seen, &reports, &claims, |s| acks.get(s as usize).copied().unwrap_or(0), |s| s == HOST || clients.contains(&s), ms);
+            for &(n, s) in &out.client_only {
+                self.client_only_new += 1;
+                if self.client_only_lines < MAX_CLIENT_ONLY_LINES {
+                    self.client_only_lines += 1;
+                    log::line(&format!(
+                        "own: {n:#x} reported by {who} near it and not loaded on the host: a row with {who} as its only candidate",
+                        who = om::who(s)
+                    ));
+                }
+            }
             for (n, c, why) in &out.refused {
                 if self.refused_at.get(&(*n, *c)).is_some_and(|&t| ms.saturating_sub(t) < 5000) {
                     continue;
@@ -3173,10 +3224,11 @@ pub(crate) mod own {
                 self.line(
                     always,
                     format!(
-                        "own: {:#x} e{}{} {} -> {} ({why}) d {} seq {}",
+                        "own: {:#x} e{}{}{} {} -> {} ({why}) d {} seq {}",
                         d.net,
                         d.entity,
                         tag(d.kind),
+                        if d.client_only { " [client-only]" } else { "" },
                         om::who(ch.from),
                         om::who(ch.to),
                         dists(&d.players),
@@ -3307,6 +3359,7 @@ pub(crate) mod own {
             let suppressed = std::mem::take(&mut self.suppressed);
             let tail = if suppressed > 0 { format!("; {suppressed} ordinary lines suppressed") } else { String::new() };
             let disobeyed = std::mem::take(&mut self.disobeyed);
+            self.client_only_lines = 0;
             if host {
                 let mut per: BTreeMap<u8, u32> = BTreeMap::new();
                 for e in self.table.full() {
@@ -3315,12 +3368,14 @@ pub(crate) mod own {
                 let owners: Vec<String> = per.iter().map(|(&s, &n)| format!("{} {n}", om::who(s))).collect();
                 let near: Vec<String> = self.unowned_near.iter().take(4).map(|&(n, e, d)| format!("{n:#x} e{e} {d:.0} m")).collect();
                 log::line(&format!(
-                    "own (10 s): seq {}; {} / waiting {} / unowned-within-40m {}{}; changes {} (nearer {}, absent {}, claim {}, range {}, boss {}, unloaded {}); fulls {}, ack resends {}; doubles {}; disobeyed {disobeyed}{tail}",
+                    "own (10 s): seq {}; {} / waiting {} / unowned-within-40m {}{}; client-only owned {} (new {}); changes {} (nearer {}, absent {}, claim {}, range {}, boss {}, unloaded {}); fulls {}, ack resends {}; doubles {}; disobeyed {disobeyed}{tail}",
                     self.table.seq,
                     if owners.is_empty() { "nobody owns any".to_string() } else { owners.join(" / ") },
                     self.table.waiting(),
                     self.unowned_near.len(),
                     if near.is_empty() { String::new() } else { format!(" [{}]", near.join(", ")) },
+                    self.table.client_only_owned(),
+                    std::mem::take(&mut self.client_only_new),
                     ch.values().sum::<u32>(),
                     c(Why::Nearer),
                     c(Why::OwnerAbsent),
@@ -3337,9 +3392,16 @@ pub(crate) mod own {
                 let mut g = std::mem::take(&mut self.grant_ms);
                 g.sort_unstable();
                 let median = g.get(g.len() / 2).map_or("-".into(), |t| t.to_string());
+                let unlisted: Vec<String> = self.near_unlisted.iter().take(4).map(|&(n, d)| format!("{n:#x} {d:.0} m")).collect();
+                let unlisted = format!(
+                    "near, no table row {}{}; reported {}",
+                    self.near_unlisted.len(),
+                    if unlisted.is_empty() { String::new() } else { format!(" [{}]", unlisted.join(", ")) },
+                    self.reported_here.len()
+                );
                 let m = &mut self.mirror;
                 log::line(&format!(
-                    "own (10 s): applied seq {} (fulls {}, deltas {}, stale ignored {}, gaps {}); mine {mine}; transitions {}; disobeyed {disobeyed}; claims sent {} granted {} (median {median} ms){tail}",
+                    "own (10 s): applied seq {} (fulls {}, deltas {}, stale ignored {}, gaps {}); mine {mine}; {unlisted}; transitions {}; disobeyed {disobeyed}; claims sent {} granted {} (median {median} ms){tail}",
                     m.applied,
                     std::mem::take(&mut m.fulls),
                     std::mem::take(&mut m.deltas),
@@ -3447,7 +3509,17 @@ pub(crate) mod own {
         /// `chr_loop_in` = our late chr-loop patch is in; before it every enemy runs its own
         /// AI here whatever the table says, so the Status names none of them as running (the
         /// host's DOUBLE detector would count them all).
-        pub fn client_step(&mut self, me: u8, paused: bool, pause_flipped: bool, chr_loop_in: bool, ours: &[u16], ours_changed: bool) {
+        #[allow(clippy::too_many_arguments)]
+        pub fn client_step(
+            &mut self,
+            me: u8,
+            me_pos: Option<[f32; 3]>,
+            paused: bool,
+            pause_flipped: bool,
+            chr_loop_in: bool,
+            ours: &[u16],
+            ours_changed: bool,
+        ) {
             let ms = crate::game::now_ms();
             let msgs: Vec<AssignIn> = {
                 let mut g = book();
@@ -3518,6 +3590,7 @@ pub(crate) mod own {
                 running.sort_unstable();
                 running.dedup();
                 running.truncate(MAX_OWNED);
+                let near = self.near_report(me, me_pos);
                 queue_ctrl(
                     0,
                     &Msg::Status {
@@ -3526,9 +3599,44 @@ pub(crate) mod own {
                         applied_seq: self.mirror.applied,
                         flags: if paused { STATUS_PAUSED } else { 0 },
                         running,
+                        near,
                     },
                 );
             }
+        }
+
+        /// Client, with each Status: the alive enemies within `TAKE_M` of our player that the
+        /// table does not name (the host may not have them loaded: a block border, a later
+        /// load; without a row nobody would run them, frozen next to us), and the ones we
+        /// reported before that are now ours and within `KEEP_M` (so the host keeps the row).
+        /// Ours first, then the nearest; at most `MAX_REPORTED`.
+        fn near_report(&mut self, me: u8, me_pos: Option<[f32; 3]>) -> Vec<u16> {
+            let Some(pos) = me_pos.filter(|_| self.mirror.ready) else {
+                self.reported_here.clear();
+                self.near_unlisted.clear();
+                return Vec::new();
+            };
+            let mut seen = std::collections::HashSet::new();
+            let (mut fresh, mut kept) = (Vec::new(), Vec::new());
+            for c in enemies() {
+                let Some(n) = netai::net_id(c) else { continue };
+                if !seen.insert(n) || c.hp().is_none_or(|hp| hp <= 0) {
+                    continue;
+                }
+                let Some(d) = c.position().map(|p| crate::game::distance(p, pos)) else { continue };
+                let row = self.mirror.rows.get(&n);
+                if row.is_none() && d <= om::TAKE_M {
+                    fresh.push((d, n));
+                } else if self.reported_here.contains(&n) && d <= om::KEEP_M && row.is_none_or(|r| r.owner == me) {
+                    kept.push((d, n));
+                }
+            }
+            fresh.sort_by(|a, b| a.0.total_cmp(&b.0));
+            kept.sort_by(|a, b| a.0.total_cmp(&b.0));
+            self.near_unlisted = fresh.iter().map(|&(d, n)| (n, d)).collect();
+            let ids: Vec<u16> = kept.iter().chain(fresh.iter()).map(|&(_, n)| n).take(om::MAX_REPORTED).collect();
+            self.reported_here = ids.iter().copied().collect();
+            ids
         }
     }
 }
@@ -5687,7 +5795,7 @@ impl Engine {
                 self.own.host_step(f, &clients, running, &claims, claims_changed);
                 self.host_candidates(f);
             } else {
-                self.own.client_step(me, self.pause.active, pause_flipped, self.late.is_empty(), &claims, claims_changed);
+                self.own.client_step(me, f.player.position(), self.pause.active, pause_flipped, self.late.is_empty(), &claims, claims_changed);
             }
             // A client's enemies all keep their own AI until its chr-loop patch is in.
             if self.host || self.late.is_empty() {
@@ -6252,8 +6360,8 @@ mod tests {
             Msg::Engaged { generation: 10, slots: vec![] },
             Msg::MaxHp { generation: 9, max: vec![(1_120_353, 349), (1_100_301, 9999)] },
             Msg::MaxHp { generation: 9, max: vec![] },
-            Msg::Status { generation: 11, origin: 1, applied_seq: 812, flags: STATUS_PAUSED, running: vec![0x0801, 0x5822] },
-            Msg::Status { generation: 11, origin: 2, applied_seq: 0, flags: 0, running: vec![] },
+            Msg::Status { generation: 11, origin: 1, applied_seq: 812, flags: STATUS_PAUSED, running: vec![0x0801, 0x5822], near: vec![0x0900] },
+            Msg::Status { generation: 11, origin: 2, applied_seq: 0, flags: 0, running: vec![], near: vec![] },
             Msg::Assign { generation: 12, full: true, seq: 814, base: 0, entries: vec![(0x48ac, 0, 814), (0x5822, 1, 812)] },
             Msg::Assign { generation: 12, full: false, seq: 815, base: 814, entries: vec![(0x48ac, crate::ownership::NOBODY, 815)] },
             Msg::Assign { generation: 12, full: true, seq: u32::MAX, base: 7, entries: vec![] },
@@ -6274,7 +6382,7 @@ mod tests {
         assert_eq!(decode(&[99, 0, 0]), None);
         // An origin or a slot past the six players is malformed.
         assert_eq!(decode(&encode(&Msg::Engaged { generation: 1, slots: vec![6] })), None);
-        assert_eq!(decode(&encode(&Msg::Status { generation: 1, origin: 6, applied_seq: 0, flags: 0, running: vec![] })), None);
+        assert_eq!(decode(&encode(&Msg::Status { generation: 1, origin: 6, applied_seq: 0, flags: 0, running: vec![], near: vec![] })), None);
         assert_eq!(decode(&encode(&Msg::Claims { generation: 1, origin: 6, ids: vec![] })), None);
         // An owner past the six players (but not "nobody") is malformed.
         assert_eq!(decode(&encode(&Msg::Assign { generation: 1, full: false, seq: 1, base: 0, entries: vec![(1, 6, 1)] })), None);
@@ -6287,6 +6395,10 @@ mod tests {
         assert!(matches!(decode(&encode(&many)), Some(Msg::Claims { ids, .. }) if ids.len() == MAX_CLAIMS));
         let big = Msg::Assign { generation: 1, full: true, seq: 1, base: 0, entries: (0..3000).map(|n| (n, 0, 1)).collect() };
         assert!(matches!(decode(&encode(&big)), Some(Msg::Assign { entries, .. }) if entries.len() == MAX_OWNED));
+        let near = Msg::Status { generation: 1, origin: 1, applied_seq: 1, flags: 0, running: vec![], near: (0..100).collect() };
+        assert!(
+            matches!(decode(&encode(&near)), Some(Msg::Status { near, .. }) if near.len() == crate::ownership::MAX_REPORTED)
+        );
     }
 
     #[test]
