@@ -56,6 +56,8 @@ mod nopause;
 mod npcintro;
 mod nsession;
 mod objact;
+#[allow(dead_code)] // wired into nsession.rs by the next commits
+mod ownership;
 mod ownworld;
 mod peers;
 mod persist;
