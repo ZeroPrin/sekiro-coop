@@ -2943,6 +2943,8 @@ pub(crate) mod own {
         /// Client: when its late chr-loop patch went in (ms; 0 = not yet). Before it every
         /// enemy keeps its own AI here whatever the table says, so DISOBEY counts from then.
         chr_loop_at_ms: u64,
+        /// Host: the "no owner table" line went out (once per engagement).
+        no_hook_logged: bool,
         disobey_at: Option<Instant>,
         /// netId -> last DISOBEY / DOUBLE line.
         detect_at: HashMap<u16, u64>,
@@ -3042,6 +3044,12 @@ pub(crate) mod own {
         /// client slots.
         pub fn host_step(&mut self, f: &Frame, clients: &[u8], world_running: bool, ours: &[u16], ours_changed: bool) {
             if !installed() {
+                if !self.no_hook_logged {
+                    self.no_hook_logged = true;
+                    log::line(&format!(
+                        "own: NO OWNER TABLE: the IsOwnedHere hook is not installed on this host, so no Assign goes to clients {clients:?}; they leave with \"no ownership table within 5 s\" (see the hook line at the start of this log)"
+                    ));
+                }
                 return;
             }
             let now = Instant::now();
