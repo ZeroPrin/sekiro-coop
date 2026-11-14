@@ -1728,10 +1728,11 @@ fn serve(t: u32, buf: *mut u8, cap: u32) -> i32 {
         // The attacker's copy lost a life ours still has (a deathblow, multi-life enemy):
         // lowered and refilled now, so the hit applies on top of the right life (livesync.rs
         // `lives_byte_action`; the Lives message would come later, out of order with the hit).
-        if lives_byte != 0
+        if t == T_DAMAGE as u32
             && let Some(victim) = get_u16(&p, DAMAGE_VICTIM).filter(|&n| enemy_net_id(n))
         {
-            crate::livesync::apply_lives_byte(victim, lives_byte);
+            let applied = lives_byte != 0 && crate::livesync::apply_lives_byte(victim, lives_byte);
+            dbtrace::received_21(victim, applied);
         }
         // SAFETY: the game passes a buffer of `cap` bytes (checked above).
         unsafe { std::ptr::copy_nonoverlapping(p.as_ptr(), buf, p.len()) };
@@ -1777,8 +1778,12 @@ fn route_send(t: u32, data: *const u8, size: u32, dst: Dst) -> bool {
     if t == T_DAMAGE as u32 {
         // The victim enemy's lives here (0 = unknown / a player), appended after the
         // game's bytes so the player netId offsets stay put; relays keep it.
-        let byte = get_u16(&v, DAMAGE_VICTIM).filter(|&n| enemy_net_id(n)).map_or(0, crate::livesync::lives_byte_for);
+        let victim = get_u16(&v, DAMAGE_VICTIM).filter(|&n| enemy_net_id(n));
+        let byte = victim.map_or(0, crate::livesync::lives_byte_for);
         put_lives_byte(&mut v, byte);
+        if let Some(n) = victim {
+            dbtrace::sent_21(n);
+        }
     }
     queue_out(t as u8, dst, v);
     true
@@ -3242,6 +3247,198 @@ mod ownlog {
     }
 }
 
+/// Deathblow trace (test14, docs/PLAN-NATIVE-OWNERSHIP.md §4.3): what one deathblow did on
+/// this machine, one line 3 s after its type 18. Ours: every throw of our player on an enemy;
+/// theirs: another player's throw on an enemy owned here. Answers whether a deathblow's kill /
+/// life loss travels in a 21, and whether stealth markers show on enemies owned elsewhere.
+pub(crate) mod dbtrace {
+    use super::*;
+
+    /// The line comes this long after the throw.
+    const AFTER_MS: u64 = 3000;
+    /// Open traces at once, lines per run (then every 50th).
+    const MAX_OPEN: usize = 16;
+    const MAX_LINES: u32 = 200;
+    /// The gate's stealth "yes" for our player counts this long before our throw.
+    const STEALTH_YES_MS: u64 = 3000;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Outcome {
+        Died,
+        LifeLost,
+        StoodUp,
+        Gone,
+    }
+
+    /// Pure: what became of the enemy (`lives` before and after, `hp` after; None = not
+    /// readable here any more: removed or unloaded).
+    pub fn outcome(lives: (Option<i32>, Option<i32>), hp_after: Option<i32>) -> Outcome {
+        match (lives, hp_after) {
+            (_, Some(h)) if h <= 0 => Outcome::Died,
+            (_, None) => Outcome::Gone,
+            ((Some(a), Some(b)), _) if b < a => Outcome::LifeLost,
+            _ => Outcome::StoodUp,
+        }
+    }
+
+    impl Outcome {
+        fn text(self) -> &'static str {
+            match self {
+                Outcome::Died => "died",
+                Outcome::LifeLost => "life lost",
+                Outcome::StoodUp => "stood up",
+                Outcome::Gone => "gone (not readable here any more)",
+            }
+        }
+    }
+
+    struct Entry {
+        n: u16,
+        at: u64,
+        /// None = ours; Some(slot) = that peer's throw.
+        by: Option<u8>,
+        owned: bool,
+        lives: Option<i32>,
+        hp: Option<i32>,
+        entity: i32,
+        tx21: u32,
+        rx21: u32,
+        bytes: u32,
+        stealth_yes: bool,
+    }
+
+    static OPEN: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+    static LINES: AtomicU32 = AtomicU32::new(0);
+    /// The gate's last stealth-category "yes" for our player: `netId << 48 | ms`.
+    static STEALTH_YES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    fn now() -> u64 {
+        crate::game::now_ms()
+    }
+
+    /// dblock's gate (game thread): the game said yes to a stealth-category throw of our player
+    /// on `n` (a marker is up). Atomics only.
+    pub fn stealth_yes(n: u16) {
+        let w = (n as u64) << 48 | (now() & 0xFFFF_FFFF_FFFF);
+        let i = STEALTH_YES.iter().position(|a| (a.load(Ordering::Relaxed) >> 48) as u16 == n).unwrap_or((n as usize) % STEALTH_YES.len());
+        STEALTH_YES[i].store(w, Ordering::Relaxed);
+    }
+
+    fn stealth_yes_recent(n: u16, at: u64) -> bool {
+        STEALTH_YES.iter().any(|a| {
+            let w = a.load(Ordering::Relaxed);
+            w != 0 && (w >> 48) as u16 == n && at.saturating_sub(w & 0xFFFF_FFFF_FFFF) <= STEALTH_YES_MS
+        })
+    }
+
+    /// note_throw (game threads): a throw on enemy `n`, ours (`by` None) or a peer's.
+    pub fn start(n: u16, by: Option<u8>) {
+        let owned = owned_here(n);
+        if by.is_some() && !owned {
+            return;
+        }
+        let at = now();
+        let lh = crate::livesync::lives_hp(n);
+        let Ok(mut g) = OPEN.try_lock() else { return };
+        // One deathblow sends two throw ids: the first opens the trace.
+        if g.iter().any(|e| e.n == n && e.by == by) || g.len() >= MAX_OPEN {
+            return;
+        }
+        g.push(Entry {
+            n,
+            at,
+            by,
+            owned,
+            lives: lh.map(|x| x.0),
+            hp: lh.map(|x| x.1),
+            entity: lh.map_or(-1, |x| x.2),
+            tx21: 0,
+            rx21: 0,
+            bytes: 0,
+            stealth_yes: by.is_none() && !owned && stealth_yes_recent(n, at),
+        });
+    }
+
+    /// route_send: our 21 on `n`.
+    pub fn sent_21(n: u16) {
+        if let Ok(mut g) = OPEN.try_lock() {
+            for e in g.iter_mut().filter(|e| e.n == n) {
+                e.tx21 += 1;
+            }
+        }
+    }
+
+    /// serve: a received 21 on `n`, and whether its lives byte lowered our copy.
+    pub fn received_21(n: u16, applied: bool) {
+        if let Ok(mut g) = OPEN.try_lock() {
+            for e in g.iter_mut().filter(|e| e.n == n) {
+                e.rx21 += 1;
+                e.bytes += applied as u32;
+            }
+        }
+    }
+
+    pub fn clear() {
+        if let Ok(mut g) = OPEN.lock() {
+            g.clear();
+        }
+    }
+
+    fn opt(v: Option<i32>) -> String {
+        v.map_or("?".into(), |v| v.to_string())
+    }
+
+    /// Every frame (nsession::tick): the traces 3 s old get their line.
+    pub fn tick() {
+        let at = now();
+        let due: Vec<Entry> = {
+            let Ok(mut g) = OPEN.try_lock() else { return };
+            let (due, keep): (Vec<Entry>, Vec<Entry>) = g.drain(..).partition(|e| at.saturating_sub(e.at) >= AFTER_MS);
+            *g = keep;
+            due
+        };
+        for e in due {
+            let after = crate::livesync::lives_hp(e.n);
+            let (lives_b, hp_b) = (after.map(|x| x.0), after.map(|x| x.1));
+            let out = outcome((e.lives, lives_b), hp_b);
+            let k = LINES.fetch_add(1, Ordering::Relaxed);
+            if k >= MAX_LINES && k % 50 != 0 {
+                continue;
+            }
+            let friend = crate::livesync::friend_lives(e.n)
+                .map_or("none".to_string(), |(l, dead)| format!("{l}{}", if dead { " dead" } else { "" }));
+            let line = match e.by {
+                None => format!(
+                    "deathblow: TRACE {:#x} e{} owned {}, lives {}->{} HP {}->{} here, 21 sent {} for it, the friend's lives (livesync) {friend}, outcome {}{}",
+                    e.n,
+                    e.entity,
+                    if e.owned { "here" } else { "elsewhere" },
+                    opt(e.lives),
+                    opt(lives_b),
+                    opt(e.hp),
+                    opt(hp_b),
+                    e.tx21,
+                    out.text(),
+                    if e.stealth_yes { "; the gate showed our stealth deathblow on it while owned elsewhere" } else { "" }
+                ),
+                Some(slot) => format!(
+                    "deathblow: TRACE peer {slot}'s throw on {:#x} e{} (owned here), lives {}->{} HP {}->{}, 21 received {} (lives byte applied {}), the friend's lives (livesync) {friend}, outcome {}",
+                    e.n,
+                    e.entity,
+                    opt(e.lives),
+                    opt(lives_b),
+                    opt(e.hp),
+                    opt(hp_b),
+                    e.rx21,
+                    e.bytes,
+                    out.text()
+                ),
+            };
+            log::line(&line);
+        }
+    }
+}
+
 /// Type 18 (throw / grab / deathblow, `+0x20` defender netId, `+0x22` attacker) seen lately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ThrowNote {
@@ -3364,6 +3561,11 @@ fn note_throw(d: &[u8], sent: bool, origin: u8) {
         ));
     }
     throw_probe::add(defender, sent, now);
+    if own_on_enemy {
+        dbtrace::start(defender, None);
+    } else if !sent && by_player && enemy_net_id(defender) {
+        dbtrace::start(defender, Some(origin));
+    }
     let note = ThrowNote { defender, at: now, sent, by_player, slot: if sent { me } else { origin } };
     if let Ok(mut g) = THROWS.try_lock() {
         let i = THROW_AT.fetch_add(1, Ordering::Relaxed) % 16;
@@ -3918,6 +4120,11 @@ pub(crate) mod dblock {
         // SAFETY: the trampoline (or the original once unhooked) has this signature.
         let f: extern "C" fn(usize, usize, usize) -> u64 = unsafe { std::mem::transmute(if t != 0 { t } else { module_base() + GATE_RVA }) };
         let r = f(atk, def, kind);
+        // Deathblow trace: a stealth marker for our player (atomics and two reads only).
+        if r & 0xFF != 0 && atk != 0 && atk == PLAYER.load(Ordering::Relaxed) && def >= 0x10000 && stealth_category(kind_category(kind)) {
+            // SAFETY: the original just read this ChrIns; `+0x78` is its netId.
+            super::dbtrace::stealth_yes(unsafe { ((def + CHR_NET_ID) as *const u16).read_volatile() });
+        }
         let any = ANY.load(Ordering::Acquire)
             || ANY_FRESH.load(Ordering::Acquire)
             || ANY_TAKEN.load(Ordering::Acquire)
@@ -5758,6 +5965,7 @@ fn engine() -> std::sync::MutexGuard<'static, Option<Engine>> {
 /// puppet.rs, every in-world frame (game thread, FrameBegin).
 pub fn tick(f: &Frame) {
     throw_probe::tick();
+    dbtrace::tick();
     ME.store(f.peers.me().slot(), Ordering::Relaxed);
     dblock::frame(f.player.0, f.peers);
     let on = tuning::native_session();
@@ -5813,6 +6021,7 @@ pub fn on_world_reset(why: &str) {
     let Some(e) = g.as_mut() else { return };
     e.disengage_all(why, Reason::Load, true, false);
     e.load_at = Some(Instant::now());
+    dbtrace::clear();
     e.failed = None;
     e.rest_hold_until = None;
     let broken = BROKEN.load(Ordering::Acquire);
@@ -6460,6 +6669,18 @@ mod tests {
         assert_eq!(d, vec![1u8; 8]);
         // Short buffers do not panic.
         pnet_from_wire(&mut [0u8; 3], T_DAMAGE, &h);
+    }
+
+    #[test]
+    fn deathblow_trace_outcomes() {
+        use dbtrace::{Outcome, outcome};
+        assert_eq!(outcome((Some(2), Some(1)), Some(500)), Outcome::LifeLost);
+        assert_eq!(outcome((Some(2), Some(2)), Some(500)), Outcome::StoodUp);
+        assert_eq!(outcome((Some(0), Some(0)), Some(0)), Outcome::Died);
+        assert_eq!(outcome((Some(1), Some(0)), Some(0)), Outcome::Died, "dead wins over a life count");
+        assert_eq!(outcome((Some(0), Some(0)), Some(30)), Outcome::StoodUp, "a single-life enemy that survived");
+        assert_eq!(outcome((Some(2), None), None), Outcome::Gone);
+        assert_eq!(outcome((None, None), Some(10)), Outcome::StoodUp);
     }
 
     #[test]

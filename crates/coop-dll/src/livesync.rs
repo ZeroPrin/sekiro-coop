@@ -412,16 +412,16 @@ pub(crate) fn lives_byte_for(n: u16) -> u8 {
 }
 
 /// Receiver side, before the relayed hit is handed to the game: our copy of `n` takes the
-/// attacker's lower lives count, with full HP and posture (`lives_byte_action`).
-pub(crate) fn apply_lives_byte(n: u16, byte: u8) {
+/// attacker's lower lives count, with full HP and posture (`lives_byte_action`). True = done.
+pub(crate) fn apply_lives_byte(n: u16, byte: u8) -> bool {
     if byte == 0 || !ENABLED.load(Ordering::Relaxed) {
-        return;
+        return false;
     }
-    let Some(chr) = chr_of(n) else { return };
-    let Some((data, hp, max_hp, max_posture, ours)) = read_data(chr) else { return };
-    let Some(to) = lives_byte_action(ours, byte).filter(|_| hp > 0) else { return };
+    let Some(chr) = chr_of(n) else { return false };
+    let Some((data, hp, max_hp, max_posture, ours)) = read_data(chr) else { return false };
+    let Some(to) = lives_byte_action(ours, byte).filter(|_| hp > 0) else { return false };
     if !set_lives(data, ours, to, "lives byte") {
-        return;
+        return false;
     }
     refill(chr, data, max_hp, max_posture);
     let k = BYTE_APPLIED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -431,6 +431,21 @@ pub(crate) fn apply_lives_byte(n: u16, byte: u8) {
             chr.entity_id().unwrap_or(-1)
         ));
     }
+    true
+}
+
+/// Deathblow trace: (lives, HP, entity) of enemy `n` now (game threads, never blocks).
+pub(crate) fn lives_hp(n: u16) -> Option<(i32, i32, i32)> {
+    let chr = chr_of(n)?;
+    let d = read_data(chr)?;
+    Some((d.4, d.1, chr.entity_id().unwrap_or(-1)))
+}
+
+/// Deathblow trace: the other players' merged state of `n` (lives, dead), if any.
+pub(crate) fn friend_lives(n: u16) -> Option<(i32, bool)> {
+    let g = STATE.try_lock().ok()?;
+    let (r, _) = g.as_ref()?.remote.get(&n)?;
+    Some((r.lives, r.flags & LIFE_DEAD != 0))
 }
 
 pub(crate) fn lives0_of(chr: Chr) -> i32 {
