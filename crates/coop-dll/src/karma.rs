@@ -122,7 +122,7 @@ const ROWS_EVERY: Duration = Duration::from_secs(5);
 const MOD_REST_WINDOW: Duration = Duration::from_secs(3);
 /// After the clean-up of an own rest: wait this long, then top the HP up to the new max once.
 const TOPUP_AFTER: Duration = Duration::from_millis(800);
-const VK_F2: i32 = 0x71;
+const VK_F1: i32 = 0x70;
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -380,7 +380,7 @@ struct State {
     /// The row currently kept on the player (0 = none) and the last one logged.
     on: u32,
     logged: Option<(u32, u32, bool)>,
-    f2_down: bool,
+    f1_down: bool,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -631,18 +631,18 @@ fn tick(st: &mut State, enabled: bool, linked: bool, hands_off: bool, in_world_f
     }
     st.last_committed = Some(committed);
 
-    // Dev trigger (debug_hotkeys = 1): F2 gives one Karma, solo too.
-    let f2 = tuning::debug_hotkeys() && unsafe { GetAsyncKeyState(VK_F2) } as u16 & 0x8000 != 0;
-    if f2 && !st.f2_down {
+    // Dev trigger (debug_hotkeys = 1): F1 gives one Karma, solo too.
+    let f1 = tuning::debug_hotkeys() && unsafe { GetAsyncKeyState(VK_F1) } as u16 & 0x8000 != 0;
+    if f1 && !st.f1_down {
         let have = HELD.load(Ordering::Relaxed);
         if room_for_one(have, st.pending) {
             st.pending += 1;
-            log::line(&format!("karma: F2 (debug_hotkeys): +1 Karma (held {have})"));
+            log::line(&format!("karma: F1 (debug_hotkeys): +1 Karma (held {have})"));
         } else {
-            log::line(&format!("karma: F2 (debug_hotkeys): already at {MAX_KARMA}"));
+            log::line(&format!("karma: F1 (debug_hotkeys): already at {MAX_KARMA}"));
         }
     }
-    st.f2_down = f2;
+    st.f1_down = f1;
 
     // Own rest (solo too). A rest the mod caused at that idol is consumed as not ours.
     let rest = read::<i32>(base + REST_NOW).unwrap_or(-1);

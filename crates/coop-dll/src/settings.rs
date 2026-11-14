@@ -859,7 +859,7 @@ connection_items = 1
 ;     Zeroed before the save loads; the unlocks are rebuilt after each load. 0 = old behaviour.
 fix_debug_item_unlocks = 1
 ; 1 = F8 wakes you at the idol while waiting on the boss death screen, F9 goes to the friend,
-; F11 writes a MARK line to the log, F3 resyncs the world (both players rest), F2 gives you
+; F11 writes a MARK line to the log, F3 resyncs the world (both players rest), F1 gives you
 ; one Karma (to test Karma alone, without a friend).
 debug_hotkeys = 0
 ; 1 = log-only probe of the same Options menu (menu entries, page kinds, text ids) for a later

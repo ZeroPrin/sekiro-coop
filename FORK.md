@@ -47,7 +47,7 @@ item (key item, count shown, at most 6) after the reload; each one lowers max HP
 10 % and damage dealt by 2 % (additive: 6 = 40 % / 88 %), with one status icon under the HP bar.
 Resting at an idol yourself removes all of it (solo too); the friend's rest does not. Setting
 `death_debuffs` turns it on / off (host's value while linked; off = no new Karma, held Karma
-inert). Solo test: `[DEBUG] debug_hotkeys = 1`, F2 = one Karma. Also: the replica SpEffect
+inert). Solo test: `[DEBUG] debug_hotkeys = 1`, F1 = one Karma (F2 stays the wardrobe). Also: the replica SpEffect
 mirror now really removes effects (`0xBFB6D0` instead of `0xC00340`, remotefx.rs). The test11 and
 test12 checklists below still apply (test11 was never played in co-op). Log prefix `karma:`.
 
