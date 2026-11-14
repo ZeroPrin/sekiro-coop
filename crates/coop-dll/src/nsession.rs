@@ -161,7 +161,9 @@ const MSG_HELLO: u8 = 1;
 const MSG_LIST: u8 = 2;
 const MSG_READY: u8 = 3;
 const MSG_LEAVE: u8 = 4;
-/// Id 5 retired (PROTO 6 Status, test11); free until a later PROTO reuses it.
+/// Client -> host every 2 s (PROTO 7; was Status, before that Owned): the enemies whose
+/// own AI runs on the client (`ownview.rs`, diagnostics only).
+const MSG_OWN_VIEW: u8 = 5;
 const MSG_LIVES: u8 = 6;
 /// Host -> clients: the slots engaged with the host now.
 const MSG_ENGAGED: u8 = 7;
@@ -253,6 +255,10 @@ enum Msg {
     /// (not relayed): the engage HP check compares HP only where both machines have the
     /// same max (scaling settled, §34).
     MaxHp { generation: u32, max: Vec<(i32, i32)> },
+    /// Client -> host every `ownview::REPORT_EVERY_MS`, not relayed: the alive enemies
+    /// whose own AI (ComManipulator) runs on `origin`, sorted, at most
+    /// `ownview::MAX_RUNNING` (the host's DOUBLE / OWNERLESS-NEAR / OWNER-DOWN view).
+    OwnView { generation: u32, origin: u8, running: Vec<u16> },
 }
 
 fn encode(m: &Msg) -> Vec<u8> {
@@ -313,6 +319,16 @@ fn encode(m: &Msg) -> Vec<u8> {
             for (e, m) in max {
                 v.extend_from_slice(&e.to_le_bytes());
                 v.extend_from_slice(&m.to_le_bytes());
+            }
+        }
+        Msg::OwnView { generation, origin, running } => {
+            v.push(MSG_OWN_VIEW);
+            v.extend_from_slice(&generation.to_le_bytes());
+            v.push(*origin);
+            let running = &running[..running.len().min(crate::ownview::MAX_RUNNING)];
+            v.extend_from_slice(&(running.len() as u16).to_le_bytes());
+            for n in running {
+                v.extend_from_slice(&n.to_le_bytes());
             }
         }
     }
@@ -408,6 +424,19 @@ fn decode(b: &[u8]) -> Option<Msg> {
                 max.push((r.i32()?, r.i32()?));
             }
             Msg::MaxHp { generation, max }
+        }
+        MSG_OWN_VIEW => {
+            let generation = r.u32()?;
+            let origin = r.u8()?;
+            let n = r.u16()? as usize;
+            if n > crate::ownview::MAX_RUNNING || origin as usize >= SLOTS {
+                return None;
+            }
+            let mut running = Vec::with_capacity(n);
+            for _ in 0..n {
+                running.push(r.u16()?);
+            }
+            Msg::OwnView { generation, origin, running }
         }
         _ => return None,
     };
@@ -1576,6 +1605,9 @@ fn route_send(t: u32, data: *const u8, size: u32, dst: Dst) -> bool {
         note_throw(&v, true, 0);
         dblock::on_sent(&v);
     }
+    if t == T_OWNERS as u32 {
+        ownlog::TX23.fetch_add(1, Ordering::Relaxed);
+    }
     queue_out(t as u8, dst, v);
     true
 }
@@ -2302,6 +2334,8 @@ fn engage_block_reason(our_gen: u32, pgen: u32, ready: Option<(u32, u32)>, newes
 struct Origin {
     /// Lives messages not taken yet (link, generation, entries); livesync.rs.
     lives: Vec<(u8, u32, Vec<LifeEntry>)>,
+    /// Host: this client's latest OwnView not taken yet (link, generation, running).
+    view: Option<(u8, u32, Vec<u16>)>,
 }
 
 struct Book {
@@ -2313,7 +2347,7 @@ struct Book {
 
 static BOOK: Mutex<Book> = Mutex::new(Book {
     peers: [const { None }; SLOTS],
-    origins: [const { Origin { lives: Vec::new() } }; SLOTS],
+    origins: [const { Origin { lives: Vec::new(), view: None } }; SLOTS],
     engaged: None,
 });
 /// Our reliable lane per link (module `lane`); a new one (new id) after every link drop.
@@ -2450,6 +2484,14 @@ fn on_control(from: u8, data: &[u8], epoch: u64) {
                     p.max_hp = Some((generation, max));
                 }
             }
+            // Diagnostics: never relayed, a client's own view to the host only; taken under
+            // `accepts` by the engine (`take_view`).
+            Msg::OwnView { generation, origin, running } => {
+                if !host || origin != from {
+                    return;
+                }
+                g.origins[s].view = Some((from, generation, running));
+            }
         }
     }
     for (t, m) in out {
@@ -2539,6 +2581,493 @@ pub fn owned_here(net_id: u16) -> bool {
 /// were "claimed by both machines" while only table bosses counted).
 fn is_boss(c: Chr) -> bool {
     c.entity_id().is_some_and(|e| crate::bosses::encounter_of(e).is_some()) || crate::livesync::multi_life(crate::livesync::lives0_of(c))
+}
+
+/// Passive owner view (test14, docs/PLAN-NATIVE-OWNERSHIP.md §4; pure parts in
+/// `crate::ownview`). Reads what the game's own 22 / 23 decided and logs `own:` lines; it
+/// never writes ownership. Game thread (our FrameBegin), both roles while engaged at stage
+/// >= 2 (a client from its chr-loop patch on: before it every enemy runs locally there).
+mod ownlog {
+    use super::*;
+    use crate::ownview::{self as ov, Change, Episode};
+    use std::collections::{BTreeSet, HashSet};
+
+    /// The native answers and positions are read this often.
+    const OBSERVE_EVERY: Duration = Duration::from_millis(250);
+    /// Capped line kinds: at most this many per 10 s each (every one counted).
+    const MAX_LINES: u32 = 10;
+    const LINE_WINDOW_MS: u64 = 10_000;
+    /// One DOUBLE line per netId per this long.
+    const DOUBLE_LINE_GAP_MS: u64 = 30_000;
+    /// `chr+0x18`: the chr-set entry `U` (gap map §1.4).
+    const CHR_SET_ENTRY: usize = 0x18;
+    /// `chr+0x2040`: the game forces this enemy's AI local (EnemyIns slot 175).
+    const CHR_FORCED_LOCAL: usize = 0x2040;
+    const CHR_INTERVAL: usize = 0x110;
+    const CHR_LOD_FLAGS: usize = 0x1A10;
+    /// `chr+0x1FC8`: the last priority `0x9F0230` computed here (clamped 0..0x7FFF).
+    const CHR_PRIO: usize = 0x1FC8;
+
+    /// One alive enemy as seen at an observation.
+    pub struct Seen {
+        pub n: u16,
+        pub c: Chr,
+        pub pos: Option<[f32; 3]>,
+        /// Its own AI (ComManipulator) runs here.
+        pub running: bool,
+        /// The game's `IsOwnedHere` answer.
+        pub here: bool,
+    }
+
+    #[derive(Default)]
+    pub struct State {
+        watch: ov::OwnerWatch,
+        flaps: ov::Flaps,
+        two: ov::TwoReports,
+        observe_at: Option<Instant>,
+        // --- host ---
+        /// Each client's latest OwnView (arrival ms, running netIds).
+        views: [Option<(u64, BTreeSet<u16>)>; SLOTS],
+        /// Clients with a new OwnView since the last evaluation.
+        views_new: u8,
+        /// Each client's last parsed 22 (netId -> prio).
+        peer_prio: [HashMap<u16, u16>; SLOTS],
+        slow: HashMap<(u16, u8), Episode>,
+        down: [Episode; SLOTS],
+        double_at: HashMap<u16, u64>,
+        last_ownerless: Vec<(u16, i32, f32)>,
+        // --- client ---
+        sent_at: Option<Instant>,
+        sync_in: u32,
+        sync_in_ms: u64,
+        silent: Episode,
+        // --- lines and 10 s counters ---
+        b_double: ov::Budget,
+        b_ownerless: ov::Budget,
+        b_flap: ov::Budget,
+        b_slow: ov::Budget,
+        doubles: u32,
+        ownerless: u32,
+        flap_lines: u32,
+        slow_lines: u32,
+        down_lines: u32,
+        silent_ms: u64,
+        rx22: u32,
+        summary_at: Option<Instant>,
+        tx23_at: u32,
+        served23_at: u32,
+    }
+
+    /// Host: 23 packets our game sent (route_send).
+    pub static TX23: AtomicU32 = AtomicU32::new(0);
+
+    fn prio_here(c: Chr) -> Option<u16> {
+        read::<u16>(c.0 + CHR_PRIO)
+    }
+
+    fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
+        v.map_or("?".into(), |v| v.to_string())
+    }
+
+    /// `0x9E5C00(U)` read directly: `*(U+0x30)+0x8C` bit 0.
+    fn u_9e5c00(u: Option<usize>) -> Option<u8> {
+        u.and_then(|u| read_ptr(u + 0x30)).filter(|&p| p >= 0x10000).and_then(|p| read::<u8>(p + 0x8C)).map(|b| b & 1)
+    }
+
+    fn set_entry(c: Chr) -> Option<usize> {
+        read_ptr(c.0 + CHR_SET_ENTRY).filter(|&u| u >= 0x10000)
+    }
+
+    /// The host copy's force-local inputs (gap map §1.4): `+0x2040`, `U+0x20`,
+    /// `0x9E5C00(U)`, module0 `+0x54` bit 0.
+    fn force_local(c: Chr) -> String {
+        let u = set_entry(c);
+        let m54 = read_ptr(c.0 + 0x1FF8).and_then(read_ptr).filter(|&m| m >= 0x10000).and_then(|m| read::<u8>(m + 0x54)).map(|b| b & 1);
+        format!(
+            "+0x2040 {}, U+0x20 {}, 0x9E5C00(U) {}, module0+0x54 {}",
+            opt(read::<u8>(c.0 + CHR_FORCED_LOCAL)),
+            u.and_then(|u| read::<u8>(u + 0x20)).map_or("?".into(), |b| format!("{b:#x}")),
+            opt(u_9e5c00(u)),
+            opt(m54)
+        )
+    }
+
+    /// The candidate-gate inputs (gap map §3.1) of an enemy nobody runs.
+    fn gate_inputs(c: Chr) -> String {
+        let u = set_entry(c);
+        let ui = |off: usize| u.and_then(|u| read::<i32>(u + off));
+        format!(
+            "interval {}, 1A10&8 {}, U+0x10/+0x14/+0x20 {}/{}/{}, 0x9E5C00(U) {}",
+            opt(read::<i32>(c.0 + CHR_INTERVAL)),
+            opt(read::<u8>(c.0 + CHR_LOD_FLAGS).map(|b| (b >> 3) & 1)),
+            opt(ui(0x10)),
+            opt(ui(0x14)),
+            u.and_then(|u| read::<u8>(u + 0x20)).map_or("?".into(), |b| format!("{b:#x}")),
+            opt(u_9e5c00(u)),
+        )
+    }
+
+    fn dist(a: Option<[f32; 3]>, b: Option<[f32; 3]>) -> Option<f32> {
+        Some(crate::game::distance(a?, b?))
+    }
+
+    fn alive(c: Chr) -> bool {
+        c.hp().is_some_and(|hp| hp > 0)
+    }
+
+    fn metres(d: Option<f32>) -> String {
+        d.map_or("?".into(), |d| format!("{d:.0}"))
+    }
+
+    impl State {
+        /// Teardown: everything goes.
+        pub fn reset(&mut self) {
+            *self = Self::default();
+        }
+
+        /// Host: client `slot` left while others stay.
+        pub fn forget(&mut self, slot: u8) {
+            let s = slot as usize % SLOTS;
+            self.views[s] = None;
+            self.views_new &= !(1 << s);
+            self.peer_prio[s].clear();
+            self.down[s] = Episode::default();
+            self.slow.retain(|&(_, p), _| p != slot);
+            self.two.reset();
+            book().origins[s].view = None;
+        }
+
+        /// Host: client `slot`'s 22 as fed to the game.
+        pub fn on_22(&mut self, slot: u8, payload: &[u8]) {
+            self.rx22 += 1;
+            self.peer_prio[slot as usize % SLOTS] = ov::entries_22(payload);
+        }
+
+        fn peer_prio_text(&self, n: u16, clients: &[u8]) -> String {
+            if clients.is_empty() {
+                return "-".into();
+            }
+            let v: Vec<String> = clients
+                .iter()
+                .map(|&s| {
+                    let p = self.peer_prio[s as usize % SLOTS].get(&n).map_or("none".to_string(), |p| p.to_string());
+                    if clients.len() == 1 { p } else { format!("{} {p}", ov::who(s)) }
+                })
+                .collect();
+            v.join(", ")
+        }
+
+        /// Every frame while engaged at stage >= 2 (a client: from its chr-loop patch on).
+        /// `clients`: the host's engaged client slots (empty on a client).
+        pub fn step(&mut self, f: &Frame, host: bool, me: u8, clients: &[u8]) {
+            let ms = crate::game::now_ms();
+            if self.summary_at.is_none() {
+                // Counters count from this engagement on.
+                self.summary_at = Some(Instant::now());
+                self.tx23_at = TX23.load(Ordering::Relaxed);
+                self.served23_at = SERVED_23.load(Ordering::Relaxed);
+            }
+            if host {
+                self.take_views(clients, ms);
+            }
+            if self.observe_at.is_none_or(|t| t.elapsed() >= OBSERVE_EVERY) {
+                self.observe_at = Some(Instant::now());
+                let seen = self.observe(ms, clients);
+                if host {
+                    self.host_checks(f, &seen, clients, ms);
+                } else {
+                    self.client_checks(f, &seen, me, ms);
+                }
+            }
+            if self.summary_at.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
+                self.summary_at = Some(Instant::now());
+                self.summary(host, clients);
+            }
+        }
+
+        /// Native answers of every alive enemy: BOSS / FLAP lines, `boss_taken` on 0 -> 1.
+        fn observe(&mut self, ms: u64, clients: &[u8]) -> Vec<Seen> {
+            let mut out = Vec::new();
+            let mut dup = HashSet::new();
+            for c in enemies() {
+                let Some(n) = netai::net_id(c) else { continue };
+                if !alive(c) || !dup.insert(n) {
+                    continue;
+                }
+                let here = owned_here(n);
+                let change = self.watch.observe(n, here);
+                if change != Change::Same {
+                    let boss = is_boss(c);
+                    let e = c.entity_id().unwrap_or(-1);
+                    if boss {
+                        log::line(&format!(
+                            "own: BOSS {n:#x} e{e} owner {} (native 23{}), prio here {}, peer {}",
+                            if here { "here" } else { "elsewhere" },
+                            if change == Change::First { ", first seen" } else { "" },
+                            opt(prio_here(c)),
+                            self.peer_prio_text(n, clients)
+                        ));
+                    }
+                    if change == Change::Taken && boss {
+                        dblock::boss_taken(n, e);
+                    }
+                    if matches!(change, Change::Taken | Change::Lost)
+                        && let Some(k) = self.flaps.record(n, ms)
+                    {
+                        self.flap_lines += 1;
+                        if self.b_flap.allow(ms, MAX_LINES, LINE_WINDOW_MS) {
+                            log::line(&format!(
+                                "own: FLAP {n:#x} e{e} {k} owner changes in 10 s (now {}){}",
+                                if here { "here" } else { "elsewhere" },
+                                if boss { " [boss]" } else { "" }
+                            ));
+                        }
+                    }
+                }
+                out.push(Seen { n, c, pos: c.position(), running: netai::active_kind(c) == 1, here });
+            }
+            self.flaps.prune(ms);
+            out
+        }
+
+        fn take_views(&mut self, clients: &[u8], ms: u64) {
+            let mut g = book();
+            for &s in clients {
+                let i = s as usize % SLOTS;
+                if let Some((link, generation, running)) = g.origins[i].view.take()
+                    && accepts(link, generation)
+                {
+                    self.views[i] = Some((ms, running.into_iter().collect()));
+                    self.views_new |= 1 << i;
+                }
+            }
+        }
+
+        fn host_checks(&mut self, f: &Frame, seen: &[Seen], clients: &[u8], ms: u64) {
+            // Living players' positions: us (slot 0) and each engaged client's remote.
+            let host_down = !alive(f.player) || crate::bossrules::spectating();
+            let host_pos = f.player.position();
+            let down_slots = crate::world::down_slots();
+            let remotes: Vec<(u8, Option<[f32; 3]>, bool)> = clients
+                .iter()
+                .map(|&s| {
+                    let r = PeerId::new(s).and_then(|id| f.remote_of(id));
+                    let down = down_slots >> s & 1 != 0 || r.is_none_or(|r| !alive(r));
+                    (s, r.and_then(|r| r.position()), down)
+                })
+                .collect();
+            let living: Vec<[f32; 3]> = host_pos
+                .filter(|_| !host_down)
+                .into_iter()
+                .chain(remotes.iter().filter(|r| !r.2).filter_map(|r| r.1))
+                .collect();
+            let near_living = |p: Option<[f32; 3]>| {
+                p.and_then(|p| living.iter().map(|&l| crate::game::distance(p, l)).min_by(f32::total_cmp)).filter(|&d| d <= ov::NEAR_M)
+            };
+            self.slow_check(seen, &remotes, host_pos, ms);
+            // OWNER-DOWN: enemies owned on a dead / spectating machine near a living player.
+            let mut machines: Vec<(u8, bool)> = vec![(0, host_down)];
+            machines.extend(remotes.iter().map(|r| (r.0, r.2)));
+            for (s, down) in machines {
+                let view = self.views[s as usize % SLOTS].as_ref().map(|v| &v.1);
+                let owned_there = |e: &Seen| if s == 0 { e.here } else { view.is_some_and(|v| v.contains(&e.n)) };
+                let near: Vec<&Seen> =
+                    if down { seen.iter().filter(|e| owned_there(e) && near_living(e.pos).is_some()).collect() } else { Vec::new() };
+                if let Some(held) = self.down[s as usize % SLOTS].step(!near.is_empty(), ms, ov::DOWN_AFTER_MS, ov::REPEAT_MS) {
+                    self.down_lines += 1;
+                    log::line(&format!(
+                        "own: OWNER-DOWN {} enemies ({} bosses) owned on a dead/spectating machine ({}) within {} m of the living player for {:.0} s",
+                        near.len(),
+                        near.iter().filter(|e| is_boss(e.c)).count(),
+                        ov::who(s),
+                        ov::NEAR_M,
+                        held as f32 / 1000.0
+                    ));
+                }
+            }
+            // The two-report rule, once every engaged client sent a new OwnView.
+            let all: u8 = clients.iter().fold(0, |m, &s| m | 1 << s);
+            if all == 0 || self.views_new & all != all {
+                return;
+            }
+            self.views_new = 0;
+            let mut snap = ov::Snapshot { at_ms: ms, ..Default::default() };
+            for e in seen.iter().filter(|e| e.running) {
+                *snap.running.entry(e.n).or_default() |= ov::HOST_BIT;
+            }
+            for &s in clients {
+                if let Some((_, v)) = &self.views[s as usize % SLOTS] {
+                    for &n in v {
+                        *snap.running.entry(n).or_default() |= 1 << s;
+                    }
+                }
+            }
+            for e in seen {
+                if let Some(d) = near_living(e.pos) {
+                    snap.near.insert(e.n, d);
+                }
+            }
+            let Some(v) = self.two.step(snap) else { return };
+            let by_net: HashMap<u16, &Seen> = seen.iter().map(|e| (e.n, e)).collect();
+            for (n, mask) in v.doubles {
+                self.doubles += 1;
+                if self.double_at.get(&n).is_some_and(|&t| ms.saturating_sub(t) < DOUBLE_LINE_GAP_MS)
+                    || !self.b_double.allow(ms, MAX_LINES, LINE_WINDOW_MS)
+                {
+                    continue;
+                }
+                self.double_at.insert(n, ms);
+                let (e, inputs) = by_net.get(&n).map_or((-1, "not loaded on the host".to_string()), |s| {
+                    (s.c.entity_id().unwrap_or(-1), format!("host copy {}", force_local(s.c)))
+                });
+                log::line(&format!("own: DOUBLE {n:#x} e{e} runs on {} (2 reports); {inputs}", ov::machines(mask)));
+            }
+            self.double_at.retain(|_, t| ms.saturating_sub(*t) < DOUBLE_LINE_GAP_MS);
+            self.last_ownerless.clear();
+            for &(n, d) in &v.ownerless {
+                self.ownerless += 1;
+                let Some(s) = by_net.get(&n) else { continue };
+                let e = s.c.entity_id().unwrap_or(-1);
+                self.last_ownerless.push((n, e, d));
+                if !self.b_ownerless.allow(ms, MAX_LINES, LINE_WINDOW_MS) {
+                    continue;
+                }
+                let mut ds = vec![format!("host {}", metres(dist(s.pos, host_pos)))];
+                ds.extend(remotes.iter().map(|&(slot, rp, _)| format!("{} {}", ov::who(slot), metres(dist(s.pos, rp)))));
+                log::line(&format!(
+                    "own: OWNERLESS-NEAR {n:#x} e{e} d {} m; {}, prio host {}, peer {}",
+                    ds.join(" / "),
+                    gate_inputs(s.c),
+                    opt(prio_here(s.c)),
+                    self.peer_prio_text(n, clients)
+                ));
+            }
+        }
+
+        /// SLOW: a client is much nearer to an enemy the host still runs (v7.9 deflect timing).
+        fn slow_check(&mut self, seen: &[Seen], remotes: &[(u8, Option<[f32; 3]>, bool)], host_pos: Option<[f32; 3]>, ms: u64) {
+            let mut live = HashSet::new();
+            for e in seen.iter().filter(|e| e.here) {
+                for &(s, rp, _) in remotes {
+                    let (Some(dc), Some(dh)) = (dist(e.pos, rp), dist(e.pos, host_pos)) else { continue };
+                    let key = (e.n, s);
+                    let cond = dc <= ov::SLOW_NEAR_M && dh - dc >= ov::SLOW_GAP_M;
+                    if !cond && !self.slow.contains_key(&key) {
+                        continue;
+                    }
+                    live.insert(key);
+                    let due = self.slow.entry(key).or_default().step(cond, ms, ov::SLOW_AFTER_MS, u64::MAX);
+                    let Some(held) = due else { continue };
+                    self.slow_lines += 1;
+                    if self.b_slow.allow(ms, MAX_LINES, LINE_WINDOW_MS) {
+                        log::line(&format!(
+                            "own: SLOW {:#x} e{} {} nearer by {:.0} m for {:.1} s, still the host's (prio host {} / peer {})",
+                            e.n,
+                            e.c.entity_id().unwrap_or(-1),
+                            ov::who(s),
+                            dh - dc,
+                            held as f32 / 1000.0,
+                            opt(prio_here(e.c)),
+                            self.peer_prio[s as usize % SLOTS].get(&e.n).map_or("none".to_string(), |p| p.to_string())
+                        ));
+                    }
+                }
+            }
+            self.slow.retain(|k, ep| live.contains(k) && *ep != Episode::default());
+        }
+
+        fn client_checks(&mut self, f: &Frame, seen: &[Seen], me: u8, ms: u64) {
+            // Our OwnView: the enemies our own AI runs.
+            if self.sent_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(ov::REPORT_EVERY_MS)) {
+                self.sent_at = Some(Instant::now());
+                let mut running: Vec<u16> = seen.iter().filter(|e| e.running).map(|e| e.n).collect();
+                running.sort_unstable();
+                running.truncate(ov::MAX_RUNNING);
+                queue_ctrl(0, &Msg::OwnView { generation: GEN_OUT[0].load(Ordering::Relaxed), origin: me, running });
+            }
+            // HOST-SILENT: the host's 4 / 5 / 70 / 71 stopped.
+            let sync = SYNC_IN.load(Ordering::Relaxed);
+            if sync != self.sync_in || self.sync_in_ms == 0 {
+                self.sync_in = sync;
+                self.sync_in_ms = ms;
+            }
+            let silent = ms.saturating_sub(self.sync_in_ms) >= ov::SILENT_AFTER_MS;
+            if silent {
+                self.silent_ms += OBSERVE_EVERY.as_millis() as u64;
+            }
+            if let Some(held) = self.silent.step(silent, ms, 0, ov::REPEAT_MS) {
+                let pos = f.player.position();
+                let k = seen.iter().filter(|e| !e.here && dist(e.pos, pos).is_some_and(|d| d <= ov::NEAR_M)).count();
+                log::line(&format!(
+                    "own: HOST-SILENT {:.0} s: {k} enemies near us owned by the host stand still",
+                    (held + ov::SILENT_AFTER_MS) as f32 / 1000.0
+                ));
+            }
+        }
+
+        fn summary(&mut self, host: bool, clients: &[u8]) {
+            let (mut here, mut running) = (0u32, 0u32);
+            let mut hist_here = [0u32; 5];
+            let mut dup = HashSet::new();
+            for c in enemies() {
+                let Some(n) = netai::net_id(c) else { continue };
+                if !alive(c) || !dup.insert(n) {
+                    continue;
+                }
+                here += self.watch.owned_here(n).unwrap_or(false) as u32;
+                running += (netai::active_kind(c) == 1) as u32;
+                if let Some(p) = prio_here(c) {
+                    hist_here[ov::prio_bucket(p)] += 1;
+                }
+            }
+            let flaps = std::mem::take(&mut self.flap_lines);
+            if host {
+                let tx23 = TX23.load(Ordering::Relaxed);
+                let views: Vec<String> = clients
+                    .iter()
+                    .map(|&s| {
+                        let v = self.views[s as usize % SLOTS].as_ref().map_or("?".to_string(), |v| v.1.len().to_string());
+                        format!("{} {v}", ov::who(s))
+                    })
+                    .collect();
+                let mut hist_peer = [0u32; 5];
+                for &s in clients {
+                    for &p in self.peer_prio[s as usize % SLOTS].values() {
+                        hist_peer[ov::prio_bucket(p)] += 1;
+                    }
+                }
+                let near: Vec<String> = self.last_ownerless.iter().take(4).map(|&(n, e, d)| format!("{n:#x} e{e} {d:.0} m")).collect();
+                let over = [&mut self.b_double, &mut self.b_ownerless, &mut self.b_flap, &mut self.b_slow]
+                    .into_iter()
+                    .map(|b| std::mem::take(&mut b.suppressed))
+                    .sum::<u32>();
+                log::line(&format!(
+                    "own (10 s): host {running} / {} (OwnView), owned here {here}, doubles {}, ownerless-near {}{}, flaps {flaps}, slow {}, owner-down {}; 22 rx {}, 23 tx {}; prio hist host {}, peer {}{}",
+                    views.join(" / "),
+                    std::mem::take(&mut self.doubles),
+                    std::mem::take(&mut self.ownerless),
+                    if near.is_empty() { String::new() } else { format!(" [{}]", near.join(", ")) },
+                    std::mem::take(&mut self.slow_lines),
+                    std::mem::take(&mut self.down_lines),
+                    std::mem::take(&mut self.rx22),
+                    tx23.wrapping_sub(self.tx23_at),
+                    ov::hist(&hist_here),
+                    ov::hist(&hist_peer),
+                    if over > 0 { format!("; {over} lines over the cap") } else { String::new() }
+                ));
+                self.tx23_at = tx23;
+            } else {
+                let served = SERVED_23.load(Ordering::Relaxed);
+                log::line(&format!(
+                    "own (10 s): owned here {here}, running here {running}, 23 rx {}, flaps {flaps}, host-silent {:.1} s; prio hist {}",
+                    served.wrapping_sub(self.served23_at),
+                    std::mem::take(&mut self.silent_ms) as f32 / 1000.0,
+                    ov::hist(&hist_here)
+                ));
+                self.served23_at = served;
+            }
+        }
+    }
 }
 
 /// Type 18 (throw / grab / deathblow, `+0x20` defender netId, `+0x22` attacker) seen lately.
@@ -3683,8 +4212,6 @@ const SOFT_FAILS_LATCH: u32 = 3;
 /// Frames the client's late chr-loop patch may stay busy before we leave.
 const LATE_BUSY_MAX: u32 = 600;
 const STATS_EVERY: Duration = Duration::from_secs(10);
-/// How often `boss_watch` asks the game who runs each boss.
-const BOSS_WATCH_EVERY: Duration = Duration::from_millis(250);
 /// Host: the Engaged set goes out when it changes and this often.
 const ENGAGED_EVERY: Duration = Duration::from_secs(10);
 /// Engaged, a peer in another block for this long = that peer disengages (border flicker below).
@@ -3952,9 +4479,10 @@ struct Engine {
     all_going: bool,
     /// Our world update paused (menu): only for the "world stopped" log lines.
     pause: PauseTracker,
-    /// Bosses' native `owned_here` at the last `boss_watch` (this engagement).
-    boss_owned: HashMap<u16, bool>,
-    boss_watch_at: Option<Instant>,
+    /// The passive owner view (module `ownlog`).
+    ov: ownlog::State,
+    /// The last area load / world reset: the next first engagement logs how long it took.
+    load_at: Option<Instant>,
 }
 
 impl Engine {
@@ -3984,8 +4512,8 @@ impl Engine {
             blocker_since: BTreeMap::new(),
             all_going: false,
             pause: PauseTracker::default(),
-            boss_owned: HashMap::new(),
-            boss_watch_at: None,
+            ov: ownlog::State::default(),
+            load_at: None,
         }
     }
 
@@ -4052,7 +4580,7 @@ impl Engine {
         clear_queues();
         let _ = take_last23();
         self.pause = PauseTracker::default();
-        self.boss_owned.clear();
+        self.ov.reset();
         self.engaged_sent = 0;
         self.engaged_sent_at = None;
     }
@@ -4073,6 +4601,9 @@ impl Engine {
         let others = !self.all_going && self.any_engaged();
         if was == Phase::Engaged && others {
             drop_inbound_from(slot);
+            if self.host {
+                self.ov.forget(slot);
+            }
             if self.host && self.stage >= 2 {
                 let cleared = clear_record(slot);
                 log::line(&format!(
@@ -4508,6 +5039,10 @@ impl Engine {
             mask_slots(engaged_links()),
             if step_aside::NATIVE_BULLETS { "native" } else { "artfx.rs" }
         ));
+        // How long the enemies ran locally on both machines after the last load (D6 evidence).
+        if let Some(t) = self.load_at.take() {
+            log::line(&format!("nsession: load -> ENGAGED in {} ms (enemies local on both meanwhile)", t.elapsed().as_millis()));
+        }
     }
 
     /// One engaged link's drop rules (its leave, restart, block, remote; client: the
@@ -4674,35 +5209,16 @@ impl Engine {
         if self.stage >= 2 && self.host {
             self.host_candidates(f);
         }
-        // A client's enemies all keep their own AI until its chr-loop patch is in.
+        // The passive owner view (`own:` lines; `dblock::boss_taken` on a boss's native
+        // 0 -> 1). A client's enemies all keep their own AI until its chr-loop patch is in.
         if self.stage >= 2 && (self.host || self.late.is_empty()) {
-            self.boss_watch();
+            let clients = if self.host { mask_slots(engaged_links()) } else { Vec::new() };
+            self.ov.step(f, self.host, f.peers.me().slot(), &clients);
         }
         if !self.timers_logged && self.engaged_at.elapsed() >= Duration::from_secs(3) {
             self.timers_logged = true;
             let t = sync_table();
             log::line(&format!("nsession: sync table {t:x?} timers +0x398.. {:?}", t.and_then(|t| read::<[f32; 4]>(t + T_TIMERS))));
-        }
-    }
-
-    /// Both roles, every `BOSS_WATCH_EVERY`: a boss or multi-life enemy whose native
-    /// `owned_here` turns 0 -> 1 (after its first sight this engagement) has moved here from
-    /// another machine: its AI starts fresh, so `dblock::boss_taken` vetoes our stealth
-    /// deathblows on it for a while.
-    fn boss_watch(&mut self) {
-        if self.boss_watch_at.is_some_and(|t| t.elapsed() < BOSS_WATCH_EVERY) {
-            return;
-        }
-        self.boss_watch_at = Some(Instant::now());
-        for c in enemies() {
-            let Some(n) = netai::net_id(c) else { continue };
-            if c.hp().is_none_or(|hp| hp <= 0) || !is_boss(c) {
-                continue;
-            }
-            let here = owned_here(n);
-            if self.boss_owned.insert(n, here) == Some(false) && here {
-                dblock::boss_taken(n, c.entity_id().unwrap_or(-1));
-            }
         }
     }
 
@@ -4724,6 +5240,7 @@ impl Engine {
             match feed_22(&p, remote) {
                 Ok(n) => {
                     bump(&SRV, T_CAND as u32);
+                    self.ov.on_22(slot, &p);
                     if !l.first22_forced {
                         // Give this client its candidates now, not at the next 3 s tick.
                         l.first22_forced = true;
@@ -5111,6 +5628,7 @@ pub fn on_world_reset(why: &str) {
     let mut g = engine();
     let Some(e) = g.as_mut() else { return };
     e.disengage_all(why, Reason::Load, true, false);
+    e.load_at = Some(Instant::now());
     e.failed = None;
     e.rest_hold_until = None;
     let broken = BROKEN.load(Ordering::Acquire);
@@ -5251,6 +5769,8 @@ mod tests {
             Msg::Engaged { generation: 10, slots: vec![] },
             Msg::MaxHp { generation: 9, max: vec![(1_120_353, 349), (1_100_301, 9999)] },
             Msg::MaxHp { generation: 9, max: vec![] },
+            Msg::OwnView { generation: 11, origin: 1, running: vec![0x0801, 0x5822] },
+            Msg::OwnView { generation: 11, origin: 5, running: vec![] },
         ];
         for m in all {
             let b = encode(&m);
@@ -5265,8 +5785,17 @@ mod tests {
         assert_eq!(decode(&[99, 0, 0]), None);
         // An origin or a slot past the six players is malformed.
         assert_eq!(decode(&encode(&Msg::Engaged { generation: 1, slots: vec![6] })), None);
-        // The PROTO 6 ownership ids (Status 5, Assign 9, Claims 10, Ack 11) are retired.
-        for id in [5u8, 9, 10, 11] {
+        assert_eq!(decode(&encode(&Msg::OwnView { generation: 1, origin: 6, running: vec![] })), None);
+        // Caps: the encoder never writes more than the decoder takes.
+        let big = Msg::OwnView { generation: 1, origin: 1, running: (0..3000).collect() };
+        assert!(matches!(decode(&encode(&big)), Some(Msg::OwnView { running, .. }) if running.len() == crate::ownview::MAX_RUNNING));
+        // A count past the cap is malformed.
+        let mut b = vec![MSG_OWN_VIEW, 1, 0, 0, 0, 1];
+        b.extend_from_slice(&((crate::ownview::MAX_RUNNING + 1) as u16).to_le_bytes());
+        b.extend(std::iter::repeat_n(0u8, 2 * (crate::ownview::MAX_RUNNING + 1)));
+        assert_eq!(decode(&b), None);
+        // The PROTO 6 ownership ids (Assign 9, Claims 10, Ack 11) are retired; 5 is OwnView.
+        for id in [9u8, 10, 11] {
             assert_eq!(decode(&[id, 1, 0, 0, 0, 1, 0, 0]), None, "retired id {id}");
         }
     }
