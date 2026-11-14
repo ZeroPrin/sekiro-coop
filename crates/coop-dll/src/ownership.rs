@@ -13,7 +13,8 @@
 //!   NOBODY until that client acks, so a lost or late message never makes two brains;
 //! - `HostTable`: both of the above over every enemy the host sees;
 //! - `Mirror`: the receiver side (per-entry sequence numbers, full resync, contiguous ack);
-//! - `DoubleWatch`: the host's cross-machine two-brains detector.
+//! - `DoubleWatch`: the host's cross-machine two-brains detector;
+//! - `KindCache`: boss or ordinary per enemy (a boss answer kept, an ordinary one re-checked).
 
 use std::collections::{HashMap, HashSet};
 
@@ -56,6 +57,9 @@ pub const ACK_WARN_MS: u64 = 5000;
 pub const STATUS_EVERY_MS: u64 = 2000;
 /// Missing from the host's scan this long before the entry goes to nobody.
 pub const UNLOAD_GRACE_MS: u64 = 1000;
+/// An enemy classified Ordinary is classified again at most this often (a Boss answer is
+/// kept): its entity id or NpcParam row may not be readable when it is first seen.
+pub const KIND_RECHECK_MS: u64 = 1000;
 
 /// One player as an enemy's rule sees it. `present` = engaged, alive, not waiting dead in a
 /// boss fight, world not paused; `dist` = metres to the enemy (None = position unknown).
@@ -593,6 +597,39 @@ impl Mirror {
     }
 }
 
+// --- Kind cache --------------------------------------------------------------------------
+
+/// Boss or ordinary per netId for one engagement. A Boss answer is kept; an Ordinary one is
+/// asked again at most every `KIND_RECHECK_MS`: on the first sight the entity id (table
+/// bosses) or the NpcParam row behind `chr+0x2010` (lives, multi-life minibosses) may not be
+/// readable yet, and livesync `lives0_of` reads 1 then. [Г] Both are set when the chr is
+/// built, before it is in a chr set; not verified live, the "is a boss now" line shows it.
+#[derive(Default)]
+pub struct KindCache {
+    rows: HashMap<u16, (Kind, u64)>,
+}
+
+impl KindCache {
+    /// The kind of `n` (`is_boss` asked only when due). The bool: it was Ordinary until now
+    /// and is a Boss from here (log it).
+    pub fn get(&mut self, n: u16, now: u64, is_boss: impl FnOnce() -> bool) -> (Kind, bool) {
+        let was = match self.rows.get(&n) {
+            Some(&(Kind::Boss, _)) => return (Kind::Boss, false),
+            Some(&(Kind::Ordinary, at)) if now.saturating_sub(at) < KIND_RECHECK_MS => return (Kind::Ordinary, false),
+            Some(_) => true,
+            None => false,
+        };
+        let k = if is_boss() { Kind::Boss } else { Kind::Ordinary };
+        self.rows.insert(n, (k, now));
+        (k, was && k == Kind::Boss)
+    }
+
+    /// The last answer for `n`, without asking (None = never seen).
+    pub fn known(&self, n: u16) -> Option<Kind> {
+        self.rows.get(&n).map(|r| r.0)
+    }
+}
+
 // --- Double watch ------------------------------------------------------------------------
 
 /// Host: an enemy whose AI runs on the host and on a client, counted only when the client
@@ -914,6 +951,25 @@ mod tests {
         // Not running on the host: nothing.
         assert!(w.report(C, 60, &[0x802], &host, seq).is_empty());
         assert!(w.report(C, 60, &[0x802], &host, seq).is_empty());
+    }
+
+    #[test]
+    fn kind_cache_keeps_a_boss_and_rechecks_an_ordinary_once_a_second() {
+        let mut k = KindCache::default();
+        let mut asked = 0;
+        // First sight: the param row not readable yet (ordinary).
+        assert_eq!(k.get(0x800, 1000, || { asked += 1; false }), (Kind::Ordinary, false));
+        // Within the second: not asked again.
+        assert_eq!(k.get(0x800, 1999, || { asked += 1; true }), (Kind::Ordinary, false));
+        assert_eq!(asked, 1);
+        // After it: asked, a boss now (flagged once).
+        assert_eq!(k.get(0x800, 2000, || { asked += 1; true }), (Kind::Boss, true));
+        assert_eq!(k.get(0x800, 9000, || { asked += 1; false }), (Kind::Boss, false), "a boss answer is kept");
+        assert_eq!(asked, 2);
+        assert_eq!(k.known(0x800), Some(Kind::Boss));
+        assert_eq!(k.known(0x801), None);
+        // A boss on the first sight is not "a boss now".
+        assert_eq!(k.get(0x801, 0, || true), (Kind::Boss, false));
     }
 
     #[test]

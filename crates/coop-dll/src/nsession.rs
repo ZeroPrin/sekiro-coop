@@ -2915,8 +2915,8 @@ pub(crate) mod own {
     pub struct State {
         // --- host ---
         table: om::HostTable,
-        /// Boss or not, per netId, for this engagement.
-        kinds: HashMap<u16, Kind>,
+        /// Boss or not, per netId, for this engagement (both roles).
+        kinds: om::KindCache,
         decide_at: Option<Instant>,
         /// Presence signature of the last decision (a change decides at once).
         presence: u64,
@@ -3004,6 +3004,20 @@ pub(crate) mod own {
             o.status.clear();
             o.claims = None;
             o.ack = None;
+        }
+
+        /// Boss or ordinary (`om::KindCache`: a boss answer kept, an ordinary one asked again
+        /// at most once a second); a late boss answer is logged.
+        fn kind_of(&mut self, n: u16, c: Chr, ms: u64) -> Kind {
+            let (kind, now_boss) = self.kinds.get(n, ms, || is_boss(c));
+            if now_boss {
+                log::line(&format!(
+                    "own: {n:#x} e{} is a boss now (lives {}), first seen as an ordinary enemy",
+                    c.entity_id().unwrap_or(-1),
+                    crate::livesync::lives0_of(c)
+                ));
+            }
+            kind
         }
 
         /// Ordinary lines: at most `MAX_LINES` per 10 s; `always` (bosses, claims) never capped.
@@ -3097,7 +3111,7 @@ pub(crate) mod own {
             let mut seen = Vec::new();
             for c in enemies() {
                 let Some(n) = netai::net_id(c) else { continue };
-                let kind = *self.kinds.entry(n).or_insert_with(|| if is_boss(c) { Kind::Boss } else { Kind::Ordinary });
+                let kind = self.kind_of(n, c, ms);
                 let pos = c.position();
                 let players = pl
                     .iter()
@@ -3433,8 +3447,8 @@ pub(crate) mod own {
                     self.transitions += 1;
                     let c = chrs.get(&n).copied();
                     let kind = match c {
-                        Some(c) => *self.kinds.entry(n).or_insert_with(|| if is_boss(c) { Kind::Boss } else { Kind::Ordinary }),
-                        None => Kind::Ordinary,
+                        Some(c) => self.kind_of(n, c, ms),
+                        None => self.kinds.known(n).unwrap_or(Kind::Ordinary),
                     };
                     let entity = c.and_then(|c| c.entity_id()).unwrap_or(-1);
                     if new == me && old != NOBODY && kind == Kind::Boss {
