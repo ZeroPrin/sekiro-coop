@@ -2,9 +2,9 @@
 
 Unofficial branch of Sekiro Together, based on the newest public source (1.0.9-beta,
 commit `e11f68b`; the 1.0.10 / 1.0.11 sources were not published when this was made).
-Version string: `1.0.9-pickups.3-test11`. Everybody in a session needs the same build.
+Version string: `1.0.9-pickups.3-test12`. Everybody in a session needs the same build.
 
-> **Test build `1.0.9-pickups.3-test11`: nothing in the sections below marked experimental or
+> **Test build `1.0.9-pickups.3-test12`: nothing in the sections below marked experimental or
 > "not verified live" has been verified in a live game.** `test2` merged the branches
 > `base-fixes`, `objact-sync`, `loadout-sync`, `items-unlock-fix`, `pos-rate` and `pvp-native`
 > onto `share-pickups`; it had one live test (2026-11-12). `test3` adds the fixes made after it:
@@ -35,7 +35,17 @@ Version string: `1.0.9-pickups.3-test11`. Everybody in a session needs the same 
 > cleared on warps; the auditor ranks bosses before elites and labels elites; throwprobe logs posture
 > and the AI target with a `+0 s` line (budget 536 lines). Known leftover: a solo world whose Senpou lift
 > was killed by a test5 session stays dead (not repaired automatically; joining a host whose lift works
-> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. `test10` adds Reed as a separate skin (`reed.rs`, section "Wardrobe"; only with all eight Reed part files in the parts package), fixes the `aitarget:` logger (records keyed by address: no fake `TARGET me -> me` / HIT lines; separate event and replan budgets, a sharded sample table, section "Enemy target choice, observed"), mirrors the friend's prosthetic tool states onto its replica (`fx_speffect_mirror = 1`: tool flashes and sounds, `docs/RE-REMOTE-FX.md` "Протезы на реплике"; the 906 deflect-spark "gap" was none) and removes `fx_debug`; the wardrobe close-on-load was checked (works, never triggered in test9). Checklist: section "test10 co-op checklist". `test11` replaces enemy AI ownership: the host alone decides which machine runs each enemy (an owner table sent on our control lane, PROTO 6), and `IsOwnedHere` answers only from that table on both machines; ownfill, the boss stripping, the pause hand-over, the prio-0xFFFF stealth claims and contests are gone, stealth claims are requests to the host, and the ini keys `ns_force_distribution` / `ns_throw_claims` are removed (`docs/PLAN-OWNERSHIP.md`; section "test11 co-op checklist"). The oracle is a playtest with both logs.
+> restores it in the co-op world). `test7` adds an observe-only log of how enemies choose between the players (`ai_retarget`, `aitarget:` lines, section below; scores are never changed). `test8` changes the wardrobe: legs always follow the skin, every head goes with every skin (no locks), `wardrobe_all_parts` is gone, and the panel closes when a loading screen starts. `test9` is test8 with the optional parts package built in (`mod\parts`, section "Parts package"): the Shura head on other skins and the Tengu torso render with the right textures. `test10` adds Reed as a separate skin (`reed.rs`, section "Wardrobe"; only with all eight Reed part files in the parts package), fixes the `aitarget:` logger (records keyed by address: no fake `TARGET me -> me` / HIT lines; separate event and replan budgets, a sharded sample table, section "Enemy target choice, observed"), mirrors the friend's prosthetic tool states onto its replica (`fx_speffect_mirror = 1`: tool flashes and sounds, `docs/RE-REMOTE-FX.md` "Протезы на реплике"; the 906 deflect-spark "gap" was none) and removes `fx_debug`; the wardrobe close-on-load was checked (works, never triggered in test9). Checklist: section "test10 co-op checklist". `test11` replaces enemy AI ownership: the host alone decides which machine runs each enemy (an owner table sent on our control lane, PROTO 6), and `IsOwnedHere` answers only from that table on both machines; ownfill, the boss stripping, the pause hand-over, the prio-0xFFFF stealth claims and contests are gone, stealth claims are requests to the host, and the ini keys `ns_force_distribution` / `ns_throw_claims` are removed (`docs/PLAN-OWNERSHIP.md`; section "test11 co-op checklist"). `test12` is test11 plus the Red Armour outfit as a separate skin with its own head (`red.rs`, section "Wardrobe"; only with all eight Red part files in the parts package); Reed and Red share one table-driven module (`partskin.rs`). The oracle is a playtest with both logs.
+
+## test12 additions (Red Armour)
+
+test12 = test11 + the Red Armour skin and head; the test11 checklist below still applies
+(test11 was never played in co-op). Solo first: F2, Skin -> Red Armour (head "As skin" = Red),
+then other heads on it and the Red head on other skins; an idol warp; "As in game". Log: `red:
+all 8 part files present`, `red: EquipParamProtector equipModelId patched in memory: ...; skin
+and head offered`, `wardrobe: applied skin red ...`. Co-op: A wears Red Armour, B Reed, each
+sees the other's outfit; with the Red files renamed on B, B sees A as Ashina and logs `red:
+peer slot N wears Red Armour but Red Armour is not available on this PC ...`.
 
 ## test11 co-op checklist (host-authored enemy ownership)
 
@@ -678,7 +688,8 @@ choice other than "As in game" is made. The native Co-op Settings page has no ro
 the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
 
 - **Choices.** Skin (torso + prosthetic arm + legs, and the default head): As in game, Wolf,
-  Shura, Ashina, Tengu. Head: As skin, Wolf, Shura, Ashina, Tengu, the same list with every
+  Shura, Ashina, Tengu (+ Reed, Red Armour with their part files). Head: As skin, Wolf, Shura,
+  Ashina, Tengu (+ Red with the Red Armour files), the same list with every
   skin and no locks (user decision 2026-11-13); Shura's head brings its hair 304000 in
   protector slot 16, any other head empties that slot. Legs are not a choice: they are always
   the skin's own (103000 / 303000 / 403000 / 503000; user decision 2026-11-13 after live
@@ -714,6 +725,39 @@ the page shows only its first 10 rows (`optmenu_model::PAGE_ROWS`).
   or `reed: skin not offered: <why>`; `wardrobe: skin reed is not offered on this PC (...)`;
   `reed: peer slot N wears Reed but Reed is not available on this PC ...`. Tests
   `reed::tests`, `wardrobe::tests::reed_outfit`.
+- **Red Armour (`red.rs`, design `E:\RE\work_skin_red\SPEC.md` section 6; NOT verified live).**
+  A red-lacquer Ashina outfit as a seventh skin ("Red Armour", ini `red`) with its own head
+  ("Red" in the Head row, ini `red`; it goes with every skin like the other heads, and the
+  Red Armour skin takes any head). Offered (skin and head) only when all eight Red part files
+  are in the parts package (`mod\parts\{bd_m_9125,am_m_9125,lg_m_9125,fc_m_0225}{,_l}.partsbnd.dcx`);
+  otherwise one `red:` line, and `red` in the ini acts as game / skin. Patch, in memory, same
+  rules as Reed (rows read 2026-11-15 from `EquipParamProtector.param`): `equipModelId` 901200
+  9530 -> 9125 (the debug "underwater cloth" torso, CharaInitParam 9610 only; one torso for
+  every sword state, as the Ashina outfit has one torso model) plus its resistPoison /
+  resistDisease / resistBlood 16 / 16 / 23 -> 0 (the row then equals the Ashina torso 431000
+  but for ids and icons: gameplay-neutral), 202000 9100 -> 9125 (prosthetic arm), 203000
+  9100 -> 9125 (legs), 600000 220 -> 225 (head `fc_m_0225`; 600000 is a never-owned duplicate
+  of the Ashina head 400000; the head carries its own face and hair, hair slot empty). Every
+  field is checked first (vanilla or already Red); anything else writes nothing and hides Red
+  for the run. 901200 tells no sword state (kept as seen last, like Reed's 201000). A friend's
+  Red rows on a machine without Red are drawn as Ashina (600000 -> 400000, 901200 -> 431000,
+  and with that torso 202000 -> 402000, 203000 -> 403000), logged once. **Cosmetic side
+  effect:** 202000 / 203000 are the Sculptor's arm / legs (CharaInitParam 15010, the
+  Sculptor's ending scene), so while patched that scene shows the Red arm and legs; with Reed
+  patched too (it repoints the Sculptor's torso 201000) the scene shows a mix of Reed's torso,
+  Red's arm / legs and the Sculptor's head. Log: `red: all 8 part files present ...`, `red:
+  EquipParamProtector equipModelId patched in memory: 901200 9530->9125 (resistPoison 16->0,
+  resistDisease 16->0, resistBlood 23->0), 202000 9100->9125, ...; skin and head offered`, or
+  `red: skin and head not offered: <why>`; `red: peer slot N wears Red Armour but Red Armour is
+  not available on this PC ...: drawn as Ashina`. Tests `red::tests`,
+  `wardrobe::tests::red_outfit`, `wardrobe::tests::cycling_with_both_outfits`.
+- **Part-file outfits (`partskin.rs`).** Reed and Red Armour are one table each (`Def`: rows
+  with old / new `equipModelId` and any further u16 fields, the part files, the replica
+  fallback map) on shared machinery: the file gate, the check-then-write patch of
+  EquipParamProtector, the availability flag and the replica fallback (`partskin::ALL`, run by
+  the frame task; `loadout::apply` chains every outfit's fallback). A further outfit is one
+  more `PartSkin` static plus its wardrobe skin. Tests `partskin::tests` (field offsets 0xA0 /
+  0xC0 / 0xC2 / 0xC4 in the 0x1FC row, no two outfits share a row or file, chained fallbacks).
 - **How the game changes armour (static RE, `E:\RE\ghidra_wardrobe`) [VAR].** EMEVD 2003[83]
   `ForcePlayerArmorEquip` = case 0x53 of `0x904EF0`: on the local EGD (`PGD+0x278`) find the
   row in the inventory (`0x79D7E0`, no add), its entry's handle (`0xC3C9B0` / `0xC3CB00`),
@@ -813,7 +857,8 @@ package): the Shura head on other skins renders correctly; without the package i
   (`me3scan::tests::parts_package_only_in_the_staged_profile`).
 - **Building it.** Set `SEKIRO_COOP_PARTS` to a `;`-separated list of folders that hold the
   `.dcx` files, then run `build-public.cmd`, for example
-  `set SEKIRO_COOP_PARTS=E:\RE\work_override\fixed\parts;E:\RE\work_skin\game\mod\parts`.
+  `set SEKIRO_COOP_PARTS=E:\RE\work_override\fixed\parts;E:\RE\work_skin\game\mod\parts;E:\RE\work_skin_red\game\mod\parts`
+  (test12: 22 files = the 6 above + 8 Reed + 8 Red Armour).
   `tools\parts\stage-parts.ps1` copies every file into `<stage>\mod\parts\` and appends the
   block to the staged `.me3`. It stops the build if a folder is missing, a file is not a
   `.dcx`, a name is in two folders, or a file fails the reset check below. Unset or empty:

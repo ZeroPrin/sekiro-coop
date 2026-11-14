@@ -796,8 +796,9 @@ wardrobe_pad = 1
 wardrobe_pad_button = none
 ; Written by the panel (you may edit them with the game closed):
 ; skin: game (= as in game; restores what you wore before the wardrobe), wolf, shura, ashina,
-; tengu. head: skin (= as the skin), wolf, shura, ashina, tengu; every head goes with every
-; skin (Shura's head off the Shura skin lacks its fire texture, it lives in Shura's torso).
+; tengu, reed, red (Red Armour). head: skin (= as the skin), wolf, shura, ashina, tengu, red;
+; every head goes with every skin (Shura's head off the Shura skin lacks its fire texture, it
+; lives in Shura's torso). reed / red only with their part files in mod\\parts.
 ; Legs are always the skin's own: a wardrobe_legs line from an older build is ignored.
 ; The Sculptor's parts are not offered: sculptor (from an older build) acts as game / skin.
 wardrobe_skin = game

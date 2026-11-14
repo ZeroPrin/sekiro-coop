@@ -71,7 +71,9 @@ mod pvp;
 mod ngblock;
 mod optprobe;
 mod packetrate;
+mod partskin;
 mod quitblock;
+mod red;
 mod reed;
 mod remotefx;
 mod restsync;
@@ -315,7 +317,7 @@ fn init(hmodule: usize) {
                 // the puppet's frame right after.
                 let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                     items::on_frame();
-                    reed::tick();
+                    partskin::tick();
                     optmenu::on_frame();
                     quitblock::tick();
                     ngblock::tick();

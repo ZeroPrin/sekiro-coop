@@ -58,10 +58,34 @@ pub enum Skin {
     /// The Reed outfit (`reed.rs`): new part files on never-owned rows, offered only when the
     /// files are installed and the param patch went through.
     Reed,
+    /// Red Armour (`red.rs`): a red-lacquer Ashina outfit, new part files on never-owned rows,
+    /// with its own head (the head choice "Red"); offered only like Reed.
+    Red,
     Sculptor,
 }
 
-pub const SKINS: [Skin; 6] = [Skin::Wolf, Skin::Shura, Skin::Ashina, Skin::Tengu, Skin::Reed, Skin::Sculptor];
+pub const SKINS: [Skin; 7] = [Skin::Wolf, Skin::Shura, Skin::Ashina, Skin::Tengu, Skin::Reed, Skin::Red, Skin::Sculptor];
+
+/// Which part-file outfits (`partskin.rs`) this machine can wear and draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Installed {
+    pub reed: bool,
+    pub red: bool,
+}
+
+impl Installed {
+    pub fn now() -> Self {
+        Self { reed: crate::reed::REED.available(), red: crate::red::RED.available() }
+    }
+
+    fn has(self, s: Skin) -> bool {
+        match s {
+            Skin::Reed => self.reed,
+            Skin::Red => self.red,
+            _ => true,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TorsoClass {
@@ -81,7 +105,22 @@ impl Skin {
             Skin::Ashina => "Ashina shinobi",
             Skin::Tengu => "Tengu",
             Skin::Reed => "Reed",
+            Skin::Red => "Red Armour",
             Skin::Sculptor => "Sculptor",
+        }
+    }
+
+    /// The label in the Head row (the Red Armour head is just "Red").
+    pub fn head_label(self) -> &'static str {
+        if self == Skin::Red { "Red" } else { self.label() }
+    }
+
+    /// The part-file outfit behind this skin, if any.
+    pub fn part_skin(self) -> Option<&'static crate::partskin::PartSkin> {
+        match self {
+            Skin::Reed => Some(&crate::reed::REED),
+            Skin::Red => Some(&crate::red::RED),
+            _ => None,
         }
     }
 
@@ -92,6 +131,7 @@ impl Skin {
             Skin::Ashina => "ashina",
             Skin::Tengu => "tengu",
             Skin::Reed => "reed",
+            Skin::Red => "red",
             Skin::Sculptor => "sculptor",
         }
     }
@@ -103,6 +143,7 @@ impl Skin {
             Skin::Shura => 300_000,
             Skin::Ashina => 400_000,
             Skin::Tengu => 500_000,
+            Skin::Red => crate::red::HEAD,
             Skin::Sculptor => 200_000,
         }
     }
@@ -120,6 +161,7 @@ impl Skin {
             Skin::Ashina => 402_000,
             Skin::Tengu => 502_000,
             Skin::Reed => 602_000,
+            Skin::Red => crate::red::ARM,
         }
     }
 
@@ -132,6 +174,7 @@ impl Skin {
             Skin::Ashina => 403_000,
             Skin::Tengu => 503_000,
             Skin::Reed => 603_000,
+            Skin::Red => crate::red::LEGS,
             Skin::Sculptor => 203_000,
         }
     }
@@ -140,6 +183,8 @@ impl Skin {
     /// no-sword torso (141000); the others take their x31000 (no Mortal Blade). The
     /// Sculptor has one torso (201000, the cutscene model). Reed (`reed.rs`): 641000
     /// (`bd_m_9045`) with the Mortal Blade, 201000 (`bd_m_9005`, the sword torso) otherwise.
+    /// Red Armour (`red.rs`): 901200 in every state (the Ashina outfit has one torso model too;
+    /// its two rows differ only in the id).
     pub fn torso(self, class: TorsoClass) -> i32 {
         let base = match self {
             Skin::Wolf => 100_000,
@@ -148,6 +193,7 @@ impl Skin {
             Skin::Tengu => 500_000,
             Skin::Reed if class == TorsoClass::MortalBlade => return REED_TORSO_MORTAL_BLADE,
             Skin::Reed | Skin::Sculptor => return 201_000,
+            Skin::Red => return crate::red::TORSO,
         };
         match class {
             TorsoClass::MortalBlade => base + 1000,
@@ -169,13 +215,13 @@ impl Skin {
 /// any refused choice; the rows stay known (`Skin::Sculptor`) so `wardrobe_added` / "As in
 /// game" still remove 200000-203000.
 ///
-/// Reed only with `reed` = `reed::available()` (its part files are installed and the param
-/// patch went through on this machine); otherwise a `reed` ini value acts as "as in game".
-pub fn skin_offered(skin: Skin, reed: bool) -> bool {
+/// Reed and Red Armour only when `inst` has them (`Installed::now`: the part files are
+/// installed and the param patch went through on this machine); otherwise a `reed` / `red`
+/// ini value acts as "as in game".
+pub fn skin_offered(skin: Skin, inst: Installed) -> bool {
     match skin {
         Skin::Sculptor => false,
-        Skin::Reed => reed,
-        _ => true,
+        _ => inst.has(skin),
     }
 }
 
@@ -185,17 +231,20 @@ pub fn skin_offered(skin: Skin, reed: bool) -> bool {
 /// Shura's torso `bd_m_9110`: on any other skin the head lacks that texture (test4 video
 /// 00:44, Wolf skin + Shura head: a translucent glowing bluish shell). The `fc_m_0200`
 /// textures used by the Ashina / Tengu / Shura heads are always loaded: those render fine.
-/// Reed is not a head (it wears the Wolf's, which the list already has).
-pub fn head_offered(head: Skin) -> bool {
-    !matches!(head, Skin::Sculptor | Skin::Reed)
+/// Reed is not a head (it wears the Wolf's, which the list already has). The Red Armour head
+/// (`fc_m_0225`, self-contained like the Ashina head) goes with every skin, offered with the
+/// Red Armour skin (`inst`); a `red` head without it acts as "as skin".
+pub fn head_offered(head: Skin, inst: Installed) -> bool {
+    !matches!(head, Skin::Sculptor | Skin::Reed) && inst.has(head)
 }
 
 /// Reed's Mortal Blade torso row (an unused Ashina-ninja torso, `reed.rs`).
 const REED_TORSO_MORTAL_BLADE: i32 = 641_000;
 
 /// The sword state a worn torso says, None for a torso that does not tell (201000: the
-/// Sculptor's single torso and Reed's sword / no-sword torso; test rows, empty). Reed's
-/// 641000 says Mortal Blade. While 201000 is worn the wardrobe keeps the class it saw last.
+/// Sculptor's single torso and Reed's sword / no-sword torso; Red Armour's 901200; test rows,
+/// empty). Reed's 641000 says Mortal Blade. While such a torso is worn the wardrobe keeps the
+/// class it saw last.
 pub fn classify_torso(row: i32) -> Option<TorsoClass> {
     if row == REED_TORSO_MORTAL_BLADE {
         return Some(TorsoClass::MortalBlade);
@@ -218,9 +267,10 @@ fn family_class(row: i32) -> Option<TorsoClass> {
 }
 
 /// An arm that has the prosthetic. 112000 (bare arm, before the prosthetic) and 122000
-/// (arm missing, cutscenes) are story states: the wardrobe leaves those alone.
+/// (arm missing, cutscenes) are story states: the wardrobe leaves those alone. 202000 is
+/// Red Armour's arm (the Sculptor skin wears the Wolf's 102000).
 pub fn prosthetic_arm(row: i32) -> bool {
-    matches!(row, 102_000 | 162_000 | 302_000 | 402_000 | 502_000 | 602_000)
+    matches!(row, 102_000 | 162_000 | 302_000 | 402_000 | 502_000 | 602_000 | 202_000)
 }
 
 /// The five protector rows (no category bits; -1 = empty).
@@ -266,11 +316,12 @@ pub struct Choices {
 /// state the player is in, `current` = what is worn now (its arm decides whether the arm is
 /// touched). Torso, arm and legs are always the skin's; the hair slot follows the head.
 /// A skin / head choice that is not offered (set by hand in the ini, or kept from an older
-/// build, or Reed without its files: `reed`) falls back: skin -> as in game, head -> as the
-/// skin. An older build's `wardrobe_legs` is not read at all: the skin's legs are put on.
-pub fn resolve(c: &Choices, class: TorsoClass, current: &Outfit, reed: bool) -> Option<Outfit> {
-    let skin = c.skin.filter(|&s| skin_offered(s, reed))?;
-    let head = c.head.filter(|&h| head_offered(h)).unwrap_or(skin);
+/// build, or Reed / Red Armour without its files: `inst`) falls back: skin -> as in game,
+/// head -> as the skin. An older build's `wardrobe_legs` is not read at all: the skin's legs
+/// are put on.
+pub fn resolve(c: &Choices, class: TorsoClass, current: &Outfit, inst: Installed) -> Option<Outfit> {
+    let skin = c.skin.filter(|&s| skin_offered(s, inst))?;
+    let head = c.head.filter(|&h| head_offered(h, inst)).unwrap_or(skin);
     Some(Outfit {
         head: head.head(),
         torso: skin.torso(class),
@@ -287,8 +338,9 @@ pub const ROWS: usize = 2;
 
 /// The choices after moving row `row` by `dir` (+1 / -1, wraps). Both lists start with their
 /// "as in game" / "as skin" entry; the head list is the same for every skin, and a skin change
-/// keeps the chosen head. `reed`: Reed is in the skin list (`skin_offered`).
-pub fn cycle(c: Choices, row: usize, dir: i32, reed: bool) -> Choices {
+/// keeps the chosen head. `inst`: Reed / Red Armour are in the lists (`skin_offered`,
+/// `head_offered`).
+pub fn cycle(c: Choices, row: usize, dir: i32, inst: Installed) -> Choices {
     fn step<T: Copy + PartialEq>(list: &[Option<T>], now: Option<T>, dir: i32) -> Option<T> {
         let i = list.iter().position(|&x| x == now).unwrap_or(0) as i32;
         list[(i + dir).rem_euclid(list.len() as i32) as usize]
@@ -296,12 +348,12 @@ pub fn cycle(c: Choices, row: usize, dir: i32, reed: bool) -> Choices {
     let mut c = c;
     match row {
         ROW_SKIN => {
-            let list: Vec<Option<Skin>> = std::iter::once(None).chain(SKINS.into_iter().filter(|&s| skin_offered(s, reed)).map(Some)).collect();
-            c.skin = step(&list, c.skin.filter(|&s| skin_offered(s, reed)), dir);
+            let list: Vec<Option<Skin>> = std::iter::once(None).chain(SKINS.into_iter().filter(|&s| skin_offered(s, inst)).map(Some)).collect();
+            c.skin = step(&list, c.skin.filter(|&s| skin_offered(s, inst)), dir);
         }
         ROW_HEAD => {
-            let list: Vec<Option<Skin>> = std::iter::once(None).chain(SKINS.into_iter().filter(|&h| head_offered(h)).map(Some)).collect();
-            c.head = step(&list, c.head.filter(|&h| head_offered(h)), dir);
+            let list: Vec<Option<Skin>> = std::iter::once(None).chain(SKINS.into_iter().filter(|&h| head_offered(h, inst)).map(Some)).collect();
+            c.head = step(&list, c.head.filter(|&h| head_offered(h, inst)), dir);
         }
         _ => {}
     }
@@ -313,7 +365,7 @@ pub fn skin_label(s: Option<Skin>) -> &'static str {
 }
 
 pub fn head_label(h: Option<Skin>) -> &'static str {
-    h.map_or("As skin", Skin::label)
+    h.map_or("As skin", Skin::head_label)
 }
 
 pub fn skin_ini(s: Option<Skin>) -> &'static str {
@@ -651,11 +703,11 @@ pub fn load_ini(v: IniValues<'_>, warn: &mut Vec<String>) {
         None
     });
     let skin = parse_skin(v.skin).unwrap_or_else(|_| {
-        warn.push(format!("wardrobe_skin = {:?} is not game/wolf/shura/ashina/tengu/reed/sculptor, using game", v.skin));
+        warn.push(format!("wardrobe_skin = {:?} is not game/wolf/shura/ashina/tengu/reed/red/sculptor, using game", v.skin));
         None
     });
     let head = parse_head(v.head).unwrap_or_else(|_| {
-        warn.push(format!("wardrobe_head = {:?} is not skin/wolf/shura/ashina/tengu/sculptor, using skin", v.head));
+        warn.push(format!("wardrobe_head = {:?} is not skin/wolf/shura/ashina/tengu/red/sculptor, using skin", v.head));
         None
     });
     let original = parse_outfit(v.original).unwrap_or_else(|_| {
@@ -706,7 +758,7 @@ pub fn edit(e: Edit) {
         Edit::Row(d) if st.open => st.row = (st.row as i32 + d).rem_euclid(ROWS as i32) as usize,
         Edit::Cycle(d) if st.open => {
             let before = st.choices;
-            st.choices = cycle(st.choices, st.row, d, crate::reed::available());
+            st.choices = cycle(st.choices, st.row, d, Installed::now());
             if st.choices != before {
                 log::line(&format!("wardrobe: choice changed: {}", describe(&st.choices)));
                 st.edited_at = Some(Instant::now());
@@ -1111,17 +1163,19 @@ fn tick_locked(player: Chr, in_world_for: Duration, reload: &mut Option<bool>) {
         st.class = Some(c);
     }
 
-    let reed = crate::reed::available();
-    let resolved = resolve(&st.choices, st.class.unwrap_or(TorsoClass::Sword), &current, reed);
-    // A skin the rules refuse (wardrobe_skin = sculptor, never offered; reed without its
-    // files) acts as "as in game".
+    let resolved = resolve(&st.choices, st.class.unwrap_or(TorsoClass::Sword), &current, Installed::now());
+    // A skin the rules refuse (wardrobe_skin = sculptor, never offered; reed / red without
+    // their files) acts as "as in game".
     let refused = st.choices.skin.is_some() && resolved.is_none();
     if refused && st.refused_logged_skin != st.choices.skin {
         st.refused_logged_skin = st.choices.skin;
         log::line(&format!(
             "wardrobe: skin {} is not offered on this PC{}: acting as 'as in game'",
             skin_ini(st.choices.skin),
-            if st.choices.skin == Some(Skin::Reed) { " (Reed part files or param patch missing, see the reed: lines)" } else { "" }
+            match st.choices.skin.and_then(Skin::part_skin) {
+                Some(p) => format!(" ({} part files or param patch missing, see the {}: lines)", p.name, p.tag),
+                None => String::new(),
+            }
         ));
     }
     let want = match resolved {
@@ -1349,6 +1403,10 @@ impl Panel {
 mod tests {
     use super::*;
 
+    const NONE: Installed = Installed { reed: false, red: false };
+    const REED: Installed = Installed { reed: true, red: false };
+    const BOTH: Installed = Installed { reed: true, red: true };
+
     const WOLF_SWORD: Outfit = Outfit { head: 100_000, torso: 131_000, arm: 102_000, legs: 103_000, hair: -1 };
 
     #[test]
@@ -1383,11 +1441,11 @@ mod tests {
     #[test]
     fn legs_follow_the_skin() {
         let rows: Vec<i32> = SKINS.into_iter().map(Skin::legs).collect();
-        assert_eq!(rows, vec![103_000, 303_000, 403_000, 503_000, 603_000, 203_000]);
+        assert_eq!(rows, vec![103_000, 303_000, 403_000, 503_000, 603_000, 203_000, 203_000]);
         // Whatever the head, the outfit's legs (and torso / arm) are the skin's own.
-        for s in SKINS.into_iter().filter(|&s| skin_offered(s, true)) {
+        for s in SKINS.into_iter().filter(|&s| skin_offered(s, REED)) {
             for head in std::iter::once(None).chain(SKINS.into_iter().map(Some)) {
-                let o = resolve(&Choices { skin: Some(s), head }, TorsoClass::Sword, &WOLF_SWORD, true).unwrap();
+                let o = resolve(&Choices { skin: Some(s), head }, TorsoClass::Sword, &WOLF_SWORD, REED).unwrap();
                 assert_eq!((o.torso, o.arm, o.legs), (s.torso(TorsoClass::Sword), s.arm(), s.legs()), "{s:?} {head:?}");
             }
         }
@@ -1396,55 +1454,55 @@ mod tests {
     #[test]
     fn heads_and_skins_offered() {
         // The Sculptor is never offered, neither as skin nor as head; all other heads are.
-        for reed in [false, true] {
+        for reed in [NONE, REED] {
             assert!(!skin_offered(Skin::Sculptor, reed));
             for s in [Skin::Wolf, Skin::Shura, Skin::Ashina, Skin::Tengu] {
-                assert!(skin_offered(s, reed) && head_offered(s), "{s:?}");
+                assert!(skin_offered(s, reed) && head_offered(s, REED), "{s:?}");
             }
         }
-        assert!(!head_offered(Skin::Sculptor));
+        assert!(!head_offered(Skin::Sculptor, REED));
         // Reed: a skin only with its files and patch; never a head (it wears the Wolf's).
-        assert!(skin_offered(Skin::Reed, true));
-        assert!(!skin_offered(Skin::Reed, false));
-        assert!(!head_offered(Skin::Reed));
+        assert!(skin_offered(Skin::Reed, REED));
+        assert!(!skin_offered(Skin::Reed, NONE));
+        assert!(!head_offered(Skin::Reed, REED));
     }
 
     #[test]
     fn resolve_builds_the_outfit() {
         // Shura's head on the Ashina skin: no lock; its hair comes along, legs are Ashina's.
         let c = Choices { skin: Some(Skin::Ashina), head: Some(Skin::Shura) };
-        let o = resolve(&c, TorsoClass::MortalBlade, &WOLF_SWORD, true).unwrap();
+        let o = resolve(&c, TorsoClass::MortalBlade, &WOLF_SWORD, REED).unwrap();
         assert_eq!(o, Outfit { head: 300_000, torso: 401_000, arm: 402_000, legs: 403_000, hair: 304_000 });
         // Every offered head with every offered skin: the head's row and the head's hair.
-        for s in SKINS.into_iter().filter(|&s| skin_offered(s, true)) {
-            for h in SKINS.into_iter().filter(|&h| head_offered(h)) {
-                let o = resolve(&Choices { skin: Some(s), head: Some(h) }, TorsoClass::Sword, &WOLF_SWORD, true).unwrap();
+        for s in SKINS.into_iter().filter(|&s| skin_offered(s, REED)) {
+            for h in SKINS.into_iter().filter(|&h| head_offered(h, REED)) {
+                let o = resolve(&Choices { skin: Some(s), head: Some(h) }, TorsoClass::Sword, &WOLF_SWORD, REED).unwrap();
                 assert_eq!((o.head, o.hair), (h.head(), h.hair()), "{s:?} {h:?}");
             }
         }
         // The Shura skin with another head: no Shura hair.
         let c = Choices { skin: Some(Skin::Shura), head: Some(Skin::Wolf) };
-        let o = resolve(&c, TorsoClass::Sword, &WOLF_SWORD, true).unwrap();
+        let o = resolve(&c, TorsoClass::Sword, &WOLF_SWORD, REED).unwrap();
         assert_eq!(o, Outfit { head: 100_000, torso: 331_000, arm: 302_000, legs: 303_000, hair: -1 });
         // "As skin": the skin's head and hair.
         let c = Choices { skin: Some(Skin::Shura), head: None };
-        assert_eq!(resolve(&c, TorsoClass::Sword, &WOLF_SWORD, true).unwrap().hair, 304_000);
+        assert_eq!(resolve(&c, TorsoClass::Sword, &WOLF_SWORD, REED).unwrap().hair, 304_000);
         // A Sculptor skin from the ini acts as "as in game" (restore).
         let c = Choices { skin: Some(Skin::Sculptor), ..Default::default() };
-        assert_eq!(resolve(&c, TorsoClass::Sword, &WOLF_SWORD, true), None);
+        assert_eq!(resolve(&c, TorsoClass::Sword, &WOLF_SWORD, REED), None);
         // A Sculptor head from the ini falls back to the skin's own.
         let c = Choices { skin: Some(Skin::Wolf), head: Some(Skin::Sculptor) };
-        let o = resolve(&c, TorsoClass::Sword, &WOLF_SWORD, true).unwrap();
+        let o = resolve(&c, TorsoClass::Sword, &WOLF_SWORD, REED).unwrap();
         assert_eq!((o.head, o.legs), (100_000, 103_000));
         // The rows stay known for the restore of an older build's choice.
         assert_eq!((Skin::Sculptor.head(), Skin::Sculptor.torso(TorsoClass::Sword), Skin::Sculptor.legs()), (200_000, 201_000, 203_000));
         // Before the prosthetic (bare arm 112000) the arm is left alone.
         let early = Outfit { torso: 141_000, arm: 112_000, ..WOLF_SWORD };
         let c = Choices { skin: Some(Skin::Tengu), ..Default::default() };
-        let o = resolve(&c, TorsoClass::NoSword, &early, true).unwrap();
+        let o = resolve(&c, TorsoClass::NoSword, &early, REED).unwrap();
         assert_eq!(o, Outfit { head: 500_000, torso: 531_000, arm: 112_000, legs: 503_000, hair: -1 });
         // As in game: nothing.
-        assert_eq!(resolve(&Choices::default(), TorsoClass::Sword, &WOLF_SWORD, true), None);
+        assert_eq!(resolve(&Choices::default(), TorsoClass::Sword, &WOLF_SWORD, REED), None);
     }
 
     /// Reed (SPEC "Reed" 1.3 rule 3): Wolf head, no hair, arm 602000 only with the
@@ -1452,30 +1510,94 @@ mod tests {
     #[test]
     fn reed_outfit() {
         let c = Choices { skin: Some(Skin::Reed), head: None };
-        let o = resolve(&c, TorsoClass::MortalBlade, &WOLF_SWORD, true).unwrap();
+        let o = resolve(&c, TorsoClass::MortalBlade, &WOLF_SWORD, REED).unwrap();
         assert_eq!(o, Outfit { head: 100_000, torso: 641_000, arm: 602_000, legs: 603_000, hair: -1 });
         for class in [TorsoClass::Sword, TorsoClass::NoSword] {
-            assert_eq!(resolve(&c, class, &WOLF_SWORD, true).unwrap().torso, 201_000, "{class:?}");
+            assert_eq!(resolve(&c, class, &WOLF_SWORD, REED).unwrap().torso, 201_000, "{class:?}");
         }
         // Before the prosthetic the bare arm stays; the arm row is a prosthetic arm.
         let early = Outfit { torso: 141_000, arm: 112_000, ..WOLF_SWORD };
-        assert_eq!(resolve(&c, TorsoClass::NoSword, &early, true).unwrap().arm, 112_000);
+        assert_eq!(resolve(&c, TorsoClass::NoSword, &early, REED).unwrap().arm, 112_000);
         assert!(prosthetic_arm(Skin::Reed.arm()));
         // Any head on Reed; Shura's brings its hair.
         let c = Choices { skin: Some(Skin::Reed), head: Some(Skin::Shura) };
-        let o = resolve(&c, TorsoClass::Sword, &WOLF_SWORD, true).unwrap();
+        let o = resolve(&c, TorsoClass::Sword, &WOLF_SWORD, REED).unwrap();
         assert_eq!((o.head, o.hair, o.legs), (300_000, 304_000, 603_000));
         // Without the files: as in game.
-        assert_eq!(resolve(&c, TorsoClass::Sword, &WOLF_SWORD, false), None);
+        assert_eq!(resolve(&c, TorsoClass::Sword, &WOLF_SWORD, NONE), None);
         // A Reed head (hand-written ini) falls back to the skin's head.
         let c = Choices { skin: Some(Skin::Tengu), head: Some(Skin::Reed) };
-        assert_eq!(resolve(&c, TorsoClass::Sword, &WOLF_SWORD, true).unwrap().head, 500_000);
+        assert_eq!(resolve(&c, TorsoClass::Sword, &WOLF_SWORD, REED).unwrap().head, 500_000);
         // The worn Reed torso keeps the sword state: 641000 tells Mortal Blade, 201000 nothing.
         assert_eq!(classify_torso(Skin::Reed.torso(TorsoClass::MortalBlade)), Some(TorsoClass::MortalBlade));
         assert_eq!(classify_torso(Skin::Reed.torso(TorsoClass::Sword)), None);
         // The story re-equips the Wolf's torso under Reed (EMEVD 2003[83]): a story change.
-        let reed = resolve(&Choices { skin: Some(Skin::Reed), head: None }, TorsoClass::Sword, &WOLF_SWORD, true).unwrap();
+        let reed = resolve(&Choices { skin: Some(Skin::Reed), head: None }, TorsoClass::Sword, &WOLF_SWORD, REED).unwrap();
         assert_eq!(external(&reed, &Outfit { torso: 101_000, ..reed }), External::Story);
+    }
+
+    /// Red Armour (`red.rs`, SPEC section 6): its own head 600000, no hair, torso 901200 in
+    /// every sword state, arm 202000 only with the prosthetic, legs 203000.
+    #[test]
+    fn red_outfit() {
+        let c = Choices { skin: Some(Skin::Red), head: None };
+        for class in [TorsoClass::MortalBlade, TorsoClass::Sword, TorsoClass::NoSword] {
+            let o = resolve(&c, class, &WOLF_SWORD, BOTH).unwrap();
+            assert_eq!(o, Outfit { head: 600_000, torso: 901_200, arm: 202_000, legs: 203_000, hair: -1 }, "{class:?}");
+        }
+        // Only with Red's files: Reed alone does not offer it, nor its head.
+        assert!(skin_offered(Skin::Red, Installed { reed: false, red: true }));
+        assert!(!skin_offered(Skin::Red, REED));
+        assert!(head_offered(Skin::Red, BOTH) && !head_offered(Skin::Red, REED));
+        assert_eq!(resolve(&c, TorsoClass::Sword, &WOLF_SWORD, REED), None);
+        // Before the prosthetic the bare arm stays; Red's arm is a prosthetic arm.
+        let early = Outfit { torso: 141_000, arm: 112_000, ..WOLF_SWORD };
+        assert_eq!(resolve(&c, TorsoClass::NoSword, &early, BOTH).unwrap().arm, 112_000);
+        assert!(prosthetic_arm(Skin::Red.arm()));
+        // Other heads on Red Armour (Shura's brings its hair), the Red head on other skins.
+        let o = resolve(&Choices { skin: Some(Skin::Red), head: Some(Skin::Shura) }, TorsoClass::Sword, &WOLF_SWORD, BOTH).unwrap();
+        assert_eq!((o.head, o.hair, o.torso, o.legs), (300_000, 304_000, 901_200, 203_000));
+        for s in [Skin::Wolf, Skin::Shura, Skin::Ashina, Skin::Tengu, Skin::Reed] {
+            let o = resolve(&Choices { skin: Some(s), head: Some(Skin::Red) }, TorsoClass::Sword, &WOLF_SWORD, BOTH).unwrap();
+            assert_eq!((o.head, o.hair, o.legs), (600_000, -1, s.legs()), "{s:?}");
+        }
+        // The Red head without Red's files falls back to the skin's head.
+        let o = resolve(&Choices { skin: Some(Skin::Tengu), head: Some(Skin::Red) }, TorsoClass::Sword, &WOLF_SWORD, REED).unwrap();
+        assert_eq!(o.head, 500_000);
+        // 901200 tells no sword state: the tracked one decides "As in game".
+        assert_eq!(classify_torso(901_200), None);
+        let red = Outfit { head: 600_000, torso: 901_200, arm: 202_000, legs: 203_000, hair: -1 };
+        assert_eq!(restore_target(&early, &red, Some(TorsoClass::MortalBlade)), Outfit { torso: 101_000, arm: 102_000, ..early });
+        assert_eq!(restore_target(&early, &red, None), Outfit { arm: 102_000, ..early });
+        assert_eq!(external(&red, &Outfit { torso: 101_000, ..red }), External::Story);
+        // Labels and ini values.
+        assert_eq!((skin_label(Some(Skin::Red)), head_label(Some(Skin::Red)), skin_ini(Some(Skin::Red))), ("Red Armour", "Red", "red"));
+        assert_eq!((parse_skin("red"), parse_head("RED")), (Ok(Some(Skin::Red)), Ok(Some(Skin::Red))));
+        assert_eq!(game_lot_flag(600_000), None);
+    }
+
+    #[test]
+    fn cycling_with_both_outfits() {
+        let mut c = Choices::default();
+        let mut skins = Vec::new();
+        for _ in 0..7 {
+            c = cycle(c, ROW_SKIN, 1, BOTH);
+            skins.push(c.skin);
+        }
+        assert_eq!(
+            skins,
+            vec![Some(Skin::Wolf), Some(Skin::Shura), Some(Skin::Ashina), Some(Skin::Tengu), Some(Skin::Reed), Some(Skin::Red), None]
+        );
+        let mut h = Choices { skin: Some(Skin::Reed), head: None };
+        let mut heads = Vec::new();
+        for _ in 0..6 {
+            h = cycle(h, ROW_HEAD, 1, BOTH);
+            heads.push(h.head);
+        }
+        assert_eq!(heads, vec![Some(Skin::Wolf), Some(Skin::Shura), Some(Skin::Ashina), Some(Skin::Tengu), Some(Skin::Red), None]);
+        // Red without its files steps like "as in game" / "as skin".
+        assert_eq!(cycle(Choices { skin: Some(Skin::Red), head: None }, ROW_SKIN, 1, REED).skin, Some(Skin::Wolf));
+        assert_eq!(cycle(Choices { skin: None, head: Some(Skin::Red) }, ROW_HEAD, 1, REED).head, Some(Skin::Wolf));
     }
 
     #[test]
@@ -1484,7 +1606,7 @@ mod tests {
         // new rule wants the skin's legs, so the next tick changes only that slot.
         for (skin, old_legs, want) in [(Skin::Ashina, 153_000, 403_000), (Skin::Shura, 503_000, 303_000), (Skin::Tengu, 303_000, 503_000)] {
             let c = Choices { skin: Some(skin), head: None };
-            let want_o = resolve(&c, TorsoClass::Sword, &WOLF_SWORD, false).unwrap();
+            let want_o = resolve(&c, TorsoClass::Sword, &WOLF_SWORD, NONE).unwrap();
             let worn = Outfit { legs: old_legs, ..want_o };
             assert_eq!(want_o.legs, want);
             let changed: Vec<usize> = (0..5).filter(|&k| worn.rows()[k] != want_o.rows()[k]).collect();
@@ -1496,48 +1618,48 @@ mod tests {
     fn cycling_skins_and_heads() {
         // Skins: as in game, Wolf, Shura, Ashina, Tengu (no Sculptor), wrapping both ways;
         // Reed after Tengu only when its files are there.
-        let skins = |reed: bool, dir: i32| {
+        let skins = |reed: Installed, dir: i32| {
             let mut c = Choices::default();
             let mut seen = Vec::new();
-            for _ in 0..(if reed { 6 } else { 5 }) {
+            for _ in 0..(if reed.reed { 6 } else { 5 }) {
                 c = cycle(c, ROW_SKIN, dir, reed);
                 seen.push(c.skin);
             }
             seen
         };
-        assert_eq!(skins(false, 1), vec![Some(Skin::Wolf), Some(Skin::Shura), Some(Skin::Ashina), Some(Skin::Tengu), None]);
-        assert_eq!(skins(true, 1), vec![Some(Skin::Wolf), Some(Skin::Shura), Some(Skin::Ashina), Some(Skin::Tengu), Some(Skin::Reed), None]);
-        assert_eq!(cycle(Choices::default(), ROW_SKIN, -1, false).skin, Some(Skin::Tengu));
-        assert_eq!(cycle(Choices::default(), ROW_SKIN, -1, true).skin, Some(Skin::Reed));
+        assert_eq!(skins(NONE, 1), vec![Some(Skin::Wolf), Some(Skin::Shura), Some(Skin::Ashina), Some(Skin::Tengu), None]);
+        assert_eq!(skins(REED, 1), vec![Some(Skin::Wolf), Some(Skin::Shura), Some(Skin::Ashina), Some(Skin::Tengu), Some(Skin::Reed), None]);
+        assert_eq!(cycle(Choices::default(), ROW_SKIN, -1, NONE).skin, Some(Skin::Tengu));
+        assert_eq!(cycle(Choices::default(), ROW_SKIN, -1, REED).skin, Some(Skin::Reed));
         // A Sculptor skin from the ini steps like "as in game"; so does Reed without files.
         for skin in [Skin::Sculptor, Skin::Reed] {
             let c = Choices { skin: Some(skin), ..Default::default() };
-            assert_eq!(cycle(c, ROW_SKIN, 1, false).skin, Some(Skin::Wolf), "{skin:?}");
+            assert_eq!(cycle(c, ROW_SKIN, 1, NONE).skin, Some(Skin::Wolf), "{skin:?}");
         }
         // Heads: as skin, Wolf, Shura, Ashina, Tengu, on every skin and while "as in game".
-        for skin in std::iter::once(None).chain(SKINS.into_iter().filter(|&s| skin_offered(s, true)).map(Some)) {
+        for skin in std::iter::once(None).chain(SKINS.into_iter().filter(|&s| skin_offered(s, REED)).map(Some)) {
             let mut h = Choices { skin, head: None };
             let mut seen = Vec::new();
             for _ in 0..5 {
-                h = cycle(h, ROW_HEAD, 1, true);
+                h = cycle(h, ROW_HEAD, 1, REED);
                 seen.push(h.head);
             }
             assert_eq!(seen, vec![Some(Skin::Wolf), Some(Skin::Shura), Some(Skin::Ashina), Some(Skin::Tengu), None], "{skin:?}");
-            assert_eq!(cycle(Choices { skin, head: None }, ROW_HEAD, -1, true).head, Some(Skin::Tengu));
+            assert_eq!(cycle(Choices { skin, head: None }, ROW_HEAD, -1, REED).head, Some(Skin::Tengu));
         }
         // A Sculptor head from the ini steps like "as skin".
         let h = Choices { skin: Some(Skin::Wolf), head: Some(Skin::Sculptor) };
-        assert_eq!(cycle(h, ROW_HEAD, 1, true).head, Some(Skin::Wolf));
+        assert_eq!(cycle(h, ROW_HEAD, 1, REED).head, Some(Skin::Wolf));
         // A skin change keeps the chosen head (Shura's too), also through "as in game".
         let mut c = Choices { skin: Some(Skin::Shura), head: Some(Skin::Shura) };
         for _ in 0..6 {
-            c = cycle(c, ROW_SKIN, 1, true);
+            c = cycle(c, ROW_SKIN, 1, REED);
             assert_eq!(c.head, Some(Skin::Shura));
         }
         // A head change keeps the skin; an unknown row changes nothing.
         let c = Choices { skin: Some(Skin::Tengu), head: None };
-        assert_eq!(cycle(c, ROW_HEAD, 1, true).skin, Some(Skin::Tengu));
-        assert_eq!(cycle(c, ROWS, 1, true), c);
+        assert_eq!(cycle(c, ROW_HEAD, 1, REED).skin, Some(Skin::Tengu));
+        assert_eq!(cycle(c, ROWS, 1, REED), c);
     }
 
     #[test]
