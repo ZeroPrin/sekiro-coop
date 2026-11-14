@@ -900,7 +900,7 @@ impl Puppet {
         self.refresh_peer_natives();
         // The friend's combat art / prosthetic bullets on the native remote (artfx.rs).
         crate::artfx::tick(Some(player), &self.peers);
-        // Gate SpEffect mirror, full-detail parts, fx_debug (remotefx.rs).
+        // Gate SpEffect mirror, full-detail parts (remotefx.rs).
         crate::remotefx::tick(Some(player), &self.peers);
         // Experimental native session (nsession.rs): does nothing while native_session = 0.
         if let Some(n) = self.net.as_ref().and_then(Option::as_ref) {

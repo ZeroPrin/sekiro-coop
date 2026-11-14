@@ -71,7 +71,6 @@ existing ini takes the same built-in default. PvP is off unless the host turns i
 | `native_full_parts` | DEBUG | 1 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 | `rest_refills_partner` | GAMEPLAY | 1 (as before) | 0 = the friend's rest respawns enemies and wakes a dead you, but does not refill a living you (HP, gourd, items). NOT verified live |
 | `remote_every_frame` | DEBUG | 1 | The friend's character updates every frame at any distance (0 = only while spectating) |
-| `fx_debug` | DEBUG | 0 | Friend's art effects (`docs/RE-REMOTE-FX.md`) |
 
 Reliable bulk kinds added by the fork: 46 (pickups), 0xA7 (ObjAct), 0xA8 (loadout), 0xA9
 (PvP); `net::tests::bulk_kinds_are_unique` checks them against the upstream kinds. The doctor

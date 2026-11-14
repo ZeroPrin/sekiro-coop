@@ -1,6 +1,8 @@
 //! Effects, sounds and look of the friend's native remote ("replica"), docs/RE-REMOTE-FX.md.
 //!
-//! Three parts, each behind its own [DEBUG] setting:
+//! Two parts, each behind its own [DEBUG] setting (the `fx_debug` diagnostics of test4-test9,
+//! a TAE event hook and per-frame `fx:` state lines, were removed in test10; restore them from
+//! commit 60f22f6 if needed):
 //!
 //! 1. **SpEffect gate mirror** (`fx_speffect_mirror`, default 1). The white slash of every
 //!    combat art (TAE type 96, FFX 4400xx), the Dragon Flash sounds (type 129) and the extra
@@ -26,9 +28,6 @@
 //!    for chr types 3/4/10/11). The builder runs every frame and is cheap while nothing
 //!    changes; only real part loads are logged. native.rs registers a new chr at once, so
 //!    its first build is full-detail too (test4 built `_L` first, then reloaded).
-//! 3. **Diagnostics** (`fx_debug`, default 0): `fx:` lines with the local player's and the
-//!    replicas' SpEffect changes, the TAE effect / sound events they start (with the
-//!    StateInfo condition and its result), parts flag, SE module and weapon SE offset.
 //!
 //! Hooks never panic into the game; every hook passes straight through when its setting is off.
 
@@ -43,7 +42,6 @@ use crate::{hook, log};
 
 /// Settings ([DEBUG], live).
 pub static FULL_PARTS: AtomicBool = AtomicBool::new(true);
-pub static FX_DEBUG: AtomicBool = AtomicBool::new(false);
 /// 0 off, 1 art gates, 2 art gates + enchant stateInfos.
 pub static MIRROR: AtomicU8 = AtomicU8::new(1);
 
@@ -57,13 +55,6 @@ const MAX_IDS: usize = 16;
 /// `call 0xE7B000` in the ChrAsm model builder `0xA361C0` (rcx = *(chr+0x2148)).
 const SITE_BUILD: usize = 0xA363BC;
 const FN_BUILD: usize = 0xE7B000;
-/// SprjChrTaeAnimEvent vtable `0x2A7AE70`: slot 1 `0xB59140` only runs slots 2 and 3, and is
-/// reached only through the thunk `0x654A8C` of `0x654B70` (used when `0x141043150` says so);
-/// the per-frame paths `0xB58420` / `0xB58530` -> `0xB4FBA0` call slot 2 (`0xB4FD9C`) and
-/// slot 3 (`0xB4FDA4`) directly [VAR 2026-11-12, E:\RE\work_fx2\o_tae*.txt]. So slot 2, the
-/// first dispatcher `0xB59170`, sees every event exactly once. `this+0x10` = chr.
-const TAE_SLOT_RVA: usize = 0x2A7AE80;
-const TAE_SLOT_FN: usize = 0xB59170;
 /// `0x9E9C00(chr, id, source, u8, u8, &rates, f32, u8 force, i32, u8)` returns nothing: it
 /// calls `0x9E9D10`, which REFUSES a non-forced add on a remote player (`0x9F36C0(chr)`:
 /// player, not `[WorldChrMan+0x88]`, `vt[0x1B0]` false) unless `force` is set; with the source
@@ -75,22 +66,11 @@ const APPLY_FORCE: u8 = 1;
 const APPLY_PROLOGUE: [u8; 11] = [0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10];
 const HAS_RVA: usize = 0xBFEFB0;
 const REMOVE_RVA: usize = 0xC00340;
-/// `(list, u16 stateInfo) -> u8`: an active entry whose row has this stateInfo.
-const HAS_STATE_RVA: usize = 0xBFEBF0;
 /// `(ParamRef* out, id)`: SpEffectParam row lookup (speffect.rs detours it; we call the entry).
 const LOOKUP_RVA: usize = 0x10CEC30;
 
-const CHR_TYPE: usize = 0x70;
 const CHR_SP_LIST: usize = 0x11D0;
-const CHR_MODULES: usize = 0x1FF8;
-const MOD_SE: usize = 0xE0;
-const MOD_TIME_ACT: usize = 0x10;
-/// `chr->vtbl[47]` of PlayerIns = `*(chr+0x20B0)`; its `+8` holds the weapon SE id offset at `+0x350`.
-const CHR_WEP_INFO: usize = 0x20B0;
-const WEP_SE_OFFSET: usize = 0x350;
 const CHR_ASM_MODEL: usize = 0x2148;
-/// ChrAsm model: 1 = `_L` parts (the 6th argument of 0xE7B000).
-const ASM_LOW_DETAIL: usize = 0x2B;
 /// SpEffect list: first node at +8; node: next +0x70, id +0x58, row +0x60, state bits +0x1C.
 const LIST_FIRST: usize = 0x8;
 const NODE_NEXT: usize = 0x70;
@@ -100,9 +80,6 @@ const NODE_STATE: usize = 0x1C;
 /// Entries with any of these bits are ending / not counted by `0xBFEBF0`.
 const NODE_INACTIVE: u32 = 0x800C_0003;
 const ROW_STATE_INFO: usize = 0x15E;
-/// TAE event: type at +0, params at +8, "first frame" byte at +0x18 [ARV: sounds play once on it].
-const EV_PARAMS: usize = 0x8;
-const EV_BEGIN: usize = 0x18;
 
 /// StateInfos the art events test (FINDINGS.txt § 4): 914 no enchantment (106000),
 /// 993 / 994 / 995 Mortal Draw / Floating Passage / Dragon Flash upgrades (EMEVD 9930-9932).
@@ -242,22 +219,11 @@ fn row_state_info(id: i32) -> Option<u16> {
     (r.row >= 0x10000).then(|| read::<u16>(r.row + ROW_STATE_INFO)).flatten()
 }
 
-fn anim_of(chr: usize) -> Option<i32> {
-    let ta = read_ptr(read_ptr(chr + CHR_MODULES)? + MOD_TIME_ACT)?;
-    let head = read::<i32>(ta + 0xE8)?;
-    let tail = read::<i32>(ta + 0xEC)?;
-    if !(0..10).contains(&head) || head == tail {
-        return None;
-    }
-    read::<i32>(ta + 0x20 + 0x14 * ((head + 9) % 10) as usize).filter(|&id| id > 0)
-}
-
 // --- Shared state ---------------------------------------------------------------------------------
 
 /// Each peer's native remote chr and its ChrAsm model (hook-safe lookups), by `PeerId::index`.
 static REPLICA_CHR: [AtomicUsize; MAX_PLAYERS] = [const { AtomicUsize::new(0) }; MAX_PLAYERS];
 static REPLICA_ASM: [AtomicUsize; MAX_PLAYERS] = [const { AtomicUsize::new(0) }; MAX_PLAYERS];
-static LOCAL_CHR: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_ASM: AtomicUsize = AtomicUsize::new(0);
 
 /// native.rs `create` runs the game's player factory right now (any thread: only PlayerIns
@@ -271,12 +237,8 @@ const CREATED_TTL: u32 = 600;
 
 static BUILD_TRIED: AtomicBool = AtomicBool::new(false);
 static ORIG_BUILD: AtomicUsize = AtomicUsize::new(0);
-static TAE_TRIED: AtomicBool = AtomicBool::new(false);
-static ORIG_TAE: AtomicUsize = AtomicUsize::new(0);
 static APPLY_OK: AtomicU8 = AtomicU8::new(0); // 0 unchecked, 1 ok, 2 bad
-/// Real part loads of friends' models started through the build hook (since the last
-/// fx_debug line), and how many were logged in full.
-static LOAD_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Real part loads of friends' models started through the build hook that were logged.
 static LOAD_LOGGED: AtomicU32 = AtomicU32::new(0);
 const LOAD_LOGS: u32 = 40;
 /// ChrAsm model: pending part loads (`0xE7B000` works only while both are < 1, and sets
@@ -288,17 +250,6 @@ static OUTBOX: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
 /// Per peer index: (ids the owner has, when received).
 static WANT: Mutex<[Option<(Vec<i32>, Instant)>; MAX_PLAYERS]> = Mutex::new([const { None }; MAX_PLAYERS]);
 
-/// One TAE event a hook saw (drained and logged by `tick`).
-struct TaeRec {
-    who: String,
-    anim: Option<i32>,
-    ty: i32,
-    params: [u8; 24],
-    cond: Option<(u16, bool)>,
-}
-static TAE_Q: Mutex<VecDeque<TaeRec>> = Mutex::new(VecDeque::new());
-static TAE_DROPPED: AtomicU32 = AtomicU32::new(0);
-
 /// Game-thread state of `tick`.
 struct State {
     last_sent: Option<(Vec<i32>, Instant)>,
@@ -308,11 +259,6 @@ struct State {
     /// Per peer index: (SpEffect id, tries in a row that left it absent) on that replica.
     fails: [Vec<(i32, u32)>; MAX_PLAYERS],
     mirror_logs: u32,
-    /// fx_debug: last SpEffect id set and status line per watched chr.
-    seen_sp: Vec<(usize, Vec<i32>)>,
-    seen_status: Vec<(usize, String)>,
-    log_window: Option<Instant>,
-    log_lines: u32,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -339,7 +285,6 @@ pub fn created(chr: usize) {
 /// lib.rs, when the mod disables itself.
 pub fn shutdown() {
     FULL_PARTS.store(false, Relaxed);
-    FX_DEBUG.store(false, Relaxed);
     MIRROR.store(0, Relaxed);
 }
 
@@ -373,7 +318,6 @@ pub fn tick(player: Option<Chr>, peers: &PeerSet) {
 
 fn tick_inner(player: Option<Chr>, peers: &PeerSet) {
     let local = player.map_or(0, |c| c.0);
-    LOCAL_CHR.store(local, Relaxed);
     LOCAL_ASM.store(if local != 0 { read_ptr(local + CHR_ASM_MODEL).unwrap_or(0) } else { 0 }, Relaxed);
     for i in 0..MAX_PLAYERS {
         let chr = PeerId::new(i as u8).and_then(|id| peers.by_id(id)).and_then(|p| p.native).map_or(0, |c| c.0);
@@ -389,9 +333,6 @@ fn tick_inner(player: Option<Chr>, peers: &PeerSet) {
     if FULL_PARTS.load(Relaxed) {
         install_build_hook();
     }
-    if FX_DEBUG.load(Relaxed) {
-        install_tae_hook();
-    }
     let Ok(mut g) = STATE.lock() else { return };
     let s = g.get_or_insert_with(|| State {
         last_sent: None,
@@ -399,19 +340,12 @@ fn tick_inner(player: Option<Chr>, peers: &PeerSet) {
         applied: [const { (0, Vec::new()) }; MAX_PLAYERS],
         fails: [const { Vec::new() }; MAX_PLAYERS],
         mirror_logs: 0,
-        seen_sp: Vec::new(),
-        seen_status: Vec::new(),
-        log_window: None,
-        log_lines: 0,
     });
     let now = Instant::now();
     if s.mirror_at.is_none_or(|t| now.duration_since(t) >= MIRROR_EVERY) {
         s.mirror_at = Some(now);
         send_own(s, local, now);
         mirror(s, now);
-    }
-    if FX_DEBUG.load(Relaxed) {
-        debug_frame(s, local, now);
     }
 }
 
@@ -431,9 +365,6 @@ fn send_own(s: &mut State, local: usize, now: Instant) {
     };
     if !due {
         return;
-    }
-    if FX_DEBUG.load(Relaxed) && s.last_sent.as_ref().is_none_or(|(prev, _)| *prev != ids) {
-        log::line(&format!("fx: mirror send: our gate SpEffects {ids:?}"));
     }
     if let Ok(mut q) = OUTBOX.lock() {
         if q.len() >= 8 {
@@ -507,7 +438,7 @@ fn mirror(s: &mut State, now: Instant) {
             done.push(format!("-{id}"));
         }
         s.applied[i].1.retain(|id| want.contains(id));
-        if s.mirror_logs < MIRROR_LOGS || FX_DEBUG.load(Relaxed) {
+        if s.mirror_logs < MIRROR_LOGS {
             s.mirror_logs += 1;
             log::line(&format!("fx: mirror: replica of slot {i} chr {chr:#x}: {} (owner has {want:?})", done.join(" ")));
         }
@@ -623,185 +554,9 @@ fn is_replica_asm(asm: usize) -> bool {
 
 /// A friend's model started loading parts (a real load, not the per-frame check).
 fn note_load(asm: usize, game_low: u8) {
-    LOAD_COUNT.fetch_add(1, Relaxed);
     if LOAD_LOGGED.fetch_add(1, Relaxed) < LOAD_LOGS {
         let asked = if game_low != 0 { "the game asked for _L" } else { "the game asked for full detail too" };
         log::line(&format!("fx: parts: friend's model {asm:#x} loads parts full-detail ({asked})"));
-    }
-}
-
-// --- fx_debug: TAE events (vtable slot of SprjChrTaeAnimEvent) -------------------------------------
-
-fn install_tae_hook() {
-    if TAE_TRIED.swap(true, Relaxed) {
-        return;
-    }
-    let base = module_base();
-    let orig = base + TAE_SLOT_FN;
-    let new = tae_hook as *const () as usize;
-    ORIG_TAE.store(orig, Relaxed);
-    if hook::patch_code(TAE_SLOT_RVA, &(orig as u64).to_le_bytes(), &(new as u64).to_le_bytes(), "fx TAE event slot 2 (0x2A7AE80)") {
-        log::line("fx: TAE event logging installed (SprjChrTaeAnimEvent slot 2 = dispatcher 0xB59170, fx_debug)");
-    }
-}
-
-/// Event types worth a line: 1 attack, 33 switch weapon, 66/67 SpEffect, 96 FFX, 118 blade FFX,
-/// 128/129/131 sounds, 790 default trail off.
-fn tae_type_logged(ty: i32) -> bool {
-    matches!(ty, 1 | 33 | 66 | 67 | 96 | 112 | 118 | 120 | 128 | 129 | 131 | 132 | 790)
-}
-
-/// StateInfo condition field of the event types that have one (FINDINGS.txt layouts).
-fn tae_cond_offset(ty: i32) -> Option<usize> {
-    match ty {
-        1 => Some(0xE),
-        96 | 129 => Some(0x10),
-        _ => None,
-    }
-}
-
-extern "C" fn tae_hook(this: usize, ev: usize) -> usize {
-    if FX_DEBUG.load(Relaxed) {
-        let _ = std::panic::catch_unwind(|| tae_note(this, ev));
-    }
-    let f: extern "C" fn(usize, usize) -> usize = unsafe { std::mem::transmute(ORIG_TAE.load(Relaxed)) };
-    f(this, ev)
-}
-
-fn tae_note(this: usize, ev: usize) {
-    let Some(chr) = read_ptr(this + 0x10).filter(|&c| c >= 0x10000) else { return };
-    let who = if chr == LOCAL_CHR.load(Relaxed) {
-        "player".to_string()
-    } else if let Some(i) = REPLICA_CHR.iter().position(|a| a.load(Relaxed) == chr) {
-        format!("replica{i}")
-    } else {
-        return;
-    };
-    let ty = read::<i32>(ev).unwrap_or(-1);
-    if !tae_type_logged(ty) || read::<u8>(ev + EV_BEGIN).unwrap_or(0) == 0 {
-        return;
-    }
-    let mut params = [0u8; 24];
-    if let Some(p) = read_ptr(ev + EV_PARAMS).filter(|&p| p >= 0x10000) {
-        read_bytes(p, &mut params);
-    }
-    let cond = tae_cond_offset(ty).and_then(|o| {
-        let si = u16::from_le_bytes([params[o], params[o + 1]]);
-        (si != 0).then(|| {
-            let list = read_ptr(chr + CHR_SP_LIST).unwrap_or(0);
-            let f: extern "C" fn(usize, u32) -> u8 = unsafe { std::mem::transmute(module_base() + HAS_STATE_RVA) };
-            (si, list >= 0x10000 && f(list, si as u32) != 0)
-        })
-    });
-    let rec = TaeRec { who, anim: anim_of(chr), ty, params, cond };
-    match TAE_Q.try_lock() {
-        Ok(mut q) if q.len() < 256 => q.push_back(rec),
-        _ => {
-            TAE_DROPPED.fetch_add(1, Relaxed);
-        }
-    }
-}
-
-// --- fx_debug: per-frame state lines (game thread) ---------------------------------------------------
-
-const LOG_WINDOW: Duration = Duration::from_secs(2);
-const LOG_LINES_PER_WINDOW: u32 = 60;
-
-fn debug_line(s: &mut State, now: Instant, msg: &str) -> bool {
-    if s.log_window.is_none_or(|t| now.duration_since(t) >= LOG_WINDOW) {
-        if s.log_lines > LOG_LINES_PER_WINDOW {
-            log::line(&format!("fx: ({} lines left out in the last window)", s.log_lines - LOG_LINES_PER_WINDOW));
-        }
-        s.log_window = Some(now);
-        s.log_lines = 0;
-    }
-    s.log_lines += 1;
-    if s.log_lines <= LOG_LINES_PER_WINDOW {
-        log::line(msg);
-        true
-    } else {
-        false
-    }
-}
-
-fn debug_frame(s: &mut State, local: usize, now: Instant) {
-    let mut watched: Vec<(String, usize)> = Vec::new();
-    if local != 0 {
-        watched.push(("player".into(), local));
-    }
-    for (i, a) in REPLICA_CHR.iter().enumerate() {
-        let c = a.load(Relaxed);
-        if c != 0 {
-            watched.push((format!("replica{i}"), c));
-        }
-    }
-    s.seen_sp.retain(|(c, _)| watched.iter().any(|(_, w)| w == c));
-    s.seen_status.retain(|(c, _)| watched.iter().any(|(_, w)| w == c));
-    for (who, chr) in &watched {
-        // SpEffect changes, with the stateInfo of the new ones.
-        let now_sp = speffects(*chr);
-        let mut ids: Vec<i32> = now_sp.iter().map(|&(id, _)| id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        let prev = s.seen_sp.iter().position(|(c, _)| c == chr);
-        let old = prev.map(|p| s.seen_sp[p].1.clone()).unwrap_or_default();
-        if prev.is_none() || old != ids {
-            let added: Vec<String> = ids
-                .iter()
-                .filter(|id| !old.contains(id))
-                .map(|id| {
-                    let si = now_sp.iter().find(|(i, _)| i == id).map_or(0, |&(_, si)| si);
-                    if si != 0 { format!("{id}(si {si})") } else { id.to_string() }
-                })
-                .collect();
-            let gone: Vec<i32> = old.iter().copied().filter(|id| !ids.contains(id)).collect();
-            let anim = anim_of(*chr);
-            debug_line(s, now, &format!("fx: sp {who} anim {anim:?}: +[{}] -{gone:?}", added.join(" ")));
-            match prev {
-                Some(p) => s.seen_sp[p].1 = ids,
-                None => s.seen_sp.push((*chr, ids)),
-            }
-        }
-        // Status: chr type, parts flag, SE module, weapon SE id offset.
-        let asm = read_ptr(chr + CHR_ASM_MODEL).filter(|&a| a >= 0x10000);
-        let status = format!(
-            "type {:?}, parts low-detail(+0x2B) {:?}, SE module {}, weapon SE offset {:?}",
-            read::<u32>(chr + CHR_TYPE),
-            asm.and_then(|a| read::<u8>(a + ASM_LOW_DETAIL)),
-            read_ptr(chr + CHR_MODULES).and_then(|m| read_ptr(m + MOD_SE)).is_some_and(|p| p >= 0x10000),
-            read_ptr(chr + CHR_WEP_INFO).and_then(|w| read_ptr(w + 8)).filter(|&p| p >= 0x10000).and_then(|p| read::<i32>(p + WEP_SE_OFFSET)),
-        );
-        let prev = s.seen_status.iter().position(|(c, _)| c == chr);
-        if prev.is_none_or(|p| s.seen_status[p].1 != status) {
-            debug_line(s, now, &format!("fx: status {who} chr {chr:#x}: {status}"));
-            match prev {
-                Some(p) => s.seen_status[p].1 = status,
-                None => s.seen_status.push((*chr, status)),
-            }
-        }
-    }
-    let recs: Vec<TaeRec> = TAE_Q.try_lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
-    for r in recs {
-        let cond = match r.cond {
-            Some((si, true)) => format!(" cond si {si} = has"),
-            Some((si, false)) => format!(" cond si {si} = MISSING (event skipped)"),
-            None => String::new(),
-        };
-        let p = &r.params;
-        let w = |o: usize| i32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
-        debug_line(
-            s,
-            now,
-            &format!("fx: tae {} anim {:?} type {} [{} {} {} {}]{cond}", r.who, r.anim, r.ty, w(0), w(4), w(8), w(12)),
-        );
-    }
-    let dropped = TAE_DROPPED.swap(0, Relaxed);
-    if dropped > 0 {
-        debug_line(s, now, &format!("fx: tae {dropped} events not queued (queue busy/full)"));
-    }
-    let loads = LOAD_COUNT.swap(0, Relaxed);
-    if loads > 0 {
-        debug_line(s, now, &format!("fx: parts: {loads} part load(s) of friends' characters started (full-detail)"));
     }
 }
 
@@ -901,20 +656,8 @@ mod tests {
     }
 
     #[test]
-    fn hooked_slots_and_the_forced_add() {
-        // SprjChrTaeAnimEvent vtable 0x2A7AE70: slot 2 (+0x10) = the first dispatcher.
-        assert_eq!(TAE_SLOT_RVA, 0x2A7AE70 + 2 * 8);
-        assert_eq!(TAE_SLOT_FN, 0xB59170);
+    fn the_mirror_add_is_forced() {
         // Unforced adds on a remote player are refused by 0x9E9D10.
         assert_eq!(APPLY_FORCE, 1);
-    }
-
-    #[test]
-    fn tae_condition_offsets_match_the_templates() {
-        assert_eq!(tae_cond_offset(96), Some(0x10));
-        assert_eq!(tae_cond_offset(129), Some(0x10));
-        assert_eq!(tae_cond_offset(1), Some(0xE));
-        assert_eq!(tae_cond_offset(128), None);
-        assert!(tae_type_logged(96) && tae_type_logged(790) && !tae_type_logged(0));
     }
 }
