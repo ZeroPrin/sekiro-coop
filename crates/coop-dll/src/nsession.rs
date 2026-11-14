@@ -47,12 +47,13 @@
 //! host. The host runs one handshake / engagement per client (`Link`), a client one
 //! with the host. The game sees ONE fake member whose inbox merges every peer's packets
 //! (IDA §5.1e); player netIds travel as `0xFFF0 | slot` (§5.1d). Every game packet and
-//! the Owned / Lives messages go hop by hop: a client sends to the host only, tagged
+//! the Lives messages go hop by hop: a client sends to the host only, tagged
 //! with its origin slot and a send mode (all / host only / one peer); the host applies
 //! it and re-queues an "all" one to every other engaged client under its own
 //! generation for that link. The host's type 23 reaches the right client through the
 //! recipient wrap at `0xA1DFC1` (rcx = the recipient chr) or `0xA1DFDD` (rcx = its
-//! record). `MSG_ENGAGED` tells the clients who is engaged (Owned lists).
+//! record). `MSG_ENGAGED` tells the clients who is engaged. Enemy ownership
+//! (PROTO 6): the host's owner table, module `own` and `crate::ownership`.
 //! Safety rules for N: a peer's own trouble disengages only that peer; our block
 //! change, a rest, a load disengage all; a same-block peer that cannot join the native
 //! session (unavailable, latched failure, fallback world, no hello) keeps everyone in
@@ -161,8 +162,6 @@ const MSG_READY: u8 = 3;
 const MSG_LEAVE: u8 = 4;
 /// Client -> host (PROTO 6; was Owned).
 const MSG_STATUS: u8 = 5;
-/// Retiring with the Owned lists (the diagnostics commit).
-const MSG_OWNED: u8 = 12;
 const MSG_LIVES: u8 = 6;
 /// Host -> clients: the slots engaged with the host now.
 const MSG_ENGAGED: u8 = 7;
@@ -186,7 +185,7 @@ const SLOTS: usize = MAX_PLAYERS;
 /// `[ADVANCED] native_session_max_players` (2..6, settings.rs; the host's value decides):
 /// with more players in the session the host keeps our own sync (no handshakes).
 pub static MAX_NATIVE_PLAYERS: AtomicU8 = AtomicU8::new(MAX_PLAYERS as u8);
-/// At most this many netIds in one Owned message.
+/// At most this many netIds in one Status / Assign message.
 const MAX_OWNED: usize = 2048;
 /// At most this many enemies in one Lives message.
 pub const MAX_LIVES: usize = 1024;
@@ -256,10 +255,6 @@ enum Msg {
     /// The sender checked our list of `peer_generation` and is ready to engage with it.
     Ready { generation: u32, peer_generation: u32 },
     Leave { generation: u32, latch: bool, reason: u8 },
-    /// Every 2 s while engaged: the netIds of the enemies owned on `origin`'s machine
-    /// (`0xA4A650`), so each side can log the enemies nobody owns (no controller).
-    /// `generation` is the sending hop's (the host re-tags what it relays).
-    Owned { generation: u32, origin: u8, ids: Vec<u16> },
     /// livesync.rs: lives / death of enemies that lost a life or died on `origin`'s
     /// machine (changes, and every 2 s all of them).
     Lives { generation: u32, origin: u8, entries: Vec<LifeEntry> },
@@ -314,16 +309,6 @@ fn encode(m: &Msg) -> Vec<u8> {
             v.extend_from_slice(&generation.to_le_bytes());
             v.push(*latch as u8);
             v.push(*reason);
-        }
-        Msg::Owned { generation, origin, ids } => {
-            v.push(MSG_OWNED);
-            v.extend_from_slice(&generation.to_le_bytes());
-            v.push(*origin);
-            let ids = &ids[..ids.len().min(MAX_OWNED)];
-            v.extend_from_slice(&(ids.len() as u16).to_le_bytes());
-            for n in ids {
-                v.extend_from_slice(&n.to_le_bytes());
-            }
         }
         Msg::Lives { generation, origin, entries } => {
             v.push(MSG_LIVES);
@@ -452,19 +437,6 @@ fn decode(b: &[u8]) -> Option<Msg> {
         }
         MSG_READY => Msg::Ready { generation: r.u32()?, peer_generation: r.u32()? },
         MSG_LEAVE => Msg::Leave { generation: r.u32()?, latch: r.u8()? != 0, reason: r.u8()? },
-        MSG_OWNED => {
-            let generation = r.u32()?;
-            let origin = r.u8()?;
-            let n = r.u16()? as usize;
-            if n > MAX_OWNED || origin as usize >= SLOTS {
-                return None;
-            }
-            let mut ids = Vec::with_capacity(n);
-            for _ in 0..n {
-                ids.push(r.u16()?);
-            }
-            Msg::Owned { generation, origin, ids }
-        }
         MSG_LIVES => {
             let generation = r.u32()?;
             let origin = r.u8()?;
@@ -2361,17 +2333,6 @@ fn make_due(off: usize) -> bool {
     sync_table().is_some_and(|t| write(t + off, 0.0f32))
 }
 
-/// netIds of the loaded enemies owned on this machine (`0xA4A650`).
-fn owned_ids() -> Vec<u16> {
-    let Some(w) = wcm() else { return Vec::new() };
-    let owned: extern "C" fn(usize, u16) -> u8 = unsafe { std::mem::transmute(module_base() + OWNED_HERE_RVA) };
-    let mut v: Vec<u16> = enemies().into_iter().filter_map(netai::net_id).filter(|&n| owned(w, n) != 0).collect();
-    v.sort_unstable();
-    v.dedup();
-    v.truncate(MAX_OWNED);
-    v
-}
-
 /// Our world update stood still this long while engaged: we are "paused" (absent for the
 /// host's owner table; a client says so in its Status).
 const WORLD_PAUSED_AFTER: Duration = Duration::from_millis(1500);
@@ -2402,107 +2363,6 @@ impl PauseTracker {
             PauseStep::Idle
         }
     }
-}
-
-/// The ownerless report's counters: every netId counts once (an enemy can sit in several
-/// chr sets: live 396 / 397 "alive" for 232 enemies).
-#[derive(Default)]
-struct OwnerTally {
-    seen: std::collections::HashSet<u16>,
-    nobody: u32,
-    both: u32,
-}
-
-impl OwnerTally {
-    /// True when this netId is counted as owned by nobody (first sighting only).
-    fn add(&mut self, n: u16, here: bool, there: bool) -> bool {
-        if !self.seen.insert(n) {
-            return false;
-        }
-        if here && there {
-            self.both += 1;
-        }
-        if here || there {
-            return false;
-        }
-        self.nobody += 1;
-        true
-    }
-}
-
-/// Enemies within this distance of a player that nobody owns are listed one by one.
-const OWNERLESS_NEAR_M: f32 = 40.0;
-
-/// Every 10 s while engaged: enemies owned on no machine (`theirs` = the other engaged
-/// players' latest Owned lists, `others` their positions). Such an enemy has no
-/// controller anywhere: NetAI without records (frozen or walking in place) on every screen.
-fn ownerless_report(player: Chr, others: &[(u8, Option<[f32; 3]>)], theirs: Option<&[(u8, Vec<u16>)]>) {
-    let Some(theirs) = theirs else {
-        log::line("nsession: ownerless check: no owned list from every engaged peer yet");
-        return;
-    };
-    let Some(w) = wcm() else { return };
-    let owned: extern "C" fn(usize, u16) -> u8 = unsafe { std::mem::transmute(module_base() + OWNED_HERE_RVA) };
-    let me = player.position();
-    let mut near = Vec::new();
-    let mut both_ids: Vec<String> = Vec::new();
-    let mut tally = OwnerTally::default();
-    for c in enemies() {
-        let Some(n) = netai::net_id(c) else { continue };
-        if c.hp().is_some_and(|hp| hp <= 0) {
-            continue;
-        }
-        let here = owned(w, n) != 0;
-        let there = theirs.iter().any(|(_, ids)| ids.binary_search(&n).is_ok());
-        // Before the early `continue`: `tally.add` is false for every owned enemy, which
-        // is exactly the both-claimed case.
-        if here && there && both_ids.len() < 4 {
-            let how = if own::mine(n) { "table here" } else { "game here" };
-            both_ids.push(format!("{n:#x} ent {} ({how})", c.entity_id().unwrap_or(-1)));
-        }
-        if !tally.add(n, here, there) {
-            continue;
-        }
-        let Some(p) = c.position() else { continue };
-        let d = |o: Option<[f32; 3]>| o.map_or(f32::MAX, |o| crate::game::distance(p, o));
-        let dm = d(me);
-        let df = others.iter().map(|(_, o)| d(*o)).fold(f32::MAX, f32::min);
-        if dm.min(df) <= OWNERLESS_NEAR_M {
-            let kind = match netai::active_kind(c) {
-                0 => "NetAI",
-                1 => "own AI",
-                2 => "other manipulator",
-                _ => "unreadable",
-            };
-            near.push((
-                dm.min(df),
-                format!(
-                    "{} netId {n:#x} at {:.1},{:.1},{:.1} {kind} interval {:?}, {:.0} m from us, {:.0} m from the nearest other player",
-                    c.entity_id().unwrap_or(-1),
-                    p[0],
-                    p[1],
-                    p[2],
-                    read::<i32>(c.0 + 0x110),
-                    dm.min(9999.0),
-                    df.min(9999.0)
-                ),
-            ));
-        }
-    }
-    near.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let list: Vec<String> = near.iter().take(8).map(|(_, s)| s.clone()).collect();
-    log::line(&format!(
-        "nsession: ownerless (10 s): {} alive enemies owned by nobody, {} of them within {OWNERLESS_NEAR_M} m of a player{}{}",
-        tally.nobody,
-        near.len(),
-        if list.is_empty() { String::new() } else { format!(": {}", list.join("; ")) },
-        if tally.both > 0 {
-            let ids = if both_ids.is_empty() { String::new() } else { format!(" [{}]", both_ids.join(", ")) };
-            format!("; {} claimed by both machines{ids}", tally.both)
-        } else {
-            String::new()
-        }
-    ));
 }
 
 /// Host: the friend's candidate list into the record of the friend's remote (§4).
@@ -2601,8 +2461,6 @@ fn engage_block_reason(our_gen: u32, pgen: u32, ready: Option<(u32, u32)>, newes
 /// link it came on and that hop's generation (valid while `accepts(link, generation)`).
 #[derive(Default)]
 struct Origin {
-    /// The latest Owned list (link, generation, when, sorted netIds).
-    owned: Option<(u8, u32, Instant, Vec<u16>)>,
     /// Lives messages not taken yet (link, generation, entries); livesync.rs.
     lives: Vec<(u8, u32, Vec<LifeEntry>)>,
     /// Host: this client's Status messages not taken yet (the engine drains them).
@@ -2648,7 +2506,7 @@ struct Book {
 
 static BOOK: Mutex<Book> = Mutex::new(Book {
     peers: [const { None }; SLOTS],
-    origins: [const { Origin { owned: None, lives: Vec::new(), status: VecDeque::new(), claims: None, ack: None } }; SLOTS],
+    origins: [const { Origin { lives: Vec::new(), status: VecDeque::new(), claims: None, ack: None } }; SLOTS],
     engaged: None,
     assigns: VecDeque::new(),
 });
@@ -2675,7 +2533,7 @@ pub fn on_bulk(_from: PeerId, data: &[u8], _epoch: u64) {
 }
 
 /// A handshake message on link `from`: stored whatever the setting (cheap). Host: an
-/// engaged client's Owned / Lives go on to the other engaged clients, re-tagged with our
+/// engaged client's Lives go on to the other engaged clients, re-tagged with our
 /// generation for each.
 fn on_control(from: u8, data: &[u8], epoch: u64) {
     let Some(m) = decode(data) else {
@@ -2756,17 +2614,6 @@ fn on_control(from: u8, data: &[u8], epoch: u64) {
                 if let Some(p) = g.peers[s].as_mut() {
                     p.leave = Some((generation, latch, reason));
                 }
-            }
-            Msg::Owned { generation, origin, mut ids } => {
-                if !origin_ok(host, from, origin, me) {
-                    return;
-                }
-                ids.sort_unstable();
-                for t in onward(origin, generation) {
-                    let generation = GEN_OUT[t as usize].load(Ordering::Relaxed);
-                    out.push((t, Msg::Owned { generation, origin, ids: ids.clone() }));
-                }
-                g.origins[origin as usize].owned = Some((from, generation, Instant::now(), ids));
             }
             Msg::Lives { generation, origin, entries } => {
                 if !origin_ok(host, from, origin, me) {
@@ -2905,22 +2752,6 @@ pub fn take_lives() -> Vec<LifeEntry> {
     out
 }
 
-/// The fresh Owned lists of these slots (link accepted, younger than `OWNED_FRESH`);
-/// None while any of them has none (we cannot tell what it owns yet).
-fn owned_lists(slots: &[u8]) -> Option<Vec<(u8, Vec<u16>)>> {
-    let g = book();
-    slots
-        .iter()
-        .map(|&s| {
-            g.origins[s as usize]
-                .owned
-                .as_ref()
-                .filter(|(link, generation, at, _)| accepts(*link, *generation) && at.elapsed() < OWNED_FRESH)
-                .map(|(.., ids)| (s, ids.clone()))
-        })
-        .collect()
-}
-
 /// The loaded enemies (WorldChrMan's chr sets, enemy class only).
 pub fn enemy_chrs() -> Vec<Chr> {
     enemies()
@@ -2978,6 +2809,14 @@ pub(crate) mod own {
     static OWNER: [AtomicU8; 0x10000] = [const { AtomicU8::new(NOBODY) }; 0x10000];
     /// Ordinary decision / transition lines per `STATS_EVERY` (bosses and claims are never capped).
     const MAX_LINES: u32 = 60;
+    /// DISOBEY / DOUBLE: checked every second; one line per netId per `DETECT_LINE_GAP_MS`, at
+    /// most `MAX_DETECT_LINES` per 10 s (all of them counted in the summary).
+    const DISOBEY_EVERY: Duration = Duration::from_secs(1);
+    const DISOBEY_AFTER_MS: u64 = 1000;
+    const DETECT_LINE_GAP_MS: u64 = 30_000;
+    const MAX_DETECT_LINES: u32 = 10;
+    /// `chr+0x2040`: the game forces this enemy's AI local (`0x9F33F0`, RE-FINDINGS-2 §AI).
+    const CHR_FORCED_LOCAL: usize = 0x2040;
 
     pub fn active() -> bool {
         ACTIVE.load(Ordering::Acquire)
@@ -3103,6 +2942,20 @@ pub(crate) mod own {
         claims_made: u32,
         claims_granted: u32,
         grant_ms: Vec<u64>,
+        /// Host: two-brains detector over the clients' Status reports.
+        watch: om::DoubleWatch,
+        /// Host: alive enemies near a present player that nobody owns (last decision):
+        /// (netId, entity, metres).
+        unowned_near: Vec<(u16, i32, f32)>,
+        /// When the table went active here (ms): an enemy without an entry counts from then.
+        active_at_ms: u64,
+        disobey_at: Option<Instant>,
+        /// netId -> last DISOBEY / DOUBLE line.
+        detect_at: HashMap<u16, u64>,
+        detect_lines: u32,
+        detect_lines_at: Option<Instant>,
+        disobeyed: u32,
+        doubles: u32,
         // --- both: log caps and counters (10 s) ---
         lines_at: Option<Instant>,
         lines: u32,
@@ -3133,6 +2986,7 @@ pub(crate) mod own {
             let seq = self.table.seq;
             *self = Self::default();
             self.table.seq = seq;
+            book().assigns.clear();
         }
 
         /// Host: client `slot` left while others stay. Its entries are decided again at the
@@ -3143,6 +2997,7 @@ pub(crate) mod own {
             self.acks[s] = 0;
             self.paused[s] = false;
             self.claims[s].clear();
+            self.watch.forget(slot);
             self.decide_at = None;
             let mut g = book();
             let o = &mut g.origins[s];
@@ -3178,6 +3033,7 @@ pub(crate) mod own {
             let now = Instant::now();
             let ms = crate::game::now_ms();
             let mut changed = ours_changed;
+            let mut statuses: Vec<(u8, StatusIn)> = Vec::new();
             {
                 let mut g = book();
                 for &s in clients {
@@ -3210,8 +3066,12 @@ pub(crate) mod own {
                             changed = true;
                             log::line(&format!("own: peer{s}'s world update {}", if p { "paused (menu): it is absent" } else { "runs again" }));
                         }
+                        statuses.push((s, st));
                     }
                 }
+            }
+            if !statuses.is_empty() && active() {
+                self.double_check(&statuses, ms);
             }
             // Who may run enemies: alive, not waiting dead in a boss fight, world running.
             let down = crate::world::down_slots();
@@ -3295,7 +3155,17 @@ pub(crate) mod own {
                     ),
                 );
             }
+            self.unowned_near = seen
+                .iter()
+                .filter(|e| !e.dead && self.table.published(e.net) == NOBODY)
+                .filter_map(|e| {
+                    let d = e.players.iter().filter(|p| p.present).filter_map(|p| p.dist).fold(f32::MAX, f32::min);
+                    (d <= om::TAKE_M).then_some((e.net, e.entity, d))
+                })
+                .collect();
+            self.unowned_near.sort_by(|a, b| a.2.total_cmp(&b.2));
             if !active() {
+                self.active_at_ms = ms;
                 activate();
                 log::line(&format!(
                     "own: host table active: {} enemies seen, {} owned here, {} by clients; IsOwnedHere answers from it for enemies",
@@ -3307,6 +3177,150 @@ pub(crate) mod own {
             self.send(clients, &out, ms);
             self.warn_waits(ms);
             self.track_claims(HOST, ours, ms);
+        }
+
+        /// A DISOBEY / DOUBLE line, capped (`DETECT_LINE_GAP_MS` per netId, `MAX_DETECT_LINES`
+        /// per 10 s).
+        fn detect_line(&mut self, n: u16, ms: u64, s: String) {
+            let now = Instant::now();
+            if self.detect_lines_at.is_none_or(|t| now.duration_since(t) >= STATS_EVERY) {
+                self.detect_lines_at = Some(now);
+                self.detect_lines = 0;
+            }
+            if self.detect_at.get(&n).is_some_and(|&t| ms.saturating_sub(t) < DETECT_LINE_GAP_MS) || self.detect_lines >= MAX_DETECT_LINES {
+                return;
+            }
+            self.detect_at.insert(n, ms);
+            self.detect_lines += 1;
+            log::line(&s);
+        }
+
+        /// Host: a client's Status names the enemies whose AI runs there; any of them that
+        /// runs here too, with the client caught up on its last change, in two reports in a
+        /// row, is a real double brain.
+        fn double_check(&mut self, statuses: &[(u8, StatusIn)], ms: u64) {
+            let mut chrs: HashMap<u16, Chr> = HashMap::new();
+            let mut here: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            for c in enemies() {
+                let Some(n) = netai::net_id(c) else { continue };
+                if c.hp().is_some_and(|hp| hp > 0) && netai::active_kind(c) == 1 {
+                    here.insert(n);
+                    chrs.insert(n, c);
+                }
+            }
+            for (s, st) in statuses {
+                let table = &self.table;
+                let both = self.watch.report(*s, st.applied, &st.running, &here, |n| table.change_seq(n));
+                for n in both {
+                    self.doubles += 1;
+                    let e = chrs.get(&n).and_then(|c| c.entity_id()).unwrap_or(-1);
+                    let line = format!(
+                        "own: DOUBLE {n:#x} e{e} runs on the host and {who} (table owner {}, {who} applied seq {} >= change {}, 2 reports)",
+                        om::who(self.table.published(n)),
+                        st.applied,
+                        self.table.change_seq(n),
+                        who = om::who(*s),
+                    );
+                    self.detect_line(n, ms, line);
+                }
+            }
+        }
+
+        /// Both roles, every second while the table is active: an alive enemy whose own AI
+        /// (ComManipulator) runs here although the table says it is not ours, with that entry
+        /// unchanged for more than a second: something other than `IsOwnedHere` decided.
+        pub fn disobey_check(&mut self, me: u8) {
+            if !active() || self.disobey_at.is_some_and(|t| t.elapsed() < DISOBEY_EVERY) {
+                return;
+            }
+            self.disobey_at = Some(Instant::now());
+            let ms = crate::game::now_ms();
+            let mut seen = std::collections::HashSet::new();
+            for c in enemies() {
+                let Some(n) = netai::net_id(c) else { continue };
+                if !seen.insert(n) || c.hp().is_none_or(|hp| hp <= 0) || netai::active_kind(c) != 1 || owner(n) == me {
+                    continue;
+                }
+                let (seq, at) = if self.mirror.ready {
+                    self.mirror.rows.get(&n).map_or((0, self.active_at_ms), |r| (r.seq, r.at_ms))
+                } else {
+                    self.table.rows.get(&n).map_or((0, self.active_at_ms), |r| (r.publ.seq, r.published_ms))
+                };
+                let age = ms.saturating_sub(at.max(self.active_at_ms));
+                if age <= DISOBEY_AFTER_MS {
+                    continue;
+                }
+                self.disobeyed += 1;
+                let line = format!(
+                    "own: DISOBEY {n:#x} e{} table owner {} (seq {seq}, {:.1} s ago) but our AI runs it (IsOwnedHere {}, native {}, +0x2040 {})",
+                    c.entity_id().unwrap_or(-1),
+                    om::who(owner(n)),
+                    age as f32 / 1000.0,
+                    owned_here(n) as u8,
+                    game_owned_here(n) as u8,
+                    read::<u8>(c.0 + CHR_FORCED_LOCAL).map_or("?".into(), |b| b.to_string())
+                );
+                self.detect_line(n, ms, line);
+            }
+        }
+
+        /// The 10 s summary (host: the table; client: what it applied).
+        pub fn summary(&mut self, host: bool, me: u8) {
+            if !active() {
+                log::line(&format!(
+                    "own (10 s): table not active yet ({})",
+                    if host { "no decision yet" } else { "no full Assign from the host yet" }
+                ));
+                return;
+            }
+            let ch = std::mem::take(&mut self.changes);
+            let c = |w: Why| ch.get(&w).copied().unwrap_or(0);
+            let suppressed = std::mem::take(&mut self.suppressed);
+            let tail = if suppressed > 0 { format!("; {suppressed} ordinary lines suppressed") } else { String::new() };
+            let disobeyed = std::mem::take(&mut self.disobeyed);
+            if host {
+                let mut per: BTreeMap<u8, u32> = BTreeMap::new();
+                for e in self.table.full() {
+                    *per.entry(e.1).or_default() += 1;
+                }
+                let owners: Vec<String> = per.iter().map(|(&s, &n)| format!("{} {n}", om::who(s))).collect();
+                let near: Vec<String> = self.unowned_near.iter().take(4).map(|&(n, e, d)| format!("{n:#x} e{e} {d:.0} m")).collect();
+                log::line(&format!(
+                    "own (10 s): seq {}; {} / waiting {} / unowned-within-40m {}{}; changes {} (nearer {}, absent {}, claim {}, range {}, boss {}, unloaded {}); fulls {}, ack resends {}; doubles {}; disobeyed {disobeyed}{tail}",
+                    self.table.seq,
+                    if owners.is_empty() { "nobody owns any".to_string() } else { owners.join(" / ") },
+                    self.table.waiting(),
+                    self.unowned_near.len(),
+                    if near.is_empty() { String::new() } else { format!(" [{}]", near.join(", ")) },
+                    ch.values().sum::<u32>(),
+                    c(Why::Nearer),
+                    c(Why::OwnerAbsent),
+                    c(Why::Claim),
+                    c(Why::InRange) + c(Why::OutOfRange),
+                    c(Why::BossHost) + c(Why::BossHostAway),
+                    c(Why::Unloaded),
+                    std::mem::take(&mut self.fulls),
+                    std::mem::take(&mut self.resends),
+                    std::mem::take(&mut self.doubles),
+                ));
+            } else {
+                let mine = self.mirror.rows.values().filter(|r| r.owner == me).count();
+                let mut g = std::mem::take(&mut self.grant_ms);
+                g.sort_unstable();
+                let median = g.get(g.len() / 2).map_or("-".into(), |t| t.to_string());
+                let m = &mut self.mirror;
+                log::line(&format!(
+                    "own (10 s): applied seq {} (fulls {}, deltas {}, stale ignored {}, gaps {}); mine {mine}; transitions {}; disobeyed {disobeyed}; claims sent {} granted {} (median {median} ms){tail}",
+                    m.applied,
+                    std::mem::take(&mut m.fulls),
+                    std::mem::take(&mut m.deltas),
+                    std::mem::take(&mut m.stale),
+                    std::mem::take(&mut m.gaps),
+                    std::mem::take(&mut self.transitions),
+                    std::mem::take(&mut self.claims_made),
+                    std::mem::take(&mut self.claims_granted),
+                ));
+            }
         }
 
         /// Both roles: our own claims, logged when the table grants them (`mine`) or not
@@ -3435,6 +3449,7 @@ pub(crate) mod own {
                 }
             }
             if self.mirror.ready && !active() {
+                self.active_at_ms = ms;
                 activate();
                 let mine = self.mirror.rows.values().filter(|r| r.owner == me).count();
                 log::line(&format!(
@@ -4619,9 +4634,6 @@ const FIRST_23_WITHIN: Duration = Duration::from_secs(5);
 /// failure of the native session: no soft fail, no fallback).
 const HOST_SILENT_MAX: Duration = Duration::from_secs(30);
 const SOFT_FAILS_LATCH: u32 = 3;
-const OWNED_EVERY: Duration = Duration::from_secs(2);
-/// A peer's Owned list counts this long.
-const OWNED_FRESH: Duration = Duration::from_secs(5);
 /// Frames the client's late chr-loop patch may stay busy before we leave.
 const LATE_BUSY_MAX: u32 = 600;
 const STATS_EVERY: Duration = Duration::from_secs(10);
@@ -4876,11 +4888,8 @@ struct Engine {
     /// Engaged and our world update stopped: logged once per stop.
     still_logged: bool,
     engaged_at: Instant,
-    owned_sent_at: Option<Instant>,
-    /// v8.30b: last Owned list sent and when the list was last compared (change-triggered early send).
-    owned_sent_ids: Vec<u16>,
-    owned_check_at: Option<Instant>,
-    ownerless_at: Option<Instant>,
+    /// The owner table's 10 s summary was last logged.
+    own_summary_at: Option<Instant>,
     stats_at: Option<Instant>,
     timers_logged: bool,
     /// The host-authored owner table (module `own`, docs/PLAN-OWNERSHIP.md).
@@ -4919,10 +4928,7 @@ impl Engine {
             running_since: None,
             still_logged: false,
             engaged_at: Instant::now(),
-            owned_sent_at: None,
-            owned_sent_ids: Vec::new(),
-            owned_check_at: None,
-            ownerless_at: None,
+            own_summary_at: None,
             stats_at: None,
             timers_logged: false,
             own: own::State::default(),
@@ -5415,8 +5421,7 @@ impl Engine {
             self.stage = l.stage;
             self.engaged_at = Instant::now();
             self.still_logged = false;
-            self.owned_sent_at = None;
-            self.ownerless_at = Some(Instant::now());
+            self.own_summary_at = Some(Instant::now());
             self.timers_logged = false;
             self.stats_at = Some(Instant::now());
         }
@@ -5588,20 +5593,8 @@ impl Engine {
         }
     }
 
-    /// The other players that own enemies natively, with their native remotes' positions:
-    /// host = its engaged clients; client = the host and the clients the host says are engaged.
-    fn competitors(&self, f: &Frame) -> Vec<(u8, Option<[f32; 3]>)> {
-        let me = f.peers.me().slot();
-        let mask = if self.host { engaged_links() } else { 1 | PEER_ENGAGED.load(Ordering::Relaxed) };
-        mask_slots(mask)
-            .into_iter()
-            .filter(|&s| s != me)
-            .map(|s| (s, PeerId::new(s).and_then(|id| f.remote_of(id)).and_then(|c| c.position())))
-            .collect()
-    }
-
-    /// Once per frame while any link is engaged: Owned lists, the Engaged set, the
-    /// ownerless report, the owner table, the host's 22 feed, timers.
+    /// Once per frame while any link is engaged: the Engaged set, the owner table (and its
+    /// diagnostics), the host's 22 feed, timers.
     fn engaged_common(&mut self, f: &Frame) {
         update_pnets(f);
         let now = Instant::now();
@@ -5634,8 +5627,6 @@ impl Engine {
                 queue_ctrl_engaged(|generation| Msg::Engaged { generation, slots: slots.clone() });
             }
         }
-        let comps = self.competitors(f);
-        let comp_slots: Vec<u8> = comps.iter().map(|c| c.0).collect();
         // Our world update paused (menu) for `WORLD_PAUSED_AFTER`: absent for the owner table.
         let stalled = if self.updates.is_some() { self.updates_at.elapsed() } else { Duration::ZERO };
         let pause_flipped = self.stage >= 2 && self.pause.step(stalled) != PauseStep::Idle;
@@ -5645,35 +5636,27 @@ impl Engine {
                 if self.pause.active { "paused (menu): absent for the owner table" } else { "runs again after a pause" }
             ));
         }
-        // The 2 s heartbeat, plus (v8.30b) an early send when the list changed (at most every 250 ms).
-        let owned_due = self.owned_sent_at.is_none_or(|t| t.elapsed() >= OWNED_EVERY);
-        let owned_check = !owned_due
-            && self.owned_sent_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(250))
-            && self.owned_check_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(250));
-        if self.stage >= 2 && (owned_due || owned_check) {
-            self.owned_check_at = Some(now);
-            let ids = owned_ids();
-            if owned_due || ids != self.owned_sent_ids {
-                self.owned_sent_at = Some(now);
-                self.owned_sent_ids = ids.clone();
-                queue_ctrl_engaged(|generation| Msg::Owned { generation, origin: me, ids: ids.clone() });
-            }
-        }
-        if self.stage >= 2 && self.ownerless_at.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
-            self.ownerless_at = Some(now);
-            ownerless_report(f.player, &comps, owned_lists(&comp_slots).as_deref());
-        }
         // The owner table: the host decides and sends it, a client applies it; our stealth
         // claims are requests to it.
         if self.stage >= 2 {
             let (claims, claims_changed) = take_claims();
             if self.host {
                 let clients = mask_slots(engaged_links());
-                let running = self.world_running();
+                // Paused = the same 1.5 s rule as a client's Status (a short loading hitch of
+                // the world update must not hand every enemy over and back).
+                let running = !self.pause.active;
                 self.own.host_step(f, &clients, running, &claims, claims_changed);
                 self.host_candidates(f);
             } else {
                 self.own.client_step(me, self.pause.active, pause_flipped, &claims, claims_changed);
+            }
+            // A client's enemies all keep their own AI until its chr-loop patch is in.
+            if self.host || self.late.is_empty() {
+                self.own.disobey_check(me);
+            }
+            if self.own_summary_at.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
+                self.own_summary_at = Some(now);
+                self.own.summary(self.host, me);
             }
         }
         if !self.timers_logged && self.engaged_at.elapsed() >= Duration::from_secs(3) {
@@ -6220,8 +6203,6 @@ mod tests {
             Msg::List { generation: 3, block: 5, pairs: vec![] },
             Msg::Ready { generation: u32::MAX, peer_generation: 4 },
             Msg::Leave { generation: 9, latch: true, reason: Reason::NetIdMismatch as u8 },
-            Msg::Owned { generation: 5, origin: 0, ids: vec![0x0801, 0x0FFF, 0x1800] },
-            Msg::Owned { generation: 6, origin: 3, ids: vec![] },
             Msg::Lives {
                 generation: 7,
                 origin: 2,
@@ -6253,7 +6234,6 @@ mod tests {
         }
         assert_eq!(decode(&[99, 0, 0]), None);
         // An origin or a slot past the six players is malformed.
-        assert_eq!(decode(&encode(&Msg::Owned { generation: 1, origin: 6, ids: vec![] })), None);
         assert_eq!(decode(&encode(&Msg::Engaged { generation: 1, slots: vec![6] })), None);
         assert_eq!(decode(&encode(&Msg::Status { generation: 1, origin: 6, applied_seq: 0, flags: 0, running: vec![] })), None);
         assert_eq!(decode(&encode(&Msg::Claims { generation: 1, origin: 6, ids: vec![] })), None);
@@ -6874,22 +6854,6 @@ mod tests {
         // A note "in the future" (clock skew between threads) is ignored, never underflows.
         ring[4] = ThrowNote { defender: 0x0903, at: 20_000, sent: true, by_player: true, slot: 0 };
         assert_eq!(player_throw_age(&ring, 0x0903, true, 10_000, THROW_COLLIDE_MS), None);
-    }
-
-    #[test]
-    fn ownerless_count_is_per_net_id() {
-        let mut t = OwnerTally::default();
-        // 232 enemies, each listed twice (two chr sets): 232 counted, not 464.
-        for rep in 0..2 {
-            for n in 0..232u16 {
-                let counted = t.add(n, n % 7 == 0, n % 11 == 0);
-                assert_eq!(counted, rep == 0 && n % 7 != 0 && n % 11 != 0);
-            }
-        }
-        let distinct = (0..232u16).filter(|n| n % 7 != 0 && n % 11 != 0).count() as u32;
-        assert_eq!(t.nobody, distinct);
-        assert!(t.nobody <= 232);
-        assert_eq!(t.both, (0..232u16).filter(|n| n % 7 == 0 && n % 11 == 0).count() as u32);
     }
 
     #[test]

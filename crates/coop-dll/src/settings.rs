@@ -876,7 +876,7 @@ enemy_mode = 4
 ; Log what the game's own netcode does (read at game start only).
 observe = 1
 ; Log lines left out of log.txt, comma list. A word is a whole category (the first word of a
-; line: gpuguard, native, nsession, t, ownfill, stealth, observe, hkb, ...), text with a : or a
+; line: gpuguard, native, nsession, t, own, stealth, observe, hkb, ...), text with a : or a
 ; space is the start of one line type (native: remote moved). Empty = log everything. MARK and
 ; CRASH lines always stay. Every clock line (10 min) counts what was left out.
 log_off = observe, hkb, native: remote moved

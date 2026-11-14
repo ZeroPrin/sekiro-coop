@@ -587,6 +587,7 @@ impl Mirror {
         out
     }
 
+    #[cfg(test)]
     pub fn owner(&self, n: u16) -> u8 {
         self.rows.get(&n).map_or(NOBODY, |r| r.owner)
     }
